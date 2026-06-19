@@ -1,0 +1,603 @@
+import { supabase }           from '../../lib/supabase.js'
+import { NotificationService } from '../../notifications/NotificationService.js'
+import type { z }             from 'zod'
+import type {
+  listDebtorsQuerySchema,
+  updateDebtorSchema,
+  createActionSchema,
+  createAgreementSchema,
+  createCampaignSchema,
+  listActionsQuerySchema,
+  createDebtorSchema,
+  createDebtSchema,
+  createTemplateSchema,
+  createCollectionTaskSchema,
+  updateCollectionTaskSchema,
+  listMessagesQuerySchema,
+} from './collection.schema.js'
+
+type ListDebtorsQuery       = z.infer<typeof listDebtorsQuerySchema>
+type UpdateDebtorInput      = z.infer<typeof updateDebtorSchema>
+type CreateActionInput      = z.infer<typeof createActionSchema>
+type CreateAgreementInput   = z.infer<typeof createAgreementSchema>
+type CreateCampaignInput    = z.infer<typeof createCampaignSchema>
+type ListActionsQuery       = z.infer<typeof listActionsQuerySchema>
+type CreateDebtorInput      = z.infer<typeof createDebtorSchema>
+type CreateDebtInput        = z.infer<typeof createDebtSchema>
+type CreateTemplateInput    = z.infer<typeof createTemplateSchema>
+type CreateTaskInput        = z.infer<typeof createCollectionTaskSchema>
+type UpdateTaskInput        = z.infer<typeof updateCollectionTaskSchema>
+type ListMessagesQuery      = z.infer<typeof listMessagesQuerySchema>
+
+const PLATFORM_URL = process.env.PLATFORM_URL ?? 'https://app.tudominio.com'
+
+function toE164(phone: string): string {
+  const digits = phone.replace(/\D/g, '')
+  if (digits.startsWith('57')) return `+${digits}`
+  if (digits.length === 10) return `+57${digits}`
+  return `+${digits}`
+}
+
+export class CollectionService {
+  // ── Stats ─────────────────────────────────────────────────────────────────
+
+  static async getStats(companyId: string | null) {
+    let debtorsQ = supabase
+      .from('collection_debtors')
+      .select('id, status, phone, email, collection_debts(outstanding_amount, overdue_91_plus)')
+    if (companyId) debtorsQ = debtorsQ.eq('company_id', companyId)
+    const { data: debtors, error } = await debtorsQ
+
+    if (error) throw error
+
+    const total        = debtors?.length ?? 0
+    const active       = debtors?.filter(d => d.status !== 'paid').length ?? 0
+    const paid         = debtors?.filter(d => d.status === 'paid').length ?? 0
+    const inCollection = debtors?.filter(d => d.status === 'in_collection').length ?? 0
+    const noContact    = debtors?.filter(d => !d.phone && !d.email).length ?? 0
+
+    const saldoVencido = debtors?.reduce((sum, d) => {
+      const debts: any[] = (d as any).collection_debts ?? []
+      return sum + debts.reduce((s: number, x: any) => s + (x.outstanding_amount ?? 0), 0)
+    }, 0) ?? 0
+
+    const mora91 = debtors?.filter(d => {
+      const debts: any[] = (d as any).collection_debts ?? []
+      return debts.some((x: any) => (x.overdue_91_plus ?? 0) > 0)
+    }).length ?? 0
+
+    // Agreements — join through debtor
+    let agreementsQ = supabase
+      .from('collection_agreements')
+      .select('id, status, debtor_id, collection_debtors!inner(company_id)')
+      .eq('status', 'active')
+    if (companyId) agreementsQ = agreementsQ.eq('collection_debtors.company_id', companyId)
+    const { data: agreements } = await agreementsQ
+
+    // Tasks
+    let tasksQ = supabase
+      .from('collection_tasks')
+      .select('id, status, due_date, collection_debtors!inner(company_id)')
+    if (companyId) tasksQ = tasksQ.eq('collection_debtors.company_id', companyId)
+    const { data: tasks } = await tasksQ
+
+    const today = new Date().toISOString().split('T')[0]
+    const tasksHoy      = tasks?.filter(t => t.due_date?.startsWith(today)).length ?? 0
+    const tasksVencidas = tasks?.filter(t => t.status !== 'done' && t.due_date && t.due_date < today).length ?? 0
+
+    const contacted = debtors?.filter(d => d.status !== 'pending').length ?? 0
+
+    return {
+      total, active, paid, inCollection, noContact, saldoVencido, mora91,
+      acuerdosActivos: agreements?.length ?? 0,
+      tasksHoy, tasksVencidas,
+      contactabilidad: total > 0 ? Math.round((contacted / total) * 100) : 0,
+      efectividad:     contacted > 0 ? Math.round((paid / contacted) * 100) : 0,
+    }
+  }
+
+  // ── Debtors ───────────────────────────────────────────────────────────────
+
+  static async listDebtors(query: ListDebtorsQuery, companyId: string | null) {
+    const { status, search, assigned, page, limit } = query
+    const from = (page - 1) * limit
+
+    let q = supabase
+      .from('collection_debtors')
+      .select('*, collection_debts(outstanding_amount,overdue_1_30,overdue_31_60,overdue_61_90,overdue_91_plus,not_yet_due,total_balance,currency,due_date,siigo_document)', { count: 'exact' })
+      .order('updated_at', { ascending: false })
+      .range(from, from + limit - 1)
+
+    if (companyId) q = q.eq('company_id', companyId)
+
+    if (status) {
+      q = q.eq('status', status)
+    }
+    // sin filtro de status → devuelve todos (cartera activa = vista por defecto)
+    if (assigned) q = q.eq('assigned_user_id', assigned)
+    if (search) {
+      q = q.or(`debtor_name.ilike.%${search}%,debtor_document.ilike.%${search}%`)
+    }
+
+    const { data, error, count } = await q
+    if (error) throw error
+    return { data, total: count ?? 0, page, limit }
+  }
+
+  static async getDebtor(id: string) {
+    const { data, error } = await supabase
+      .from('collection_debtors')
+      .select('*,collection_debts(*)')
+      .eq('id', id)
+      .single()
+
+    if (error) throw error
+    return data
+  }
+
+  static async updateDebtor(id: string, input: UpdateDebtorInput) {
+    const { data, error } = await supabase
+      .from('collection_debtors')
+      .update(input)
+      .eq('id', id)
+      .select()
+      .single()
+
+    if (error) throw error
+    return data
+  }
+
+  // ── Actions ───────────────────────────────────────────────────────────────
+
+  static async listActions(query: ListActionsQuery, companyId: string) {
+    const { debtor_id, page, limit } = query
+    const from = (page - 1) * limit
+
+    let q = supabase
+      .from('collection_actions')
+      .select('*', { count: 'exact' })
+      .eq('company_id', companyId)
+      .order('created_at', { ascending: false })
+      .range(from, from + limit - 1)
+
+    if (debtor_id) q = q.eq('debtor_id', debtor_id)
+
+    const { data, error, count } = await q
+    if (error) throw error
+    return { data, total: count ?? 0, page, limit }
+  }
+
+  static async createAction(input: CreateActionInput, userId: string, companyId: string) {
+    const { data, error } = await supabase
+      .from('collection_actions')
+      .insert({ ...input, user_id: userId, company_id: companyId })
+      .select()
+      .single()
+
+    if (error) throw error
+    return data
+  }
+
+  // ── Agreements ────────────────────────────────────────────────────────────
+
+  static async createAgreement(input: CreateAgreementInput, companyId: string, createdBy: string) {
+    const { data, error } = await supabase
+      .from('collection_agreements')
+      .insert({ ...input, company_id: companyId, created_by: createdBy })
+      .select()
+      .single()
+
+    if (error) throw error
+
+    // Notificar al deudor por WhatsApp y email si tiene los datos
+    const debtor = await CollectionService.getDebtor(input.debtor_id)
+
+    const notifData = {
+      debtorName:   debtor.debtor_name,
+      amount:       String(input.total_amount),
+      installments: String(input.installment_count),
+      nextDate:     input.first_due_date ?? '',
+    }
+
+    if (debtor.whatsapp ?? debtor.phone) {
+      void NotificationService.enqueue({
+        channel:   'whatsapp',
+        template:  'collection-agreement',
+        to:        toE164((debtor.whatsapp ?? debtor.phone)!),
+        data:      notifData,
+        companyId,
+      })
+    }
+
+    if (debtor.email) {
+      void NotificationService.enqueue({
+        channel:   'email',
+        template:  'collection-agreement',
+        to:        debtor.email,
+        data:      notifData,
+        companyId,
+      })
+    }
+
+    return data
+  }
+
+  static async listAgreements(debtorId: string) {
+    const { data, error } = await supabase
+      .from('collection_agreements')
+      .select('*')
+      .eq('debtor_id', debtorId)
+      .order('created_at', { ascending: false })
+
+    if (error) throw error
+    return data
+  }
+
+  // ── Campaigns ─────────────────────────────────────────────────────────────
+
+  static async listCampaigns(companyId: string) {
+    const { data, error } = await supabase
+      .from('collection_campaigns')
+      .select('*,collection_templates(name,channel)')
+      .eq('company_id', companyId)
+      .order('created_at', { ascending: false })
+
+    if (error) throw error
+    return data
+  }
+
+  static async createCampaign(input: CreateCampaignInput, companyId: string, createdBy: string) {
+    const { debtor_ids, message_template, ...rest } = input
+    const { data, error } = await supabase
+      .from('collection_campaigns')
+      .insert({
+        ...rest,
+        company_id:       companyId,
+        created_by:       createdBy,
+        debtor_ids:       debtor_ids ?? [],
+        message_template: message_template ?? null,
+      })
+      .select()
+      .single()
+
+    if (error) throw error
+    return data
+  }
+
+  static async sendCampaign(campaignId: string): Promise<{ sent: number }> {
+    const { data: campaign, error } = await supabase
+      .from('collection_campaigns')
+      .select('*')
+      .eq('id', campaignId)
+      .single()
+
+    if (error || !campaign) throw new Error('Campaña no encontrada')
+
+    const debtorIds: string[] = campaign.debtor_ids ?? []
+    const messageTemplate: string = campaign.message_template ?? ''
+    const channel = (campaign.channel ?? 'whatsapp') as 'sms' | 'whatsapp' | 'email'
+
+    if (!debtorIds.length) {
+      await supabase.from('collection_campaigns')
+        .update({ status: 'sent', sent_at: new Date().toISOString() })
+        .eq('id', campaignId)
+      return { sent: 0 }
+    }
+
+    // Cargar deudores por IDs con sus deudas para variables del mensaje
+    const { data: debtors } = await supabase
+      .from('collection_debtors')
+      .select('id, debtor_name, debtor_document, phone, whatsapp, email, collection_debts(outstanding_amount, due_date, currency)')
+      .in('id', debtorIds)
+
+    const contacts = (debtors ?? [])
+      .filter((d: any) => {
+        if (channel === 'email')    return !!d.email
+        if (channel === 'whatsapp') return !!(d.whatsapp ?? d.phone)
+        return !!(d.phone ?? d.whatsapp)
+      })
+      .map((d: any) => {
+        const rawPhone = d.whatsapp ?? d.phone
+        const to = channel === 'email'
+          ? d.email
+          : toE164(rawPhone)
+
+        const saldo   = (d.collection_debts ?? []).reduce((acc: number, x: any) => acc + (x.outstanding_amount ?? 0), 0)
+        const dueDate = d.collection_debts?.[0]?.due_date ?? ''
+        const currency = d.collection_debts?.[0]?.currency ?? 'COP'
+
+        const text = messageTemplate
+          .replace(/\{\{nombre\}\}/g,   d.debtor_name ?? '')
+          .replace(/\{\{saldo\}\}/g,    new Intl.NumberFormat('es-CO', { style: 'currency', currency }).format(saldo))
+          .replace(/\{\{dias_mora\}\}/g, '')
+          .replace(/\{\{empresa\}\}/g,  '')
+          .replace(/\{\{asesor\}\}/g,   'RS Back Office')
+          .replace(/\{\{facturas\}\}/g, String((d.collection_debts ?? []).length))
+
+        return { to, text, debtorId: d.id, dueDate, currency, saldo }
+      })
+
+    if (!contacts.length) {
+      await supabase.from('collection_campaigns')
+        .update({ status: 'sent', sent_at: new Date().toISOString() })
+        .eq('id', campaignId)
+      return { sent: 0 }
+    }
+
+    // Enviar mensajes individuales con la cola de BullMQ (reintentos automáticos)
+    await Promise.allSettled(
+      contacts.map(c =>
+        NotificationService.enqueue({
+          channel:   channel as any,
+          to:        c.to,
+          template:  'raw-text',
+          data:      { text: c.text },
+          companyId: campaign.company_id,
+          metadata:  { campaignId, debtorId: c.debtorId },
+        }),
+      ),
+    )
+
+    // Registrar acción de cobranza por cada deudor contactado
+    const actionChannel = channel === 'email' ? 'email' : channel === 'sms' ? 'sms' : 'whatsapp'
+    const actions = contacts.map(c => ({
+      debtor_id:  c.debtorId,
+      channel:    actionChannel,
+      result:     'contacted' as const,
+      notes:      `Envío masivo: ${campaign.name}`,
+      user_id:    campaign.created_by,
+      company_id: campaign.company_id,
+    }))
+    if (actions.length) {
+      await supabase.from('collection_actions').insert(actions)
+    }
+
+    // Actualizar status de deudores a in_collection si están en pending
+    await supabase.from('collection_debtors')
+      .update({ status: 'in_collection' })
+      .in('id', contacts.map(c => c.debtorId))
+      .eq('status', 'pending')
+
+    await supabase.from('collection_campaigns')
+      .update({ status: 'sent', sent_at: new Date().toISOString(), recipient_count: contacts.length })
+      .eq('id', campaignId)
+
+    return { sent: contacts.length }
+  }
+
+  // ── Debtors (crear / importar) ────────────────────────────────────────────
+
+  static async createDebtor(input: CreateDebtorInput, companyId: string) {
+    const { data, error } = await supabase
+      .from('collection_debtors')
+      .upsert({ ...input, company_id: companyId }, { onConflict: 'company_id,debtor_document' })
+      .select()
+      .single()
+
+    if (error) throw error
+    return data
+  }
+
+  static async createDebt(input: CreateDebtInput, companyId: string) {
+    const { data, error } = await supabase
+      .from('collection_debts')
+      .upsert(
+        { ...input, company_id: companyId, last_sync_at: new Date().toISOString() },
+        { onConflict: 'debtor_id,siigo_document' },
+      )
+      .select()
+      .single()
+
+    if (error) throw error
+    return data
+  }
+
+  // ── Templates ─────────────────────────────────────────────────────────────
+
+  static async listTemplates(companyId: string) {
+    const { data, error } = await supabase
+      .from('collection_templates')
+      .select('*')
+      .or(`company_id.eq.${companyId},is_global.eq.true`)
+      .eq('is_active', true)
+      .order('name')
+
+    if (error) throw error
+    return data
+  }
+
+  static async createTemplate(input: CreateTemplateInput, companyId: string) {
+    const { data, error } = await supabase
+      .from('collection_templates')
+      .insert({ ...input, company_id: companyId })
+      .select()
+      .single()
+
+    if (error) throw error
+    return data
+  }
+
+  static async updateTemplate(id: string, input: Partial<CreateTemplateInput>) {
+    const { data, error } = await supabase
+      .from('collection_templates')
+      .update(input)
+      .eq('id', id)
+      .select()
+      .single()
+
+    if (error) throw error
+    return data
+  }
+
+  static async deleteTemplate(id: string) {
+    const { data, error } = await supabase
+      .from('collection_templates')
+      .update({ is_active: false })
+      .eq('id', id)
+      .select()
+      .single()
+
+    if (error) throw error
+    return data
+  }
+
+  // ── Collection Tasks ──────────────────────────────────────────────────────
+
+  static async listCollectionTasks(companyId: string, query: { debtor_id?: string; page: number; limit: number }) {
+    const { debtor_id, page, limit } = query
+    const from = (page - 1) * limit
+
+    let q = supabase
+      .from('collection_tasks')
+      .select('*', { count: 'exact' })
+      .eq('company_id', companyId)
+      .order('due_date', { ascending: true })
+      .range(from, from + limit - 1)
+
+    if (debtor_id) q = q.eq('debtor_id', debtor_id)
+
+    const { data, error, count } = await q
+    if (error) throw error
+    return { data, total: count ?? 0, page, limit }
+  }
+
+  static async createCollectionTask(input: CreateTaskInput, companyId: string) {
+    const { data, error } = await supabase
+      .from('collection_tasks')
+      .insert({ ...input, company_id: companyId })
+      .select()
+      .single()
+
+    if (error) throw error
+    return data
+  }
+
+  static async updateCollectionTask(id: string, input: UpdateTaskInput) {
+    const { data, error } = await supabase
+      .from('collection_tasks')
+      .update(input)
+      .eq('id', id)
+      .select()
+      .single()
+
+    if (error) throw error
+    return data
+  }
+
+  // ── Inbound Messages ──────────────────────────────────────────────────────
+
+  static async listMessages(query: ListMessagesQuery) {
+    const { debtor_id, company_id, status, page, limit } = query
+    const from = (page - 1) * limit
+
+    let q = supabase
+      .from('collection_inbound_messages')
+      .select('*', { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .range(from, from + limit - 1)
+
+    if (debtor_id)  q = q.eq('debtor_id', debtor_id)
+    if (company_id) q = q.eq('company_id', company_id)
+    if (status)     q = q.eq('status', status)
+
+    const { data, error, count } = await q
+    if (error) throw error
+    return { data, total: count ?? 0, page, limit }
+  }
+
+  static async markMessageRead(id: string) {
+    const { data, error } = await supabase
+      .from('collection_inbound_messages')
+      .update({ status: 'read' })
+      .eq('id', id)
+      .select()
+      .single()
+
+    if (error) throw error
+    return data
+  }
+
+  // ── CSV Import ────────────────────────────────────────────────────────────
+
+  static async importDebtors(
+    rows: Array<Record<string, string>>,
+    companyId: string,
+    createdBy: string,
+  ): Promise<{ imported: number; skipped: number; errors: Array<{ row: number; reason: string }> }> {
+    let imported = 0
+    let skipped  = 0
+    const errors: Array<{ row: number; reason: string }> = []
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]!
+      const rowNum = i + 2 // 1-indexed + header
+
+      const debtor_document = row['debtor_document']?.trim()
+      const debtor_name     = row['debtor_name']?.trim()
+
+      if (!debtor_document || !debtor_name) {
+        errors.push({ row: rowNum, reason: 'debtor_document y debtor_name son obligatorios' })
+        skipped++
+        continue
+      }
+
+      // Upsert debtor (por documento + empresa)
+      const { data: debtor, error: debtorErr } = await supabase
+        .from('collection_debtors')
+        .upsert({
+          company_id:        companyId,
+          debtor_document,
+          debtor_name,
+          status:            'pending',
+          city:              row['city']?.trim()  || null,
+          phone:             row['phone']?.trim() || null,
+          email:             row['email']?.trim() || null,
+          whatsapp:          row['whatsapp']?.trim() || null,
+          preferred_channel: row['preferred_channel']?.trim() || 'phone',
+          notes:             row['notes']?.trim() || null,
+        }, { onConflict: 'company_id,debtor_document', ignoreDuplicates: false })
+        .select('id')
+        .single()
+
+      if (debtorErr || !debtor) {
+        errors.push({ row: rowNum, reason: debtorErr?.message ?? 'Error al crear deudor' })
+        skipped++
+        continue
+      }
+
+      // Si hay datos de deuda, insertarlos
+      const siigo_document = row['siigo_document']?.trim()
+      if (siigo_document) {
+        const totalBalance = parseFloat(row['total_balance'] ?? '0') || 0
+        const { error: debtErr } = await supabase
+          .from('collection_debts')
+          .upsert({
+            debtor_id:         debtor.id,
+            company_id:        companyId,
+            siigo_document,
+            due_date:          row['due_date']?.trim() || null,
+            branch:            row['branch']?.trim() || null,
+            cost_center:       row['cost_center']?.trim() || null,
+            seller:            row['seller']?.trim() || null,
+            overdue_1_30:      parseFloat(row['overdue_1_30']  ?? '0') || 0,
+            overdue_31_60:     parseFloat(row['overdue_31_60'] ?? '0') || 0,
+            overdue_61_90:     parseFloat(row['overdue_61_90'] ?? '0') || 0,
+            overdue_91_plus:   parseFloat(row['overdue_91_plus'] ?? '0') || 0,
+            not_yet_due:       parseFloat(row['not_yet_due'] ?? '0') || 0,
+            credit_balance:    parseFloat(row['credit_balance'] ?? '0') || 0,
+            total_balance:     totalBalance,
+            outstanding_amount: parseFloat(row['outstanding_amount'] ?? '0') || 0,
+            currency:          row['currency']?.trim() || 'COP',
+          }, { onConflict: 'debtor_id,siigo_document', ignoreDuplicates: false })
+
+        if (debtErr) {
+          errors.push({ row: rowNum, reason: `Deudor creado, error en deuda: ${debtErr.message}` })
+        }
+      }
+
+      imported++
+    }
+
+    return { imported, skipped, errors }
+  }
+}

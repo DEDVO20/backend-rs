@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Verificar tipos TypeScript
+        run: npx tsc --noEmit
+
+      - name: Correr tests
+        run: npm test
+        env:
+          NODE_ENV: test
+          SUPABASE_URL: https://placeholder.supabase.co
+          SUPABASE_ANON_KEY: placeholder_anon_key_at_least_10_chars
+          SUPABASE_SERVICE_ROLE_KEY: placeholder_service_role_key_at_least_10
+          ZAVU_API_KEY: placeholder
+          ZAVU_WEBHOOK_SECRET: placeholder
+          RS_TEAM_EMAIL: test@empresa.com
+          PLATFORM_URL: https://app.empresa.com
+          REDIS_URL: redis://localhost:6379
+
+  build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t backend:${{ github.sha }} .

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/Deiver Ordosgoitia/AppData/Roaming/Claude/local-agent-mode-sessions/skills-plugin/13e3c298-ec7d-49d6-8594-401305bbf884/07fa37c3-cf05-437b-8fb6-2f35b7c7efa2/skills/docx/**)",
+      "Bash(node -e ' *)",
+      "Bash(npx tsc *)",
+      "Bash(curl -s -X POST http://localhost:3000/api/onboarding -H \"Content-Type: application/json\" -d \"{\\\\\"company_name\\\\\":\\\\\"Super star\\\\\",\\\\\"company_nit\\\\\":\\\\\"98765431-2\\\\\",\\\\\"company_type\\\\\":\\\\\"S.A.S\\\\\",\\\\\"company_sector\\\\\":\\\\\"Comercio\\\\\",\\\\\"company_city\\\\\":\\\\\"Bogota\\\\\",\\\\\"rep_name\\\\\":\\\\\"Deiver Villadiego\\\\\",\\\\\"rep_email\\\\\":\\\\\"dedvo2016@gmail.com\\\\\"}\")",
+      "Bash(echo \"EXIT:$?\")"
+    ]
+  }
+}
