@@ -7,6 +7,7 @@ import { logger }  from './lib/logger.js'
 import { rateLimiter }       from './middleware/rateLimiter.js'
 import { auditMiddleware }   from './middleware/auditMiddleware.js'
 import { startNotificationWorker } from './notifications/queue/notificationQueue.js'
+import { startTaskScheduler }     from './cron/taskScheduler.js'
 import { supabase }          from './lib/supabase.js'
 import { redis }             from './lib/redis.js'
 import { zavuWebhook }       from './webhooks/zavu.webhook.js'
@@ -126,6 +127,7 @@ app.onError((err, c) => {
 const PORT = Number(process.env.PORT ?? 3000)
 
 const worker = startNotificationWorker()
+const cronWorker = startTaskScheduler()
 
 const server = serve({ fetch: app.fetch, port: PORT }, () => {
   logger.info(`Servidor corriendo en http://localhost:${PORT}`)
@@ -136,7 +138,8 @@ async function shutdown(signal: string) {
   logger.info(`${signal} recibido — cerrando servidor...`)
 
   await worker.close()
-  logger.info('Worker de notificaciones cerrado')
+  await cronWorker.close()
+  logger.info('Workers cerrados')
 
   await redis.quit()
   logger.info('Redis desconectado')
