@@ -3,6 +3,7 @@ import { zValidator } from '@hono/zod-validator'
 import { authMiddleware } from '../../middleware/auth.js'
 import { requireModule }  from '../../middleware/requireRole.js'
 import { requireRole }    from '../../middleware/requireRole.js'
+import { supabase } from '../../lib/supabase.js'
 import { CollectionService } from './collection.service.js'
 import {
   listDebtorsQuerySchema,
@@ -271,6 +272,100 @@ app.post('/debtors/import',
 
     const result = await CollectionService.importDebtors(rows, companyId, createdBy)
     return c.json(result, result.errors.length > 0 ? 207 : 200)
+  },
+)
+
+// ── Contacts — Excel import (update phone/email on existing debtors) ──────
+
+app.post('/contacts/import',
+  requireRole('admin', 'rs_admin', 'rs_staff'),
+  async (c) => {
+    const contentType = c.req.header('content-type') ?? ''
+    if (!contentType.includes('multipart/form-data')) {
+      return c.json({ error: 'Se requiere multipart/form-data con un campo "file"' }, 400)
+    }
+
+    const formData = await c.req.formData()
+    const file = formData.get('file')
+    if (!file || typeof file === 'string') {
+      return c.json({ error: 'Campo "file" requerido' }, 400)
+    }
+
+    // Parse Excel with SheetJS-style approach using raw buffer
+    const buffer = await (file as File).arrayBuffer()
+    let rows: string[][]
+
+    try {
+      const { read, utils } = await import('xlsx')
+      const wb = read(buffer, { type: 'array' })
+      const ws = wb.Sheets[wb.SheetNames[0]!]!
+      rows = utils.sheet_to_json<string[]>(ws, { header: 1, defval: '' })
+    } catch {
+      return c.json({ error: 'No se pudo leer el archivo Excel' }, 400)
+    }
+
+    if (rows.length < 2) {
+      return c.json({ error: 'El archivo debe tener al menos una fila de datos' }, 400)
+    }
+
+    // Skip header row, map columns: A=empresa, B=abreviatura, C=asesor, D=NIT/celular, E=emailFact, F=contactoComercial, G=emailComercial, H=contactoTesoreria, I=emailTesoreria
+    const dataRows = rows.slice(1).filter(r => r[3]) // must have NIT/celular (col D)
+
+    let updated = 0
+    let notFound = 0
+    const errors: string[] = []
+
+    for (const row of dataRows) {
+      const nit      = String(row[3] ?? '').trim()
+      const phone    = String(row[3] ?? '').trim()
+      const email    = String(row[4] ?? '').trim()
+      const contact  = String(row[5] ?? '').trim()
+      const emailCom = String(row[6] ?? '').trim()
+
+      if (!nit) continue
+
+      // Try to match by debtor_document (NIT)
+      const updateData: Record<string, string> = {}
+      // If it looks like a phone number (starts with 3, length 10), set as phone
+      if (/^3\d{9}$/.test(nit.replace(/\D/g, ''))) {
+        updateData.phone = nit.replace(/\D/g, '')
+        updateData.whatsapp = nit.replace(/\D/g, '')
+      }
+      if (email && email.includes('@')) updateData.email = email
+      if (contact) updateData.notes = `Contacto comercial: ${contact}${emailCom ? ` (${emailCom})` : ''}`
+
+      if (Object.keys(updateData).length === 0) continue
+
+      // Update all debtors with this document number
+      const { data: matched, error } = await supabase
+        .from('collection_debtors')
+        .update(updateData)
+        .eq('debtor_document', nit)
+        .select('id')
+
+      if (error) {
+        errors.push(`NIT ${nit}: ${error.message}`)
+        continue
+      }
+
+      if (matched && matched.length > 0) {
+        updated += matched.length
+      } else {
+        // Try matching by phone if NIT didn't match
+        if (/^3\d{9}$/.test(nit.replace(/\D/g, ''))) {
+          notFound++
+        } else {
+          notFound++
+        }
+      }
+    }
+
+    return c.json({
+      total: dataRows.length,
+      updated,
+      notFound,
+      errors,
+    })
   },
 )
 
