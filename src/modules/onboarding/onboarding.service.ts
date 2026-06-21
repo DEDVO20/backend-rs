@@ -73,16 +73,58 @@ export class OnboardingService {
     if (error) throw error
     logger.info({ onboardingId: id, reviewerId }, 'Onboarding aprobado')
 
+    // 1. Crear la empresa
+    let companyId = data.company_id
+    if (!companyId) {
+      const { data: company, error: companyErr } = await supabase
+        .from('companies')
+        .insert({
+          name:    data.company_name,
+          nit:     data.company_nit ?? null,
+          city:    data.company_city ?? null,
+          sector:  data.company_sector ?? null,
+          phone:   data.company_phone ?? null,
+          address: data.company_address ?? null,
+          website: data.company_website ?? null,
+          status:  'activa',
+        })
+        .select()
+        .single()
+
+      if (companyErr) {
+        logger.error({ companyErr }, 'Error creando empresa desde onboarding')
+      } else {
+        companyId = company.id
+        // Vincular empresa al onboarding
+        await supabase.from('client_onboardings').update({ company_id: companyId }).eq('id', id)
+      }
+    }
+
+    // 2. Crear invitación para que el representante asigne su contraseña
+    const token = crypto.randomUUID()
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
+
+    await supabase.from('company_invitations').insert({
+      email:      data.rep_email.toLowerCase().trim(),
+      full_name:  data.rep_name,
+      role:       'client_owner',
+      company_id: companyId,
+      token,
+      status:     'pending',
+      expires_at: expiresAt,
+    })
+
+    // 3. Enviar email con link para crear contraseña
     void NotificationService.enqueue({
-      channel:   'email',
-      template:  'kyc-approved',
-      to:        data.rep_email,
+      channel:  'email',
+      template: 'kyc-approved',
+      to:       data.rep_email,
       data: {
         ownerName:   data.rep_name,
         companyName: data.company_name,
-        platformUrl: PLATFORM_URL,
+        platformUrl: `${PLATFORM_URL}/invitations/accept?token=${token}`,
       },
-      companyId: data.company_id ?? undefined,
+      companyId: companyId ?? undefined,
     })
 
     return data
@@ -126,14 +168,15 @@ export class OnboardingService {
       .single()
 
     if (error) {
-      // Unique constraint violation → 409 con mensaje legible
       if (error.code === '23505') {
-        const dup = error.message.includes('company_nit')
-          ? 'Ya existe una solicitud con ese NIT.'
-          : error.message.includes('rep_email')
-          ? 'Ya existe una solicitud con ese correo electrónico.'
-          : 'Ya existe una solicitud con esos datos.'
-        const conflict = new Error(dup) as any
+        // Devolver el registro existente en vez de error 409
+        let q = supabase.from('client_onboardings').select('*')
+        if (input.company_nit) q = q.eq('company_nit', input.company_nit)
+        else q = q.eq('rep_email', input.rep_email)
+        const { data: existing } = await q.single()
+        if (existing) return existing
+
+        const conflict = new Error('Ya existe una solicitud con esos datos.') as any
         conflict.statusCode = 409
         throw conflict
       }
@@ -233,11 +276,9 @@ export class OnboardingService {
         kyc_submission_id: submission.id,
         doc_type:          input.doc_type,
         status:            'uploaded',
-        original_name:     input.original_name,
+        file_name:         input.original_name ?? input.file_name ?? null,
         storage_path:      input.storage_path,
-        file_url:          input.file_url,
-        mime_type:         input.mime_type ?? null,
-        size_bytes:        input.size_bytes ?? null,
+        file_size_bytes:   input.size_bytes ?? input.file_size_bytes ?? null,
         uploaded_at:       new Date().toISOString(),
       }, { onConflict: 'kyc_submission_id,doc_type' })
       .select()

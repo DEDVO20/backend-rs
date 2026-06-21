@@ -45,12 +45,14 @@ export const acceptPoliciesSchema = z.object({
 })
 
 export const uploadKycDocSchema = z.object({
-  doc_type:      z.enum(['rut','cedula_representante','sarlaft_form','camara_comercio','estados_financieros','otro']),
-  storage_path:  z.string(),
-  file_url:      z.string().url(),
-  original_name: z.string(),
-  mime_type:     z.string().optional(),
-  size_bytes:    z.number().int().positive().optional(),
+  doc_type:        z.enum(['rut','cedula_representante','sarlaft_form','camara_comercio','estados_financieros','otro']),
+  storage_path:    z.string(),
+  file_url:        z.string().optional(),
+  original_name:   z.string().optional(),
+  file_name:       z.string().optional(),
+  mime_type:       z.string().optional(),
+  size_bytes:      z.number().int().positive().optional(),
+  file_size_bytes: z.number().int().positive().optional(),
 })
 
 export const reviewKycDocSchema = z.object({

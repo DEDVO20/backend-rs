@@ -5,6 +5,8 @@ import { requireModule }     from '../../middleware/requireRole.js'
 import { requireRole }       from '../../middleware/requireRole.js'
 import { OnboardingService } from './onboarding.service.js'
 import { DocumentsService }  from '../documents/documents.service.js'
+import { supabase }          from '../../lib/supabase.js'
+import { logger }            from '../../lib/logger.js'
 import {
   createOnboardingSchema,
   updateOnboardingSchema,
@@ -121,6 +123,7 @@ app.post('/:id/kyc/documents', async (c) => {
 
 // PATCH /api/onboarding/:id/kyc/documents/:docId — verificar/rechazar doc
 app.patch('/:id/kyc/documents/:docId',
+  authMiddleware,
   requireRole('rs_admin', 'admin'),
   zValidator('json', reviewKycDocSchema),
   async (c) => {
@@ -194,6 +197,56 @@ app.post('/:id/request-correction',
     const { notes } = await c.req.json<{ notes: string }>()
     const data = await OnboardingService.requestCorrection(c.req.param('id')!, userId, notes)
     return c.json(data)
+  },
+)
+
+// POST /api/onboarding/:id/resend-invitation — reenviar invitación
+app.post('/:id/resend-invitation',
+  authMiddleware,
+  requireRole('rs_admin', 'admin'),
+  async (c) => {
+    const onboardingId = c.req.param('id')!
+
+    const ob = await OnboardingService.getById(onboardingId)
+    if (!ob) return c.json({ error: 'Onboarding no encontrado' }, 404)
+
+    // Invalidar invitaciones anteriores
+    await supabase
+      .from('company_invitations')
+      .update({ status: 'cancelled' })
+      .eq('email', ob.rep_email.toLowerCase().trim())
+      .eq('status', 'pending')
+
+    // Crear nueva invitación
+    const token = crypto.randomUUID()
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
+
+    await supabase.from('company_invitations').insert({
+      email:      ob.rep_email.toLowerCase().trim(),
+      full_name:  ob.rep_name,
+      role:       'client_owner',
+      company_id: ob.company_id ?? null,
+      token,
+      status:     'pending',
+      expires_at: expiresAt,
+    })
+
+    const { NotificationService } = await import('../../notifications/NotificationService.js')
+    const platformUrl = process.env.PLATFORM_URL ?? 'https://app.tudominio.com'
+
+    void NotificationService.enqueue({
+      channel:  'email',
+      template: 'kyc-approved',
+      to:       ob.rep_email,
+      data: {
+        ownerName:   ob.rep_name,
+        companyName: ob.company_name,
+        platformUrl: `${platformUrl}/invitations/accept?token=${token}`,
+      },
+    })
+
+    logger.info({ onboardingId, email: ob.rep_email }, 'Invitación reenviada')
+    return c.json({ ok: true, email: ob.rep_email })
   },
 )
 
