@@ -523,14 +523,32 @@ export class CollectionService {
     rows: Array<Record<string, string>>,
     companyId: string,
     createdBy: string,
-  ): Promise<{ imported: number; skipped: number; errors: Array<{ row: number; reason: string }> }> {
+    onProgress?: (pct: number, msg: string) => void,
+  ): Promise<{
+    imported: number; skipped: number; newDebts: number; updatedDebts: number;
+    paidDebts: number; paidDebtors: number;
+    errors: Array<{ row: number; reason: string }>
+  }> {
     let imported = 0
     let skipped  = 0
+    let newDebts = 0
+    let updatedDebts = 0
     const errors: Array<{ row: number; reason: string }> = []
+    const total = rows.length
 
+    // Recopilar qué facturas vienen en este CSV por deudor
+    const csvInvoicesByDebtor = new Map<string, Set<string>>()
+    const touchedDebtorIds = new Set<string>()
+
+    // ── Paso 1: Procesar filas ──────────────────────────────────────────────
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i]!
-      const rowNum = i + 2 // 1-indexed + header
+      const rowNum = i + 2
+
+      if (onProgress && i % 5 === 0) {
+        const pct = Math.round(((i + 1) / total) * 80)
+        onProgress(pct, `Procesando ${i + 1} de ${total} registros...`)
+      }
 
       const debtor_document = row['debtor_document']?.trim()
       const debtor_name     = row['debtor_name']?.trim()
@@ -541,63 +559,149 @@ export class CollectionService {
         continue
       }
 
-      // Upsert debtor (por documento + empresa)
-      const { data: debtor, error: debtorErr } = await supabase
+      // Upsert debtor — NO sobreescribir status si ya existe
+      const { data: existing } = await supabase
         .from('collection_debtors')
-        .upsert({
-          company_id:        companyId,
-          debtor_document,
-          debtor_name,
-          status:            'pending',
-          city:              row['city']?.trim()  || null,
-          phone:             row['phone']?.trim() || null,
-          email:             row['email']?.trim() || null,
-          whatsapp:          row['whatsapp']?.trim() || null,
-          preferred_channel: row['preferred_channel']?.trim() || 'phone',
-          notes:             row['notes']?.trim() || null,
-        }, { onConflict: 'company_id,debtor_document', ignoreDuplicates: false })
-        .select('id')
-        .single()
+        .select('id, status')
+        .eq('company_id', companyId)
+        .eq('debtor_document', debtor_document)
+        .maybeSingle()
 
-      if (debtorErr || !debtor) {
-        errors.push({ row: rowNum, reason: debtorErr?.message ?? 'Error al crear deudor' })
-        skipped++
-        continue
+      let debtorId: string
+
+      if (existing) {
+        debtorId = existing.id
+        // Solo actualizar nombre, no tocar status/phone/email (esos vienen de contactos)
+        await supabase.from('collection_debtors')
+          .update({ debtor_name })
+          .eq('id', debtorId)
+      } else {
+        const { data: newDebtor, error: debtorErr } = await supabase
+          .from('collection_debtors')
+          .insert({
+            company_id:        companyId,
+            debtor_document,
+            debtor_name,
+            status:            'pending',
+            preferred_channel: 'phone',
+          })
+          .select('id')
+          .single()
+
+        if (debtorErr || !newDebtor) {
+          errors.push({ row: rowNum, reason: debtorErr?.message ?? 'Error al crear deudor' })
+          skipped++
+          continue
+        }
+        debtorId = newDebtor.id
       }
 
-      // Si hay datos de deuda, insertarlos
+      touchedDebtorIds.add(debtorId)
+
+      // Upsert factura
       const siigo_document = row['siigo_document']?.trim()
       if (siigo_document) {
+        // Registrar esta factura como presente en el CSV
+        if (!csvInvoicesByDebtor.has(debtorId)) csvInvoicesByDebtor.set(debtorId, new Set())
+        csvInvoicesByDebtor.get(debtorId)!.add(siigo_document)
+
+        // Verificar si la factura ya existía
+        const { data: existingDebt } = await supabase
+          .from('collection_debts')
+          .select('id')
+          .eq('debtor_id', debtorId)
+          .eq('siigo_document', siigo_document)
+          .maybeSingle()
+
         const totalBalance = parseFloat(row['total_balance'] ?? '0') || 0
+        const outstandingAmount = parseFloat(row['outstanding_amount'] ?? '0') || 0
+
         const { error: debtErr } = await supabase
           .from('collection_debts')
           .upsert({
-            debtor_id:         debtor.id,
+            debtor_id:         debtorId,
             company_id:        companyId,
             siigo_document,
             due_date:          row['due_date']?.trim() || null,
-            branch:            row['branch']?.trim() || null,
-            cost_center:       row['cost_center']?.trim() || null,
             seller:            row['seller']?.trim() || null,
             overdue_1_30:      parseFloat(row['overdue_1_30']  ?? '0') || 0,
             overdue_31_60:     parseFloat(row['overdue_31_60'] ?? '0') || 0,
             overdue_61_90:     parseFloat(row['overdue_61_90'] ?? '0') || 0,
             overdue_91_plus:   parseFloat(row['overdue_91_plus'] ?? '0') || 0,
             not_yet_due:       parseFloat(row['not_yet_due'] ?? '0') || 0,
-            credit_balance:    parseFloat(row['credit_balance'] ?? '0') || 0,
             total_balance:     totalBalance,
-            outstanding_amount: parseFloat(row['outstanding_amount'] ?? '0') || 0,
+            outstanding_amount: outstandingAmount,
             currency:          row['currency']?.trim() || 'COP',
           }, { onConflict: 'debtor_id,siigo_document', ignoreDuplicates: false })
 
         if (debtErr) {
-          errors.push({ row: rowNum, reason: `Deudor creado, error en deuda: ${debtErr.message}` })
+          errors.push({ row: rowNum, reason: `Error en factura: ${debtErr.message}` })
+        } else {
+          if (existingDebt) updatedDebts++
+          else newDebts++
         }
       }
 
       imported++
     }
 
-    return { imported, skipped, errors }
+    // ── Paso 2: Marcar facturas pagadas ─────────────────────────────────────
+    onProgress?.(82, 'Detectando facturas pagadas...')
+
+    let paidDebts = 0
+    for (const [debtorId, csvInvoices] of csvInvoicesByDebtor) {
+      // Obtener todas las facturas actuales de este deudor
+      const { data: allDebts } = await supabase
+        .from('collection_debts')
+        .select('id, siigo_document, outstanding_amount')
+        .eq('debtor_id', debtorId)
+
+      if (!allDebts) continue
+
+      // Facturas que NO aparecen en el CSV → marcar outstanding_amount = 0 (pagada)
+      for (const debt of allDebts) {
+        if (!csvInvoices.has(debt.siigo_document) && (debt.outstanding_amount ?? 0) > 0) {
+          await supabase.from('collection_debts')
+            .update({ outstanding_amount: 0, overdue_1_30: 0, overdue_31_60: 0, overdue_61_90: 0, overdue_91_plus: 0, not_yet_due: 0 })
+            .eq('id', debt.id)
+          paidDebts++
+        }
+      }
+    }
+
+    // ── Paso 3: Recalcular tramo y status de cada deudor ────────────────────
+    onProgress?.(90, 'Actualizando tramos y estados...')
+
+    let paidDebtors = 0
+    for (const debtorId of touchedDebtorIds) {
+      const { data: debts } = await supabase
+        .from('collection_debts')
+        .select('outstanding_amount, overdue_1_30, overdue_31_60, overdue_61_90, overdue_91_plus')
+        .eq('debtor_id', debtorId)
+
+      if (!debts) continue
+
+      const totalOutstanding = debts.reduce((s, d) => s + (d.outstanding_amount ?? 0), 0)
+
+      // Calcular max tramo
+      let maxTramo = 0
+      if (debts.some(d => (d.overdue_91_plus ?? 0) > 0)) maxTramo = 91
+      else if (debts.some(d => (d.overdue_61_90 ?? 0) > 0)) maxTramo = 61
+      else if (debts.some(d => (d.overdue_31_60 ?? 0) > 0)) maxTramo = 31
+      else if (debts.some(d => (d.overdue_1_30 ?? 0) > 0)) maxTramo = 1
+
+      const update: Record<string, unknown> = { prev_max_tramo: maxTramo }
+
+      if (totalOutstanding <= 0) {
+        update.status = 'paid'
+        paidDebtors++
+      }
+
+      await supabase.from('collection_debtors').update(update).eq('id', debtorId)
+    }
+
+    onProgress?.(100, '¡Importación completada!')
+
+    return { imported, skipped, newDebts, updatedDebts, paidDebts, paidDebtors, errors }
   }
 }

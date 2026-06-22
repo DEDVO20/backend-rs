@@ -237,6 +237,8 @@ app.post('/debtors/import',
   requireRole('admin', 'rs_admin', 'rs_staff'),
   async (c) => {
     const { id: createdBy, companyId: userCompanyId } = c.get('user')
+    const accept = c.req.header('accept') ?? ''
+    const useSSE = accept.includes('text/event-stream')
 
     const contentType = c.req.header('content-type') ?? ''
     if (!contentType.includes('multipart/form-data')) {
@@ -270,6 +272,37 @@ app.post('/debtors/import',
       rows.push(mapSiigoRow(raw))
     }
 
+    // SSE: stream progress
+    if (useSSE) {
+      return new Response(
+        new ReadableStream({
+          async start(controller) {
+            const send = (data: Record<string, unknown>) => {
+              controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`))
+            }
+
+            send({ type: 'progress', progress: 0, message: `Iniciando importación de ${rows.length} registros...` })
+
+            const result = await CollectionService.importDebtors(rows, companyId, createdBy, (pct, msg) => {
+              send({ type: 'progress', progress: pct, message: msg })
+            })
+
+            send({ type: 'progress', progress: 100, message: '¡Importación completada!' })
+            send({ type: 'done', ...result })
+            controller.close()
+          },
+        }),
+        {
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+          },
+        },
+      )
+    }
+
+    // Fallback JSON normal
     const result = await CollectionService.importDebtors(rows, companyId, createdBy)
     return c.json(result, result.errors.length > 0 ? 207 : 200)
   },
