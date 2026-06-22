@@ -195,37 +195,41 @@ describe('Notificaciones — collection', () => {
     )
   })
 
-  it('sendCampaign() llama sendBroadcast() solo con contactos que tienen teléfono', async () => {
+  it('sendCampaign() encola mensajes solo para contactos con teléfono', async () => {
     const mockCampaign = {
-      id:                   'camp_001',
-      name:                 'Campaña Junio',
-      channel:              'whatsapp',
-      company_id:           'comp_001',
-      collection_templates: {},
-      collection_debtors:   [
-        { id: 'd1', debtor_name: 'Juan', phone: '+573001111111', whatsapp: null },
-        { id: 'd2', debtor_name: 'Sin Tel', phone: null, whatsapp: null },
-      ],
+      id:               'camp_001',
+      name:             'Campaña Junio',
+      channel:          'whatsapp',
+      company_id:       'comp_001',
+      created_by:       'user_001',
+      debtor_ids:       ['d1', 'd2'],
+      message_template: 'Hola {{nombre}}',
     }
 
+    const mockDebtors = [
+      { id: 'd1', debtor_name: 'Juan', phone: '+573001111111', whatsapp: null, email: null, collection_debts: [] },
+      { id: 'd2', debtor_name: 'Sin Tel', phone: null, whatsapp: null, email: null, collection_debts: [] },
+    ]
+
     const { supabase } = await import('../src/lib/supabase.js')
-    const campaignChain: any = {
-      select: () => campaignChain,
-      eq:     () => campaignChain,
+    const chain: any = {
+      select: () => chain,
+      eq:     () => chain,
+      in:     () => chain,
       single: () => Promise.resolve({ data: mockCampaign, error: null }),
-      update: () => campaignChain,
+      update: () => chain,
+      insert: () => Promise.resolve({ data: null, error: null }),
+      then:   (fn: any) => Promise.resolve({ data: mockDebtors, error: null }).then(fn),
     }
-    ;(supabase.from as any) = () => campaignChain
+    const { supabase: sb } = await import('../src/lib/supabase.js')
+    ;(sb.from as any) = () => chain
 
     const result = await CollectionService.sendCampaign('camp_001')
 
-    expect(NotificationService.sendBroadcast).toHaveBeenCalledOnce()
-
-    const [call] = vi.mocked(NotificationService.sendBroadcast).mock.calls
-    expect(call[0].channel).toBe('whatsapp')
-    expect(call[0].template).toBe('collection-reminder')
-    expect(call[0].contacts).toHaveLength(1)
-    expect(call[0].contacts[0].to).toBe('+573001111111')
+    expect(NotificationService.enqueue).toHaveBeenCalledTimes(1)
+    expect(NotificationService.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: 'whatsapp', to: '+573001111111' }),
+    )
     expect(result.sent).toBe(1)
   })
 })

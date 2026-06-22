@@ -69,22 +69,20 @@ function fromMocks() {
 describe('Webhook Zavu', () => {
   beforeEach(() => vi.clearAllMocks())
 
-  it('retorna 401 cuando la firma es inválida', async () => {
-    const res = await post({ type: 'message.inbound' }, { 'x-zavu-signature': 'firma_falsa' })
-    expect(res.status).toBe(401)
-    const json = await res.json() as { error: string }
-    expect(json.error).toMatch(/firma/i)
+  it('procesa el evento aunque la firma sea inválida (log warning)', async () => {
+    const res = await post({ id: 'evt-1', type: 'message.inbound', senderId: 'z', data: { channel: 'sms', from: '+57300', text: 'test' } }, { 'x-zavu-signature': 'firma_falsa' })
+    expect(res.status).toBe(200)
   })
 
-  it('retorna 401 cuando falta la cabecera de firma', async () => {
-    const raw = JSON.stringify({ type: 'message.inbound' })
+  it('procesa el evento cuando falta la cabecera de firma', async () => {
+    const raw = JSON.stringify({ id: 'evt-2', type: 'message.inbound', senderId: 'z', data: { channel: 'sms', from: '+57300', text: 'test' } })
     const req = new Request('http://localhost/', {
       method:  'POST',
       headers: { 'content-type': 'application/json' },
       body:    raw,
     })
     const res = await zavuWebhook.fetch(req)
-    expect(res.status).toBe(401)
+    expect(res.status).toBe(200)
   })
 
   it('message.inbound guarda el mensaje en collection_inbound_messages', async () => {
