@@ -14,6 +14,11 @@ export const updateDebtorSchema = z.object({
   assigned_user_id:  z.string().uuid().nullable().optional(),
   preferred_channel: z.enum(['sms','email','whatsapp','phone','manual']).optional(),
   notes:             z.string().optional(),
+  debtor_name:       z.string().min(2).optional(),
+  phone:             z.string().optional(),
+  whatsapp:          z.string().optional(),
+  email:             z.string().email().optional().or(z.literal('')),
+  city:              z.string().optional(),
 })
 
 export const createActionSchema = z.object({
