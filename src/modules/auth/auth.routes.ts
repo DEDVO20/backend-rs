@@ -99,19 +99,40 @@ app.post('/logout', authMiddleware, async (c) => {
   return c.json({ message: 'Sesión cerrada correctamente' })
 })
 
-// POST /auth/forgot-password
+// POST /auth/forgot-password — genera token y envía email via Zavu
 app.post('/forgot-password',
   authLimiter,
   zValidator('json', forgotPasswordSchema),
   async (c) => {
-    const { email, redirect_url } = c.req.valid('json')
+    const { email } = c.req.valid('json')
 
-    const redirectTo = redirect_url ?? `${process.env.PLATFORM_URL}/reset-password`
+    // Verificar que el usuario existe (sin revelar al cliente)
+    const { data: listData } = await supabase.auth.admin.listUsers()
+    const user = listData?.users?.find(u => u.email === email.toLowerCase().trim())
 
-    const { error } = await supabasePublic.auth.resetPasswordForEmail(email, { redirectTo })
+    if (user) {
+      const token = crypto.randomUUID()
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString() // 1 hora
 
-    if (error) {
-      return c.json({ error: 'No se pudo enviar el correo de recuperación' }, 500)
+      // Guardar token en company_invitations (reutilizamos la tabla)
+      await supabase.from('company_invitations').insert({
+        email: email.toLowerCase().trim(),
+        token,
+        role:       'password_reset',
+        status:     'pending',
+        expires_at: expiresAt,
+      })
+
+      const platformUrl = process.env.PLATFORM_URL ?? 'https://app.tudominio.com'
+      const resetUrl = `${platformUrl}/reset-password?token=${token}`
+
+      const { NotificationService } = await import('../../notifications/NotificationService.js')
+      void NotificationService.enqueue({
+        channel:  'email',
+        template: 'password-reset',
+        to:       email,
+        data:     { resetUrl, name: user.user_metadata?.full_name ?? '' },
+      })
     }
 
     // Siempre 200 para no revelar si el email existe
@@ -119,28 +140,48 @@ app.post('/forgot-password',
   },
 )
 
-// POST /auth/reset-password
+// POST /auth/reset-password — verifica token propio y actualiza contraseña
 app.post('/reset-password',
   authLimiter,
   zValidator('json', resetPasswordSchema),
   async (c) => {
-    const { access_token, password } = c.req.valid('json')
+    const { access_token: token, password } = c.req.valid('json')
 
-    // Verificar que el token es válido antes de actualizar
-    const { data: { user }, error: userError } = await supabasePublic.auth.getUser(access_token)
+    // Buscar token en company_invitations
+    const { data: inv, error: invErr } = await supabase
+      .from('company_invitations')
+      .select('email')
+      .eq('token', token)
+      .eq('role', 'password_reset')
+      .eq('status', 'pending')
+      .gt('expires_at', new Date().toISOString())
+      .single()
 
-    if (userError || !user) {
+    if (invErr || !inv) {
       return c.json({ error: 'Token inválido o expirado' }, 401)
     }
 
-    // Actualizar la contraseña usando el service_role (no requiere sesión activa)
+    // Buscar usuario por email
+    const { data: listData } = await supabase.auth.admin.listUsers()
+    const user = listData?.users?.find(u => u.email === inv.email)
+
+    if (!user) {
+      return c.json({ error: 'Usuario no encontrado' }, 404)
+    }
+
+    // Actualizar contraseña
     const { error } = await supabase.auth.admin.updateUserById(user.id, { password })
 
     if (error) {
       return c.json({ error: 'No se pudo actualizar la contraseña' }, 500)
     }
 
-    // Revocar todas las sesiones activas — los tokens anteriores dejan de funcionar
+    // Marcar token como usado
+    await supabase.from('company_invitations')
+      .update({ status: 'accepted', accepted_at: new Date().toISOString() })
+      .eq('token', token)
+
+    // Revocar sesiones activas
     await supabase.auth.admin.signOut(user.id)
 
     auditAsync({ action: 'update', resource: 'auth', resource_id: user.id, c,

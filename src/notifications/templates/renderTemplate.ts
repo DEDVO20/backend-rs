@@ -100,6 +100,18 @@ const templates: Record<string, Builder> = {
     text: `Tarea vencida: ${str(d.taskTitle)} (${str(d.companyName)}). Resuélvela a la brevedad.`,
   }),
 
+  // ── Reset de contraseña ───────────────────────────────────────────────────
+  'password-reset': (d) => ({
+    subject: 'Restablecer tu contraseña — RS Back Office',
+    html: layout('Restablecer contraseña', `
+      <p>Hola${d.name ? ` ${str(d.name)}` : ''},</p>
+      <p>Recibimos una solicitud para restablecer tu contraseña.</p>
+      <p><a class="btn" href="${str(d.resetUrl)}">Restablecer contraseña</a></p>
+      <p style="color:#888;font-size:13px">Este enlace expira en 1 hora. Si no solicitaste este cambio, ignora este correo.</p>
+    `),
+    text: `Hola${d.name ? ` ${str(d.name)}` : ''}, restablece tu contraseña aquí: ${str(d.resetUrl)}. Expira en 1 hora.`,
+  }),
+
   // ── Cobranza ──────────────────────────────────────────────────────────────
   'collection-reminder': (d) => ({
     subject: `Recordatorio de pago — ${str(d.currency)} ${str(d.amount)}`,
