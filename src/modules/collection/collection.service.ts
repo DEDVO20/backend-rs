@@ -410,7 +410,7 @@ export class CollectionService {
     return data
   }
 
-  static async createTemplate(input: CreateTemplateInput, companyId: string) {
+  static async createTemplate(input: CreateTemplateInput, companyId: string | null) {
     const { data, error } = await supabase
       .from('collection_templates')
       .insert({ ...input, company_id: companyId })
