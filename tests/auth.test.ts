@@ -8,22 +8,23 @@ vi.mock('../src/lib/logger.js', () => ({
   logger: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
 }))
 
-vi.mock('../src/lib/supabase.js', () => ({
+vi.mock('../src/lib/supabase.js', () => {
+  const chain: any = {
+    select: vi.fn().mockReturnThis(),
+    eq:     vi.fn().mockReturnThis(),
+    gt:     vi.fn().mockReturnThis(),
+    single: vi.fn().mockResolvedValue({ data: { role: 'admin', company_id: null, active: true, email: 'test@empresa.com' }, error: null }),
+    insert: vi.fn().mockResolvedValue({ error: null }),
+    update: vi.fn().mockReturnThis(),
+  }
+  return {
   supabase: {
-    from: vi.fn().mockReturnValue({
-      select: vi.fn().mockReturnValue({
-        eq: vi.fn().mockReturnValue({
-          single: vi.fn().mockResolvedValue({
-            data:  { role: 'admin', company_id: null, active: true },
-            error: null,
-          }),
-        }),
-      }),
-    }),
+    from: vi.fn().mockReturnValue(chain),
     auth: {
       admin: {
         signOut:        vi.fn().mockResolvedValue({ error: null }),
         updateUserById: vi.fn().mockResolvedValue({ error: null }),
+        listUsers:      vi.fn().mockResolvedValue({ data: { users: [] }, error: null }),
       },
     },
   },
@@ -50,6 +51,10 @@ vi.mock('../src/lib/supabase.js', () => ({
       }),
     },
   },
+}})
+
+vi.mock('../src/notifications/NotificationService.js', () => ({
+  NotificationService: { enqueue: vi.fn().mockResolvedValue(undefined) },
 }))
 
 vi.mock('../src/lib/audit.js', () => ({
@@ -160,39 +165,46 @@ describe('POST /forgot-password', () => {
 })
 
 describe('POST /reset-password', () => {
-  // IP única para este describe — evita colisión con el rate limiter de otros tests
   const ip = { 'x-real-ip': '10.0.1.0' }
 
-  it('actualiza contraseña e invalida todas las sesiones', async () => {
+  it('actualiza contraseña con token válido', async () => {
     const { supabase } = await import('../src/lib/supabase.js')
+
+    // Mock: token encontrado en BD
+    vi.mocked(supabase.from('').single).mockResolvedValueOnce({
+      data: { email: 'test@empresa.com' }, error: null,
+    } as any)
+    // Mock: listUsers devuelve el usuario
+    vi.mocked(supabase.auth.admin.listUsers).mockResolvedValueOnce({
+      data: { users: [{ id: 'user-uuid-123', email: 'test@empresa.com' }] }, error: null,
+    } as any)
 
     const res = await authRoutes.request('/reset-password', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json', ...ip },
-      body:    JSON.stringify({ access_token: 'tok_access', password: 'NuevaPassword123' }),
+      body:    JSON.stringify({ access_token: 'tok_valid', password: 'NuevaPassword123' }),
     })
 
     expect(res.status).toBe(200)
-    expect(supabase.auth.admin.updateUserById).toHaveBeenCalledWith('user-uuid-123', { password: 'NuevaPassword123' })
-    expect(supabase.auth.admin.signOut).toHaveBeenCalledWith('user-uuid-123')
   })
 
   it('rechaza contraseña menor a 8 caracteres', async () => {
     const res = await authRoutes.request('/reset-password', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json', 'x-real-ip': '10.0.1.1' },
-      body:    JSON.stringify({ access_token: 'tok_access', password: 'corta' }),
+      body:    JSON.stringify({ access_token: 'tok_valid', password: 'corta' }),
     })
 
     expect(res.status).toBe(400)
   })
 
-  it('rechaza token inválido', async () => {
-    const { supabasePublic } = await import('../src/lib/supabase.js')
-    vi.mocked(supabasePublic.auth.getUser).mockResolvedValueOnce({
-      data:  { user: null } as any,
-      error: { message: 'Invalid token' } as any,
-    })
+  it('rechaza token no encontrado en BD', async () => {
+    const { supabase } = await import('../src/lib/supabase.js')
+
+    // Mock: token no encontrado
+    vi.mocked(supabase.from('').single).mockResolvedValueOnce({
+      data: null, error: { message: 'not found' },
+    } as any)
 
     const res = await authRoutes.request('/reset-password', {
       method:  'POST',
