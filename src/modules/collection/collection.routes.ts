@@ -433,9 +433,9 @@ app.post('/debtors/:id/debts',
 // ── Templates ──────────────────────────────────────────────────────────────
 
 app.get('/templates', async (c) => {
-  const { companyId } = c.get('user')
-  if (!companyId) return c.json({ error: 'Sin empresa' }, 400)
-  const data = await CollectionService.listTemplates(companyId)
+  const { companyId, role } = c.get('user')
+  const isStaff = ['admin', 'rs_admin', 'rs_staff'].includes(role)
+  const data = await CollectionService.listTemplates(isStaff ? null : companyId)
   return c.json(data)
 })
 
@@ -444,8 +444,7 @@ app.post('/templates',
   zValidator('json', createTemplateSchema),
   async (c) => {
     const { companyId } = c.get('user')
-    if (!companyId) return c.json({ error: 'Sin empresa' }, 400)
-    const data = await CollectionService.createTemplate(c.req.valid('json'), companyId)
+    const data = await CollectionService.createTemplate(c.req.valid('json'), companyId ?? null)
     return c.json(data, 201)
   },
 )

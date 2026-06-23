@@ -394,14 +394,18 @@ export class CollectionService {
 
   // ── Templates ─────────────────────────────────────────────────────────────
 
-  static async listTemplates(companyId: string) {
-    const { data, error } = await supabase
+  static async listTemplates(companyId: string | null) {
+    let q = supabase
       .from('collection_templates')
       .select('*')
-      .or(`company_id.eq.${companyId},is_global.eq.true`)
       .eq('is_active', true)
       .order('name')
 
+    if (companyId) {
+      q = q.or(`company_id.eq.${companyId},is_global.eq.true`)
+    }
+
+    const { data, error } = await q
     if (error) throw error
     return data
   }
