@@ -6,6 +6,7 @@ import { authMiddleware }           from '../../middleware/auth.js'
 import { getModulesForRole }        from '../../lib/permissions.js'
 import { auditAsync }               from '../../lib/audit.js'
 import { rateLimiter }              from '../../middleware/rateLimiter.js'
+import { logger }                   from '../../lib/logger.js'
 
 const app = new Hono()
 
@@ -106,33 +107,49 @@ app.post('/forgot-password',
   async (c) => {
     const { email } = c.req.valid('json')
 
+    const normalizedEmail = email.toLowerCase().trim()
+
     // Verificar que el usuario existe (sin revelar al cliente)
-    const { data: listData } = await supabase.auth.admin.listUsers()
-    const user = listData?.users?.find(u => u.email === email.toLowerCase().trim())
+    const { data: listData, error: listErr } = await supabase.auth.admin.listUsers({ perPage: 1000 })
+    if (listErr) {
+      logger.error({ err: listErr.message }, 'forgot-password: error listando usuarios')
+    }
+    const user = listData?.users?.find(u => u.email?.toLowerCase() === normalizedEmail)
+
+    logger.info({ email: normalizedEmail, found: !!user }, 'forgot-password: solicitud recibida')
 
     if (user) {
       const token = crypto.randomUUID()
       const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString() // 1 hora
 
       // Guardar token en company_invitations (reutilizamos la tabla)
-      await supabase.from('company_invitations').insert({
-        email: email.toLowerCase().trim(),
+      const { error: insErr } = await supabase.from('company_invitations').insert({
+        email: normalizedEmail,
         token,
         role:       'password_reset',
         status:     'pending',
         expires_at: expiresAt,
       })
+      if (insErr) {
+        logger.error({ err: insErr.message }, 'forgot-password: error guardando token')
+      }
 
       const platformUrl = process.env.PLATFORM_URL ?? 'https://app.tudominio.com'
       const resetUrl = `${platformUrl}/reset-password?token=${token}`
 
       const { NotificationService } = await import('../../notifications/NotificationService.js')
-      void NotificationService.enqueue({
-        channel:  'email',
-        template: 'password-reset',
-        to:       email,
-        data:     { resetUrl, name: user.user_metadata?.full_name ?? '' },
-      })
+      try {
+        // Envío directo (no cola) — más confiable para acción crítica
+        await NotificationService.sendNow({
+          channel:  'email',
+          template: 'password-reset',
+          to:       normalizedEmail,
+          data:     { resetUrl, name: user.user_metadata?.full_name ?? '' },
+        })
+        logger.info({ email: normalizedEmail }, 'forgot-password: email enviado')
+      } catch (err) {
+        logger.error({ err: err instanceof Error ? err.message : String(err) }, 'forgot-password: fallo al enviar email')
+      }
     }
 
     // Siempre 200 para no revelar si el email existe
