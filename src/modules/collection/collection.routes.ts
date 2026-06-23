@@ -112,9 +112,26 @@ app.patch('/debtors/:id',
 app.get('/actions',
   zValidator('query', listActionsQuerySchema),
   async (c) => {
-    const { companyId } = c.get('user')
-    if (!companyId) return c.json({ error: 'Sin empresa' }, 400)
-    const result = await CollectionService.listActions(c.req.valid('query'), companyId)
+    const { companyId, role } = c.get('user')
+    const isStaff = ['admin','rs_admin','rs_staff'].includes(role)
+    // Staff can filter by debtor_id without a session companyId
+    const effectiveCompanyId = companyId ?? (isStaff ? null : null)
+    if (!effectiveCompanyId && !isStaff) return c.json({ error: 'Sin empresa' }, 400)
+    if (!effectiveCompanyId) {
+      // Staff: fetch actions directly filtered by debtor_id (no company restriction)
+      const { debtor_id, page, limit } = c.req.valid('query')
+      const from = ((page ?? 1) - 1) * (limit ?? 50)
+      let q = supabase
+        .from('collection_actions')
+        .select('*', { count: 'exact' })
+        .order('created_at', { ascending: false })
+        .range(from, from + (limit ?? 50) - 1)
+      if (debtor_id) q = q.eq('debtor_id', debtor_id)
+      const { data, error, count } = await q
+      if (error) return c.json({ error: error.message }, 500)
+      return c.json({ data, total: count ?? 0, page: page ?? 1, limit: limit ?? 50 })
+    }
+    const result = await CollectionService.listActions(c.req.valid('query'), effectiveCompanyId)
     return c.json(result)
   },
 )
@@ -123,9 +140,17 @@ app.post('/actions',
   requireRole('admin', 'rs_admin', 'rs_staff'),
   zValidator('json', createActionSchema),
   async (c) => {
-    const { id, companyId } = c.get('user')
+    const { id, companyId: sessionCompanyId } = c.get('user')
+    const input = c.req.valid('json')
+    // Derive companyId from the debtor when the staff user has no company in session
+    let companyId = sessionCompanyId
+    if (!companyId) {
+      const { data: debtor } = await supabase
+        .from('collection_debtors').select('company_id').eq('id', input.debtor_id).single()
+      companyId = debtor?.company_id ?? null
+    }
     if (!companyId) return c.json({ error: 'Sin empresa' }, 400)
-    const data = await CollectionService.createAction(c.req.valid('json'), id, companyId)
+    const data = await CollectionService.createAction(input, id, companyId)
     return c.json(data, 201)
   },
 )
@@ -141,9 +166,17 @@ app.post('/agreements',
   requireRole('admin', 'rs_admin', 'rs_staff'),
   zValidator('json', createAgreementSchema),
   async (c) => {
-    const { id, companyId } = c.get('user')
+    const { id, companyId: sessionCompanyId } = c.get('user')
+    const input = c.req.valid('json')
+    // Derive companyId from the debtor when staff user has no company in session
+    let companyId = sessionCompanyId
+    if (!companyId) {
+      const { data: debtor } = await supabase
+        .from('collection_debtors').select('company_id').eq('id', input.debtor_id).single()
+      companyId = debtor?.company_id ?? null
+    }
     if (!companyId) return c.json({ error: 'Sin empresa' }, 400)
-    const data = await CollectionService.createAgreement(c.req.valid('json'), companyId, id)
+    const data = await CollectionService.createAgreement(input, companyId, id)
     return c.json(data, 201)
   },
 )
@@ -161,9 +194,11 @@ app.post('/campaigns',
   requireRole('admin', 'rs_admin', 'rs_staff'),
   zValidator('json', createCampaignSchema),
   async (c) => {
-    const { id, companyId } = c.get('user')
-    if (!companyId) return c.json({ error: 'Sin empresa' }, 400)
-    const input    = c.req.valid('json')
+    const { id, companyId: sessionCompanyId } = c.get('user')
+    const input = c.req.valid('json')
+    // Staff users have no companyId in session → accept it from the request body
+    const companyId = sessionCompanyId ?? input.company_id ?? null
+    if (!companyId) return c.json({ error: 'Sin empresa: selecciona una empresa en el filtro antes de enviar' }, 400)
     const campaign = await CollectionService.createCampaign(input, companyId, id)
     // Enviar inmediatamente si viene con deudores y mensaje
     if ((input.debtor_ids?.length ?? 0) > 0 && input.message_template) {
@@ -486,9 +521,17 @@ app.post('/tasks',
   requireRole('admin', 'rs_admin', 'rs_staff'),
   zValidator('json', createCollectionTaskSchema),
   async (c) => {
-    const { companyId } = c.get('user')
+    const { companyId: sessionCompanyId } = c.get('user')
+    const input = c.req.valid('json')
+    // Derive companyId from debtor when staff user has no company in session
+    let companyId = sessionCompanyId
+    if (!companyId && input.debtor_id) {
+      const { data: debtor } = await supabase
+        .from('collection_debtors').select('company_id').eq('id', input.debtor_id).single()
+      companyId = debtor?.company_id ?? null
+    }
     if (!companyId) return c.json({ error: 'Sin empresa' }, 400)
-    const data = await CollectionService.createCollectionTask(c.req.valid('json'), companyId)
+    const data = await CollectionService.createCollectionTask(input, companyId)
     return c.json(data, 201)
   },
 )
