@@ -434,9 +434,9 @@ export class CollectionService {
           }
 
           const docNum = x.siigo_document
-          const dateStr = x.due_date ?? ''
+          const datePart = x.due_date ? ` (${x.due_date})` : ''
 
-          return `- ${docNum}: ${copFormatted}${usdPart} (${dateStr})`
+          return `- ${docNum}: ${copFormatted}${usdPart}${datePart}`
         }).join('\n')
 
         const text = messageTemplate
