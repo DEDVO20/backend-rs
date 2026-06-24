@@ -203,8 +203,13 @@ app.post('/campaigns',
     const campaign = await CollectionService.createCampaign(input, companyId, id)
     // Enviar inmediatamente si viene con deudores y mensaje
     if ((input.debtor_ids?.length ?? 0) > 0 && input.message_template) {
-      const result = await CollectionService.sendCampaign(campaign.id)
-      return c.json({ ...campaign, sent: result.sent }, 201)
+      try {
+        const result = await CollectionService.sendCampaign(campaign.id)
+        return c.json({ ...campaign, sent: result.sent }, 201)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        return c.json({ ...campaign, sent: 0, sendError: msg }, 201)
+      }
     }
     return c.json(campaign, 201)
   },
