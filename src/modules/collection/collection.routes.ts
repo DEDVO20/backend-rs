@@ -501,8 +501,39 @@ app.post('/debtors/:id/debts',
 app.get('/templates', async (c) => {
   const { companyId, role } = c.get('user')
   const isStaff = ['admin', 'rs_admin', 'rs_staff'].includes(role)
-  const data = await CollectionService.listTemplates(isStaff ? null : companyId)
-  return c.json(data)
+
+  // Traer plantillas locales
+  const localTemplates = await CollectionService.listTemplates(isStaff ? null : companyId)
+
+  // Traer plantillas de Zavu en paralelo
+  let zavuTemplates: any[] = []
+  try {
+    const res = await fetch('https://api.zavu.dev/v1/templates?limit=100', {
+      headers: { 'Authorization': `Bearer ${process.env.ZAVU_API_KEY}` },
+    })
+    if (res.ok) {
+      const json = await res.json() as { items: any[] }
+      zavuTemplates = (json.items ?? [])
+        .filter((t: any) => t.status === 'approved')
+        .map((t: any) => ({
+          id:         `zavu_${t.id}`,
+          name:       t.name?.replace(/_/g, ' ') ?? t.id,
+          channel:    'whatsapp',
+          body:       t.body ?? t.whatsappBody ?? '',
+          is_active:  true,
+          is_global:  true,
+          source:     'zavu',
+          zavu_id:    t.id,
+          category:   t.category,
+          language:   t.language,
+          variables:  t.variables ?? [],
+          buttons:    t.buttons ?? [],
+          status:     t.whatsapp?.status ?? t.status,
+        }))
+    }
+  } catch {}
+
+  return c.json([...localTemplates, ...zavuTemplates])
 })
 
 app.post('/templates',
