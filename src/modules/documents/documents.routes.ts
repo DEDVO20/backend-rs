@@ -103,8 +103,8 @@ app.post('/upload',
   async (c) => {
     const { id, companyId: userCompanyId, role } = c.get('user')
     const isStaff = ['admin', 'rs_admin', 'rs_staff'].includes(role)
-    const companyId = userCompanyId ?? (isStaff ? 'global' : null)
-    if (!companyId) return c.json({ error: 'Sin empresa asignada' }, 400)
+    const companyId = userCompanyId ?? null
+    if (!companyId && !isStaff) return c.json({ error: 'Sin empresa asignada' }, 400)
 
     const body = await c.req.parseBody()
     const file  = body['file']
