@@ -235,13 +235,15 @@ export class CollectionService {
 
   // ── Campaigns ─────────────────────────────────────────────────────────────
 
-  static async listCampaigns(companyId: string) {
-    const { data, error } = await supabase
+  static async listCampaigns(companyId: string | null) {
+    let q = supabase
       .from('collection_campaigns')
       .select('*,collection_templates(name,channel)')
-      .eq('company_id', companyId)
       .order('created_at', { ascending: false })
 
+    if (companyId) q = q.eq('company_id', companyId)
+
+    const { data, error } = await q
     if (error) throw error
     return data
   }

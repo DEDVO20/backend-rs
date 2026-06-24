@@ -184,9 +184,10 @@ app.post('/agreements',
 // ── Campaigns ──────────────────────────────────────────────────────────────
 
 app.get('/campaigns', async (c) => {
-  const { companyId } = c.get('user')
-  if (!companyId) return c.json({ error: 'Sin empresa' }, 400)
-  const data = await CollectionService.listCampaigns(companyId)
+  const { companyId, role } = c.get('user')
+  const isStaff = ['admin', 'rs_admin', 'rs_staff'].includes(role)
+  if (!companyId && !isStaff) return c.json({ error: 'Sin empresa' }, 400)
+  const data = await CollectionService.listCampaigns(companyId ?? null)
   return c.json(data)
 })
 
