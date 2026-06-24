@@ -245,11 +245,39 @@ function parseMoney(v: string): number {
   return parseFloat(clean) || 0
 }
 
+function parseSiigoDate(val: string): string | null {
+  if (!val) return null
+  const clean = val.trim()
+  
+  if (/^\d{4}-\d{2}-\d{2}$/.test(clean)) {
+    return clean
+  }
+  
+  const match = clean.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/)
+  if (match) {
+    const day = match[1]!.padStart(2, '0')
+    const month = match[2]!.padStart(2, '0')
+    const year = match[3]!
+    return `${year}-${month}-${day}`
+  }
+  
+  try {
+    const d = new Date(clean)
+    if (!isNaN(d.getTime())) {
+      return d.toISOString().split('T')[0]!
+    }
+  } catch {
+    // Ignorar y retornar null
+  }
+  
+  return null
+}
+
 function mapSiigoRow(raw: Record<string, string>): Record<string, string> {
-  if (!('Cliente identificacion' in raw)) return raw
-  const rango = (raw['Rango vencimiento'] ?? '').trim()
-  const saldo = parseMoney(raw['Saldo actual COP'] ?? raw['Saldo actual'] ?? '')
-  const total = parseMoney(raw['Total factura original'] ?? '')
+  if (!('Cliente identificacion' in raw || 'Cliente ide' in raw)) return raw
+  const rango = (raw['Rango vencimiento'] ?? raw['Rango ven'] ?? raw['Rango ver'] ?? '').trim()
+  const saldo = parseMoney(raw['Saldo actual COP'] ?? raw['Saldo actual'] ?? raw['Saldo actu'] ?? '')
+  const total = parseMoney(raw['Total factura original'] ?? raw['Total factura'] ?? raw['Total'] ?? raw['Total fact'] ?? '')
   const overdue: Record<string, string> = {
     overdue_1_30: '0', overdue_31_60: '0', overdue_61_90: '0', overdue_91_plus: '0', not_yet_due: '0',
   }
@@ -259,11 +287,11 @@ function mapSiigoRow(raw: Record<string, string>): Record<string, string> {
   else if (rango === '91+')        overdue['overdue_91_plus'] = String(saldo)
   else if (rango === 'No vencido') overdue['not_yet_due']     = String(saldo)
   return {
-    debtor_document:    (raw['Cliente identificacion'] ?? '').trim(),
+    debtor_document:    (raw['Cliente identificacion'] ?? raw['Cliente ide'] ?? '').trim(),
     debtor_name:        (raw['Cliente nombre'] ?? '').trim(),
     seller:             (raw['Nombre vendedor'] ?? '').trim(),
     siigo_document:     (raw['Numero'] ?? '').trim(),
-    due_date:           (raw['Fecha factura'] ?? '').trim(),
+    due_date:           parseSiigoDate(raw['Fecha factura'] ?? raw['Fecha fact'] ?? '') || '',
     currency:           (raw['Moneda'] ?? 'COP').trim(),
     total_balance:      String(total),
     outstanding_amount: String(saldo),

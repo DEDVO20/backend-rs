@@ -104,7 +104,7 @@ export class CollectionService {
 
     let q = supabase
       .from('collection_debtors')
-      .select('*, collection_debts(outstanding_amount,overdue_1_30,overdue_31_60,overdue_61_90,overdue_91_plus,not_yet_due,total_balance,currency,due_date,siigo_document)', { count: 'exact' })
+      .select('*, companies(name), collection_debts(outstanding_amount,overdue_1_30,overdue_31_60,overdue_61_90,overdue_91_plus,not_yet_due,total_balance,currency,due_date,siigo_document)', { count: 'exact' })
       .order('updated_at', { ascending: false })
       .range(from, from + limit - 1)
 
@@ -121,18 +121,94 @@ export class CollectionService {
 
     const { data, error, count } = await q
     if (error) throw error
-    return { data, total: count ?? 0, page, limit }
+
+    // Fetch advisor profiles in bulk
+    const advisorIds = Array.from(new Set((data ?? []).map((d: any) => d.assigned_user_id).filter(Boolean)))
+    let advisorsMap = new Map<string, string>()
+    if (advisorIds.length > 0) {
+      const { data: advisors } = await supabase
+        .from('profiles')
+        .select('id, full_name')
+        .in('id', advisorIds)
+      advisorsMap = new Map((advisors ?? []).map((a: any) => [a.id, a.full_name]))
+    }
+
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+
+    const mappedData = (data ?? []).map((d: any) => {
+      const debts = d.collection_debts ?? []
+      
+      // Calculate days_overdue
+      let maxDays = 0
+      for (const debt of debts) {
+        if ((debt.outstanding_amount ?? 0) > 0 && debt.due_date) {
+          const dueDate = new Date(debt.due_date)
+          dueDate.setHours(0, 0, 0, 0)
+          if (dueDate < today) {
+            const diffTime = today.getTime() - dueDate.getTime()
+            const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24))
+            if (diffDays > maxDays) {
+              maxDays = diffDays
+            }
+          }
+        }
+      }
+
+      return {
+        ...d,
+        days_overdue: maxDays,
+        company: d.companies ? { name: (d.companies as any).name } : null,
+        assigned_user: d.assigned_user_id ? { full_name: advisorsMap.get(d.assigned_user_id) ?? null } : null
+      }
+    })
+
+    return { data: mappedData, total: count ?? 0, page, limit }
   }
 
   static async getDebtor(id: string) {
     const { data, error } = await supabase
       .from('collection_debtors')
-      .select('*,collection_debts(*)')
+      .select('*, companies(name), collection_debts(*)')
       .eq('id', id)
       .single()
 
     if (error) throw error
-    return data
+
+    let advisorName = null
+    if (data.assigned_user_id) {
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('full_name')
+        .eq('id', data.assigned_user_id)
+        .maybeSingle()
+      advisorName = profile?.full_name ?? null
+    }
+
+    const debts = data.collection_debts ?? []
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    let maxDays = 0
+    for (const debt of debts) {
+      if ((debt.outstanding_amount ?? 0) > 0 && debt.due_date) {
+        const dueDate = new Date(debt.due_date)
+        dueDate.setHours(0, 0, 0, 0)
+        if (dueDate < today) {
+          const diffTime = today.getTime() - dueDate.getTime()
+          const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24))
+          if (diffDays > maxDays) {
+            maxDays = diffDays
+          }
+        }
+      }
+    }
+
+    return {
+      ...data,
+      days_overdue: maxDays,
+      company: data.companies ? { name: (data.companies as any).name } : null,
+      assigned_user: data.assigned_user_id ? { full_name: advisorName } : null
+    }
   }
 
   static async updateDebtor(id: string, input: UpdateDebtorInput) {
@@ -289,8 +365,18 @@ export class CollectionService {
     // Cargar deudores por IDs con sus deudas para variables del mensaje
     const { data: debtors } = await supabase
       .from('collection_debtors')
-      .select('id, debtor_name, debtor_document, phone, whatsapp, email, collection_debts(outstanding_amount, due_date, currency)')
+      .select('id, debtor_name, debtor_document, phone, whatsapp, email, companies(name), assigned_user_id, collection_debts(outstanding_amount, due_date, currency)')
       .in('id', debtorIds)
+
+    const advisorIds = Array.from(new Set((debtors ?? []).map((d: any) => d.assigned_user_id).filter(Boolean)))
+    let advisorsMap = new Map<string, string>()
+    if (advisorIds.length > 0) {
+      const { data: advisors } = await supabase
+        .from('profiles')
+        .select('id, full_name')
+        .in('id', advisorIds)
+      advisorsMap = new Map((advisors ?? []).map((a: any) => [a.id, a.full_name]))
+    }
 
     const contacts = (debtors ?? [])
       .filter((d: any) => {
@@ -308,12 +394,33 @@ export class CollectionService {
         const dueDate = d.collection_debts?.[0]?.due_date ?? ''
         const currency = d.collection_debts?.[0]?.currency ?? 'COP'
 
+        // Calculate max days of mora (dias_mora)
+        let maxDays = 0
+        const todayObj = new Date()
+        todayObj.setHours(0, 0, 0, 0)
+        for (const debt of d.collection_debts ?? []) {
+          if ((debt.outstanding_amount ?? 0) > 0 && debt.due_date) {
+            const dueDateObj = new Date(debt.due_date)
+            dueDateObj.setHours(0, 0, 0, 0)
+            if (dueDateObj < todayObj) {
+              const diffTime = todayObj.getTime() - dueDateObj.getTime()
+              const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24))
+              if (diffDays > maxDays) {
+                maxDays = diffDays
+              }
+            }
+          }
+        }
+
+        const companyName = (d.companies as any)?.name ?? ''
+        const advisorName = d.assigned_user_id ? (advisorsMap.get(d.assigned_user_id) ?? 'RS Back Office') : 'RS Back Office'
+
         const text = messageTemplate
           .replace(/\{\{nombre\}\}/g,   d.debtor_name ?? '')
           .replace(/\{\{saldo\}\}/g,    new Intl.NumberFormat('es-CO', { style: 'currency', currency }).format(saldo))
-          .replace(/\{\{dias_mora\}\}/g, '')
-          .replace(/\{\{empresa\}\}/g,  '')
-          .replace(/\{\{asesor\}\}/g,   'RS Back Office')
+          .replace(/\{\{dias_mora\}\}/g, String(maxDays))
+          .replace(/\{\{empresa\}\}/g,  companyName)
+          .replace(/\{\{asesor\}\}/g,   advisorName)
           .replace(/\{\{facturas\}\}/g, String((d.collection_debts ?? []).length))
 
         return { to, text, debtorId: d.id, dueDate, currency, saldo }
