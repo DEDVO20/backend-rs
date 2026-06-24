@@ -201,17 +201,14 @@ app.post('/campaigns',
     const companyId = sessionCompanyId ?? input.company_id ?? null
     if (!companyId) return c.json({ error: 'Sin empresa: selecciona una empresa en el filtro antes de enviar' }, 400)
     const campaign = await CollectionService.createCampaign(input, companyId, id)
-    // Enviar inmediatamente si viene con deudores y mensaje
+    // Enviar en background — responder inmediatamente para evitar timeout/502
     if ((input.debtor_ids?.length ?? 0) > 0 && input.message_template) {
-      try {
-        const result = await CollectionService.sendCampaign(campaign.id)
-        return c.json({ ...campaign, sent: result.sent }, 201)
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        return c.json({ ...campaign, sent: 0, sendError: msg }, 201)
-      }
+      const { logger } = await import('../../lib/logger.js')
+      void CollectionService.sendCampaign(campaign.id)
+        .then(r => logger.info({ campaignId: campaign.id, sent: r.sent }, 'Campaña enviada'))
+        .catch(err => logger.error({ campaignId: campaign.id, err: err instanceof Error ? err.message : String(err) }, 'Error enviando campaña'))
     }
-    return c.json(campaign, 201)
+    return c.json({ ...campaign, sending: true }, 201)
   },
 )
 
