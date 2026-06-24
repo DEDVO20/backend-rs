@@ -98,10 +98,12 @@ app.post('/confirm-upload', async (c) => {
   return c.json(data, 201)
 })
 
-// POST /api/documents/upload — sube archivo a Storage (legacy, via backend)
+// POST /api/documents/upload — sube archivo a Storage
 app.post('/upload',
   async (c) => {
-    const { id, companyId } = c.get('user')
+    const { id, companyId: userCompanyId, role } = c.get('user')
+    const isStaff = ['admin', 'rs_admin', 'rs_staff'].includes(role)
+    const companyId = userCompanyId ?? (isStaff ? 'global' : null)
     if (!companyId) return c.json({ error: 'Sin empresa asignada' }, 400)
 
     const body = await c.req.parseBody()
