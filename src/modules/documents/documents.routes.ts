@@ -122,7 +122,7 @@ app.post('/upload',
       description: body['description'] as string | undefined,
     }
 
-    const data = await DocumentsService.upload(file, meta, companyId, id)
+    const data = await DocumentsService.upload(file, meta, companyId ?? '00000000-0000-0000-0000-000000000000', id)
     return c.json(data, 201)
   },
 )
