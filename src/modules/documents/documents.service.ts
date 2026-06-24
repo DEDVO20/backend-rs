@@ -92,11 +92,12 @@ export class DocumentsService {
   static async upload(
     file: File,
     meta: { title: string; category?: string; description?: string },
-    companyId: string,
+    companyId: string | null,
     uploadedBy: string,
   ) {
     const ext  = file.name.split('.').pop() ?? 'bin'
-    const path = `${companyId}/${Date.now()}-${crypto.randomUUID()}.${ext}`
+    const folder = companyId ?? 'uploads'
+    const path = `${folder}/${Date.now()}-${crypto.randomUUID()}.${ext}`
 
     const buffer = await file.arrayBuffer()
 
