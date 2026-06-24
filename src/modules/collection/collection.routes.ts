@@ -277,7 +277,7 @@ function mapSiigoRow(raw: Record<string, string>): Record<string, string> {
   if (!('Cliente identificacion' in raw || 'Cliente ide' in raw)) return raw
   const rango = (raw['Rango vencimiento'] ?? raw['Rango ven'] ?? raw['Rango ver'] ?? '').trim()
   const saldo = parseMoney(raw['Saldo actual COP'] ?? raw['Saldo actual'] ?? raw['Saldo actu'] ?? '')
-  const total = parseMoney(raw['Total factura original'] ?? raw['Total factura'] ?? raw['Total'] ?? raw['Total fact'] ?? '')
+  const total = parseMoney(raw['Total facturas'] ?? raw['Total factura original'] ?? raw['Total factura'] ?? raw['Total'] ?? raw['Total fact'] ?? '')
   const overdue: Record<string, string> = {
     overdue_1_30: '0', overdue_31_60: '0', overdue_61_90: '0', overdue_91_plus: '0', not_yet_due: '0',
   }

@@ -38,6 +38,14 @@ function toE164(phone: string): string {
   return `+${digits}`
 }
 
+function getTramoName(days: number): string {
+  if (days <= 0) return 'no vencido'
+  if (days <= 30) return '1-30 días'
+  if (days <= 60) return '31-60 días'
+  if (days <= 90) return '61-90 días'
+  return '91+ días'
+}
+
 export class CollectionService {
   // ── Stats ─────────────────────────────────────────────────────────────────
 
@@ -362,10 +370,9 @@ export class CollectionService {
       return { sent: 0 }
     }
 
-    // Cargar deudores por IDs con sus deudas para variables del mensaje
     const { data: debtors } = await supabase
       .from('collection_debtors')
-      .select('id, debtor_name, debtor_document, phone, whatsapp, email, companies(name), assigned_user_id, collection_debts(outstanding_amount, due_date, currency)')
+      .select('id, debtor_name, debtor_document, phone, whatsapp, email, companies(name), assigned_user_id, collection_debts(outstanding_amount, due_date, currency, siigo_document, total_balance)')
       .in('id', debtorIds)
 
     const advisorIds = Array.from(new Set((debtors ?? []).map((d: any) => d.assigned_user_id).filter(Boolean)))
@@ -415,13 +422,30 @@ export class CollectionService {
         const companyName = (d.companies as any)?.name ?? ''
         const advisorName = d.assigned_user_id ? (advisorsMap.get(d.assigned_user_id) ?? 'RS Back Office') : 'RS Back Office'
 
+        const debtsList = (d.collection_debts ?? []).filter((x: any) => (x.outstanding_amount ?? 0) > 0)
+        const debtsToUse = debtsList.length > 0 ? debtsList : (d.collection_debts ?? [])
+        const facturasStr = debtsToUse.map((x: any) => {
+          const copFormatted = new Intl.NumberFormat('es-CO', { style: 'currency', currency: 'COP', minimumFractionDigits: 0, maximumFractionDigits: 0 }).format(x.outstanding_amount ?? 0).replace(/\s/g, '')
+
+          let usdPart = ''
+          if (x.currency === 'USD' && (x.total_balance ?? 0) > 0) {
+            const usdFormatted = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 0, maximumFractionDigits: 0 }).format(x.total_balance ?? 0).replace(/\s/g, '')
+            usdPart = ` [USD ${usdFormatted}]`
+          }
+
+          const docNum = x.siigo_document
+          const dateStr = x.due_date ?? ''
+
+          return `- ${docNum}: ${copFormatted}${usdPart} (${dateStr})`
+        }).join('\n')
+
         const text = messageTemplate
           .replace(/\{\{nombre\}\}/g,   d.debtor_name ?? '')
           .replace(/\{\{saldo\}\}/g,    new Intl.NumberFormat('es-CO', { style: 'currency', currency }).format(saldo))
           .replace(/\{\{dias_mora\}\}/g, String(maxDays))
           .replace(/\{\{empresa\}\}/g,  companyName)
           .replace(/\{\{asesor\}\}/g,   advisorName)
-          .replace(/\{\{facturas\}\}/g, String((d.collection_debts ?? []).length))
+          .replace(/\{\{facturas\}\}/g, facturasStr)
 
         return { to, text, debtorId: d.id, dueDate, currency, saldo }
       })
