@@ -68,7 +68,7 @@ export class RequestsService {
     return data
   }
 
-  static async create(input: CreateInput, userId: string, companyId: string) {
+  static async create(input: CreateInput, userId: string, companyId: string | null) {
     const n = now()
     const { data, error } = await supabase
       .from('operational_requests')
@@ -101,7 +101,7 @@ export class RequestsService {
           slaHours:     48,
           ticketId:     data.id.slice(0, 8).toUpperCase(),
         },
-        companyId,
+        companyId: companyId ?? undefined,
       })
     }
 

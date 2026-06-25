@@ -43,9 +43,10 @@ app.get('/:id', async (c) => {
 app.post('/',
   zValidator('json', createRequestSchema),
   async (c) => {
-    const { id, companyId } = c.get('user')
-    if (!companyId) return c.json({ error: 'Sin empresa asignada' }, 400)
-    const data = await RequestsService.create(c.req.valid('json'), id, companyId)
+    const { id, companyId, role } = c.get('user')
+    const isStaff = (INTERNAL_ROLES as readonly string[]).includes(role)
+    // Admins pueden crear solicitudes sin empresa (se asigna después)
+    const data = await RequestsService.create(c.req.valid('json'), id, companyId ?? null)
     return c.json(data, 201)
   },
 )
@@ -57,6 +58,17 @@ app.patch('/:id',
   async (c) => {
     const data = await RequestsService.update(c.req.param('id')!, c.req.valid('json'))
     return c.json(data)
+  },
+)
+
+// DELETE /api/requests/:id — solo roles internos
+app.delete('/:id',
+  requireRole('admin', 'rs_admin', 'rs_staff'),
+  async (c) => {
+    const { supabase } = await import('../../lib/supabase.js')
+    const { error } = await supabase.from('operational_requests').delete().eq('id', c.req.param('id')!)
+    if (error) throw error
+    return c.json({ ok: true })
   },
 )
 
