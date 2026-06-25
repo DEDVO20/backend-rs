@@ -1,9 +1,9 @@
-import { Hono }         from 'hono'
-import { zValidator }   from '@hono/zod-validator'
-import { z }            from 'zod'
-import { authMiddleware }  from '../../middleware/auth.js'
-import { requireRole }     from '../../middleware/requireRole.js'
-import { supabase }        from '../../lib/supabase.js'
+import { Hono } from 'hono'
+import { zValidator } from '@hono/zod-validator'
+import { z } from 'zod'
+import { authMiddleware } from '../../middleware/auth.js'
+import { requireRole } from '../../middleware/requireRole.js'
+import { supabase } from '../../lib/supabase.js'
 import { paginationSchema, paginationRange, paginatedResponse } from '../../lib/paginate.js'
 
 const app = new Hono()
@@ -12,12 +12,12 @@ app.use('/*', authMiddleware)
 
 const updateProfileSchema = z.object({
   full_name: z.string().min(2).optional(),
-  email:     z.string().email().optional(),
+  email: z.string().email().optional(),
 })
 
 const updateProfileAdminSchema = updateProfileSchema.extend({
-  role:      z.enum(['admin','rs_admin','rs_staff','client_owner','client_user']).optional(),
-  active:    z.boolean().optional(),
+  role: z.enum(['admin', 'rs_admin', 'rs_staff', 'client_owner', 'client_user']).optional(),
+  active: z.boolean().optional(),
   company_id: z.string().uuid().nullable().optional(),
 })
 
@@ -55,8 +55,8 @@ app.patch('/me',
 
 const listProfilesSchema = paginationSchema.extend({
   company_id: z.string().uuid().optional(),
-  role:       z.string().optional(),
-  active:     z.string().optional(),
+  role: z.string().optional(),
+  active: z.string().optional(),
 })
 
 // GET /api/profiles — listar todos (admin/rs_admin)
@@ -74,7 +74,7 @@ app.get('/',
       .range(from, to)
 
     if (company_id) q = q.eq('company_id', company_id)
-    if (role)       q = q.eq('role', role)
+    if (role) q = q.eq('role', role)
     if (active !== undefined) q = q.eq('active', active !== 'false')
 
     const { data, error, count } = await q
@@ -127,11 +127,11 @@ app.get('/company/:companyId/team', async (c) => {
   return c.json(data)
 })
 
-// POST /api/profiles/invite — invitar personal administrativo RS
+// POST /api/profiles/invite — invitar personal administrativo Finto
 const inviteAdminSchema = z.object({
   full_name: z.string().min(2),
-  email:     z.string().email(),
-  role:      z.enum(['admin', 'rs_admin', 'rs_staff']),
+  email: z.string().email(),
+  role: z.enum(['admin', 'rs_admin', 'rs_staff']),
 })
 
 app.post('/invite',
@@ -148,10 +148,10 @@ app.post('/invite',
       .from('company_invitations')
       .insert({
         full_name,
-        email:      email.toLowerCase().trim(),
-        role:       targetRole,
+        email: email.toLowerCase().trim(),
+        role: targetRole,
         token,
-        status:     'pending',
+        status: 'pending',
         expires_at: expiresAt,
         company_id: null,
       })
@@ -166,13 +166,13 @@ app.post('/invite',
     const platformUrl = process.env.PLATFORM_URL ?? 'https://app.tudominio.com'
 
     void NotificationService.enqueue({
-      channel:  'email',
+      channel: 'email',
       template: 'invitation',
-      to:       email,
+      to: email,
       data: {
-        name:        full_name,
-        companyName: 'RS Back Office',
-        inviteUrl:   `${platformUrl}/invitations/accept?token=${token}`,
+        name: full_name,
+        companyName: 'Finto',
+        inviteUrl: `${platformUrl}/invitations/accept?token=${token}`,
       },
     })
 

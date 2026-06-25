@@ -7,8 +7,8 @@
 
 type RenderedTemplate = {
   subject: string
-  html:    string
-  text:    string
+  html: string
+  text: string
 }
 
 type Builder = (data: Record<string, unknown>) => RenderedTemplate
@@ -102,7 +102,7 @@ const templates: Record<string, Builder> = {
 
   // ── Reset de contraseña ───────────────────────────────────────────────────
   'password-reset': (d) => ({
-    subject: 'Restablecer tu contraseña — RS Back Office',
+    subject: 'Restablecer tu contraseña — Finto',
     html: layout('Restablecer contraseña', `
       <p>Hola${d.name ? ` ${str(d.name)}` : ''},</p>
       <p>Recibimos una solicitud para restablecer tu contraseña.</p>
@@ -159,8 +159,8 @@ const templates: Record<string, Builder> = {
   // ── Texto libre (campañas masivas) ───────────────────────────────────────
   'raw-text': (d) => ({
     subject: str(d.subject ?? 'Mensaje'),
-    html:    layout('Mensaje', `<p>${str(d.text).replace(/\n/g, '<br>')}</p>`),
-    text:    str(d.text),
+    html: layout('Mensaje', `<p>${str(d.text).replace(/\n/g, '<br>')}</p>`),
+    text: str(d.text),
   }),
 
   // ── Webhooks / mensajes entrantes ─────────────────────────────────────────

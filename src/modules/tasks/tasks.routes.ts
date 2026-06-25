@@ -1,9 +1,9 @@
-import { Hono }       from 'hono'
+import { Hono } from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import { authMiddleware } from '../../middleware/auth.js'
-import { requireModule }  from '../../middleware/requireRole.js'
-import { requireRole }    from '../../middleware/requireRole.js'
-import { TasksService }   from './tasks.service.js'
+import { requireModule } from '../../middleware/requireRole.js'
+import { requireRole } from '../../middleware/requireRole.js'
+import { TasksService } from './tasks.service.js'
 import {
   listTasksQuerySchema,
   updateTaskSchema,
@@ -64,7 +64,7 @@ app.patch('/:id',
         return c.json({ error: 'Esta tarea debe ser completada por el cliente' }, 403)
       }
       if (task.owner_type === 'rs_team' && !isInternal) {
-        return c.json({ error: 'Esta tarea debe ser completada por el equipo RS' }, 403)
+        return c.json({ error: 'Esta tarea debe ser completada por el equipo Finto' }, 403)
       }
     }
 

@@ -1,6 +1,6 @@
-import { supabase }           from '../../lib/supabase.js'
+import { supabase } from '../../lib/supabase.js'
 import { NotificationService } from '../../notifications/NotificationService.js'
-import type { z }             from 'zod'
+import type { z } from 'zod'
 import type {
   listDebtorsQuerySchema,
   updateDebtorSchema,
@@ -16,18 +16,18 @@ import type {
   listMessagesQuerySchema,
 } from './collection.schema.js'
 
-type ListDebtorsQuery       = z.infer<typeof listDebtorsQuerySchema>
-type UpdateDebtorInput      = z.infer<typeof updateDebtorSchema>
-type CreateActionInput      = z.infer<typeof createActionSchema>
-type CreateAgreementInput   = z.infer<typeof createAgreementSchema>
-type CreateCampaignInput    = z.infer<typeof createCampaignSchema>
-type ListActionsQuery       = z.infer<typeof listActionsQuerySchema>
-type CreateDebtorInput      = z.infer<typeof createDebtorSchema>
-type CreateDebtInput        = z.infer<typeof createDebtSchema>
-type CreateTemplateInput    = z.infer<typeof createTemplateSchema>
-type CreateTaskInput        = z.infer<typeof createCollectionTaskSchema>
-type UpdateTaskInput        = z.infer<typeof updateCollectionTaskSchema>
-type ListMessagesQuery      = z.infer<typeof listMessagesQuerySchema>
+type ListDebtorsQuery = z.infer<typeof listDebtorsQuerySchema>
+type UpdateDebtorInput = z.infer<typeof updateDebtorSchema>
+type CreateActionInput = z.infer<typeof createActionSchema>
+type CreateAgreementInput = z.infer<typeof createAgreementSchema>
+type CreateCampaignInput = z.infer<typeof createCampaignSchema>
+type ListActionsQuery = z.infer<typeof listActionsQuerySchema>
+type CreateDebtorInput = z.infer<typeof createDebtorSchema>
+type CreateDebtInput = z.infer<typeof createDebtSchema>
+type CreateTemplateInput = z.infer<typeof createTemplateSchema>
+type CreateTaskInput = z.infer<typeof createCollectionTaskSchema>
+type UpdateTaskInput = z.infer<typeof updateCollectionTaskSchema>
+type ListMessagesQuery = z.infer<typeof listMessagesQuerySchema>
 
 const PLATFORM_URL = process.env.PLATFORM_URL ?? 'https://app.tudominio.com'
 
@@ -58,11 +58,11 @@ export class CollectionService {
 
     if (error) throw error
 
-    const total        = debtors?.length ?? 0
-    const active       = debtors?.filter(d => d.status !== 'paid').length ?? 0
-    const paid         = debtors?.filter(d => d.status === 'paid').length ?? 0
+    const total = debtors?.length ?? 0
+    const active = debtors?.filter(d => d.status !== 'paid').length ?? 0
+    const paid = debtors?.filter(d => d.status === 'paid').length ?? 0
     const inCollection = debtors?.filter(d => d.status === 'in_collection').length ?? 0
-    const noContact    = debtors?.filter(d => !d.phone && !d.email).length ?? 0
+    const noContact = debtors?.filter(d => !d.phone && !d.email).length ?? 0
 
     const saldoVencido = debtors?.reduce((sum, d) => {
       const debts: any[] = (d as any).collection_debts ?? []
@@ -90,7 +90,7 @@ export class CollectionService {
     const { data: tasks } = await tasksQ
 
     const today = new Date().toISOString().split('T')[0]
-    const tasksHoy      = tasks?.filter(t => t.due_date?.startsWith(today)).length ?? 0
+    const tasksHoy = tasks?.filter(t => t.due_date?.startsWith(today)).length ?? 0
     const tasksVencidas = tasks?.filter(t => t.status !== 'done' && t.due_date && t.due_date < today).length ?? 0
 
     const contacted = debtors?.filter(d => d.status !== 'pending').length ?? 0
@@ -100,7 +100,7 @@ export class CollectionService {
       acuerdosActivos: agreements?.length ?? 0,
       tasksHoy, tasksVencidas,
       contactabilidad: total > 0 ? Math.round((contacted / total) * 100) : 0,
-      efectividad:     contacted > 0 ? Math.round((paid / contacted) * 100) : 0,
+      efectividad: contacted > 0 ? Math.round((paid / contacted) * 100) : 0,
     }
   }
 
@@ -146,7 +146,7 @@ export class CollectionService {
 
     const mappedData = (data ?? []).map((d: any) => {
       const debts = d.collection_debts ?? []
-      
+
       // Calculate days_overdue
       let maxDays = 0
       for (const debt of debts) {
@@ -277,28 +277,28 @@ export class CollectionService {
     const debtor = await CollectionService.getDebtor(input.debtor_id)
 
     const notifData = {
-      debtorName:   debtor.debtor_name,
-      amount:       String(input.total_amount),
+      debtorName: debtor.debtor_name,
+      amount: String(input.total_amount),
       installments: String(input.installment_count),
-      nextDate:     input.first_due_date ?? '',
+      nextDate: input.first_due_date ?? '',
     }
 
     if (debtor.whatsapp ?? debtor.phone) {
       void NotificationService.enqueue({
-        channel:   'whatsapp',
-        template:  'collection-agreement',
-        to:        toE164((debtor.whatsapp ?? debtor.phone)!),
-        data:      notifData,
+        channel: 'whatsapp',
+        template: 'collection-agreement',
+        to: toE164((debtor.whatsapp ?? debtor.phone)!),
+        data: notifData,
         companyId,
       })
     }
 
     if (debtor.email) {
       void NotificationService.enqueue({
-        channel:   'email',
-        template:  'collection-agreement',
-        to:        debtor.email,
-        data:      notifData,
+        channel: 'email',
+        template: 'collection-agreement',
+        to: debtor.email,
+        data: notifData,
         companyId,
       })
     }
@@ -338,9 +338,9 @@ export class CollectionService {
       .from('collection_campaigns')
       .insert({
         ...rest,
-        company_id:       companyId,
-        created_by:       createdBy,
-        debtor_ids:       debtor_ids ?? [],
+        company_id: companyId,
+        created_by: createdBy,
+        debtor_ids: debtor_ids ?? [],
         message_template: message_template ?? null,
       })
       .select()
@@ -387,7 +387,7 @@ export class CollectionService {
 
     const contacts = (debtors ?? [])
       .filter((d: any) => {
-        if (channel === 'email')    return !!d.email
+        if (channel === 'email') return !!d.email
         if (channel === 'whatsapp') return !!(d.whatsapp ?? d.phone)
         return !!(d.phone ?? d.whatsapp)
       })
@@ -397,7 +397,7 @@ export class CollectionService {
           ? d.email
           : toE164(rawPhone)
 
-        const saldo   = (d.collection_debts ?? []).reduce((acc: number, x: any) => acc + (x.outstanding_amount ?? 0), 0)
+        const saldo = (d.collection_debts ?? []).reduce((acc: number, x: any) => acc + (x.outstanding_amount ?? 0), 0)
         const dueDate = d.collection_debts?.[0]?.due_date ?? ''
         const currency = d.collection_debts?.[0]?.currency ?? 'COP'
 
@@ -420,7 +420,7 @@ export class CollectionService {
         }
 
         const companyName = (d.companies as any)?.name ?? ''
-        const advisorName = d.assigned_user_id ? (advisorsMap.get(d.assigned_user_id) ?? 'RS Back Office') : 'RS Back Office'
+        const advisorName = d.assigned_user_id ? (advisorsMap.get(d.assigned_user_id) ?? 'Finto') : 'Finto'
 
         const debtsList = (d.collection_debts ?? []).filter((x: any) => (x.outstanding_amount ?? 0) > 0)
         const debtsToUse = debtsList.length > 0 ? debtsList : (d.collection_debts ?? [])
@@ -440,11 +440,11 @@ export class CollectionService {
         }).join('\n')
 
         const text = messageTemplate
-          .replace(/\{\{nombre\}\}/g,   d.debtor_name ?? '')
-          .replace(/\{\{saldo\}\}/g,    new Intl.NumberFormat('es-CO', { style: 'currency', currency }).format(saldo))
+          .replace(/\{\{nombre\}\}/g, d.debtor_name ?? '')
+          .replace(/\{\{saldo\}\}/g, new Intl.NumberFormat('es-CO', { style: 'currency', currency }).format(saldo))
           .replace(/\{\{dias_mora\}\}/g, String(maxDays))
-          .replace(/\{\{empresa\}\}/g,  companyName)
-          .replace(/\{\{asesor\}\}/g,   advisorName)
+          .replace(/\{\{empresa\}\}/g, companyName)
+          .replace(/\{\{asesor\}\}/g, advisorName)
           .replace(/\{\{facturas\}\}/g, facturasStr)
 
         return { to, text, debtorId: d.id, dueDate, currency, saldo }
@@ -461,12 +461,12 @@ export class CollectionService {
     await Promise.allSettled(
       contacts.map(c =>
         NotificationService.enqueue({
-          channel:   channel as any,
-          to:        c.to,
-          template:  'raw-text',
-          data:      { text: c.text },
+          channel: channel as any,
+          to: c.to,
+          template: 'raw-text',
+          data: { text: c.text },
           companyId: campaign.company_id,
-          metadata:  { campaignId, debtorId: c.debtorId },
+          metadata: { campaignId, debtorId: c.debtorId },
         }),
       ),
     )
@@ -474,11 +474,11 @@ export class CollectionService {
     // Registrar acción de cobranza por cada deudor contactado
     const actionChannel = channel === 'email' ? 'email' : channel === 'sms' ? 'sms' : 'whatsapp'
     const actions = contacts.map(c => ({
-      debtor_id:  c.debtorId,
-      channel:    actionChannel,
-      result:     'contacted' as const,
-      notes:      `Envío masivo: ${campaign.name}`,
-      user_id:    campaign.created_by,
+      debtor_id: c.debtorId,
+      channel: actionChannel,
+      result: 'contacted' as const,
+      notes: `Envío masivo: ${campaign.name}`,
+      user_id: campaign.created_by,
       company_id: campaign.company_id,
     }))
     if (actions.length) {
@@ -633,9 +633,9 @@ export class CollectionService {
       .order('created_at', { ascending: false })
       .range(from, from + limit - 1)
 
-    if (debtor_id)  q = q.eq('debtor_id', debtor_id)
+    if (debtor_id) q = q.eq('debtor_id', debtor_id)
     if (company_id) q = q.eq('company_id', company_id)
-    if (status)     q = q.eq('status', status)
+    if (status) q = q.eq('status', status)
 
     const { data, error, count } = await q
     if (error) throw error
@@ -667,7 +667,7 @@ export class CollectionService {
     errors: Array<{ row: number; reason: string }>
   }> {
     let imported = 0
-    let skipped  = 0
+    let skipped = 0
     let newDebts = 0
     let updatedDebts = 0
     const errors: Array<{ row: number; reason: string }> = []
@@ -688,7 +688,7 @@ export class CollectionService {
       }
 
       const debtor_document = row['debtor_document']?.trim()
-      const debtor_name     = row['debtor_name']?.trim()
+      const debtor_name = row['debtor_name']?.trim()
 
       if (!debtor_document || !debtor_name) {
         errors.push({ row: rowNum, reason: 'debtor_document y debtor_name son obligatorios' })
@@ -716,10 +716,10 @@ export class CollectionService {
         const { data: newDebtor, error: debtorErr } = await supabase
           .from('collection_debtors')
           .insert({
-            company_id:        companyId,
+            company_id: companyId,
             debtor_document,
             debtor_name,
-            status:            'pending',
+            status: 'pending',
             preferred_channel: 'phone',
           })
           .select('id')
@@ -756,19 +756,19 @@ export class CollectionService {
         const { error: debtErr } = await supabase
           .from('collection_debts')
           .upsert({
-            debtor_id:         debtorId,
-            company_id:        companyId,
+            debtor_id: debtorId,
+            company_id: companyId,
             siigo_document,
-            due_date:          row['due_date']?.trim() || null,
-            seller:            row['seller']?.trim() || null,
-            overdue_1_30:      parseFloat(row['overdue_1_30']  ?? '0') || 0,
-            overdue_31_60:     parseFloat(row['overdue_31_60'] ?? '0') || 0,
-            overdue_61_90:     parseFloat(row['overdue_61_90'] ?? '0') || 0,
-            overdue_91_plus:   parseFloat(row['overdue_91_plus'] ?? '0') || 0,
-            not_yet_due:       parseFloat(row['not_yet_due'] ?? '0') || 0,
-            total_balance:     totalBalance,
+            due_date: row['due_date']?.trim() || null,
+            seller: row['seller']?.trim() || null,
+            overdue_1_30: parseFloat(row['overdue_1_30'] ?? '0') || 0,
+            overdue_31_60: parseFloat(row['overdue_31_60'] ?? '0') || 0,
+            overdue_61_90: parseFloat(row['overdue_61_90'] ?? '0') || 0,
+            overdue_91_plus: parseFloat(row['overdue_91_plus'] ?? '0') || 0,
+            not_yet_due: parseFloat(row['not_yet_due'] ?? '0') || 0,
+            total_balance: totalBalance,
             outstanding_amount: outstandingAmount,
-            currency:          row['currency']?.trim() || 'COP',
+            currency: row['currency']?.trim() || 'COP',
           }, { onConflict: 'debtor_id,siigo_document', ignoreDuplicates: false })
 
         if (debtErr) {

@@ -1,14 +1,14 @@
 import { Hono } from 'hono'
-import { z }    from 'zod'
+import { z } from 'zod'
 import { zValidator } from '@hono/zod-validator'
 import { supabase, supabasePublic } from '../../lib/supabase.js'
-import { logger }                   from '../../lib/logger.js'
+import { logger } from '../../lib/logger.js'
 
 const app = new Hono()
 
 const acceptSchema = z.object({
-  token:    z.string().uuid(),
-  email:    z.string().email(),
+  token: z.string().uuid(),
+  email: z.string().email(),
   password: z.string().min(6),
   fullName: z.string().min(2),
 })
@@ -76,12 +76,12 @@ app.post('/accept',
     const { error: profileErr } = await supabase
       .from('profiles')
       .upsert({
-        id:         userId,
-        email:      email.toLowerCase().trim(),
-        full_name:  fullName,
-        role:       invRole,
+        id: userId,
+        email: email.toLowerCase().trim(),
+        full_name: fullName,
+        role: invRole,
         company_id: invCompanyId,
-        active:     true,
+        active: true,
       }, { onConflict: 'id' })
 
     if (profileErr) {
@@ -106,9 +106,9 @@ app.post('/accept',
     logger.info({ userId, companyId: invCompanyId, role: invRole }, 'Invitación aceptada')
 
     return c.json({
-      ok:         true,
+      ok: true,
       company_id: invCompanyId,
-      role:       invRole,
+      role: invRole,
     })
   },
 )
@@ -139,12 +139,12 @@ app.get('/verify', async (c) => {
   }
 
   return c.json({
-    valid:       true,
-    email:       inv.email,
-    fullName:    inv.full_name ?? '',
-    companyName: companyName || 'RS Back Office',
-    role:        inv.role,
-    expiresAt:   inv.expires_at,
+    valid: true,
+    email: inv.email,
+    fullName: inv.full_name ?? '',
+    companyName: companyName || 'Finto',
+    role: inv.role,
+    expiresAt: inv.expires_at,
   })
 })
 
