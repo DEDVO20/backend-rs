@@ -174,4 +174,27 @@ app.post('/reminders',
   },
 )
 
+// POST /api/tasks/mark-overdue — marca tareas como vencidas manualmente
+app.post('/mark-overdue',
+  requireRole('admin', 'rs_admin'),
+  async (c) => {
+    const count = await TasksService.markOverdue()
+    return c.json({ marked_overdue: count })
+  },
+)
+
+// GET /api/tasks/cron-logs — historial de ejecuciones del cron
+app.get('/cron-logs',
+  requireRole('admin', 'rs_admin'),
+  async (c) => {
+    const { data, error } = await supabase
+      .from('cron_logs')
+      .select('*')
+      .order('executed_at', { ascending: false })
+      .limit(100)
+    if (error) throw error
+    return c.json(data)
+  },
+)
+
 export const tasksRoutes = app

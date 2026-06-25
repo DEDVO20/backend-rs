@@ -171,4 +171,16 @@ export class TasksService {
 
     return tasks.length
   }
+
+  static async markOverdue(): Promise<number> {
+    const today = new Date().toISOString().split('T')[0]!
+    const { data, error } = await supabase
+      .from('tasks')
+      .update({ status: 'overdue' })
+      .eq('status', 'pending')
+      .lt('due_date', today)
+      .select('id')
+    if (error) throw error
+    return data?.length ?? 0
+  }
 }
