@@ -110,9 +110,19 @@ app.route('/api/audit',       auditRoutes)
 // ── 404 catch-all ─────────────────────────────────────────────────────────────
 app.notFound((c) => c.json({ error: 'Ruta no encontrada' }, 404))
 
-// ── Error handler ─────────────────────────────────────────────────────────────
+// ── Error handler ─────────────────────────────────────────────────────────────────────────
 app.onError((err, c) => {
   const statusCode = (err as any).statusCode ?? 500
+
+  // Hono's onError creates a fresh response that bypasses the CORS middleware.
+  // We must re-inject CORS headers manually so the browser can read the error body.
+  const origin = c.req.header('origin') ?? ''
+  if (allowedOrigins.includes(origin)) {
+    c.header('Access-Control-Allow-Origin', origin)
+    c.header('Access-Control-Allow-Credentials', 'true')
+    c.header('Vary', 'Origin')
+  }
+
   if (statusCode < 500) {
     return c.json({ error: err.message }, statusCode)
   }
