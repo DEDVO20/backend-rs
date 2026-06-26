@@ -127,8 +127,10 @@ app.onError((err, c) => {
     return c.json({ error: err.message }, statusCode)
   }
   logger.error({ err: err.message, path: c.req.path }, 'Error no manejado')
-  // Exponer mensaje real para diagnosticar (revertir después)
-  return c.json({ error: err.message }, 500)
+  const message = process.env.NODE_ENV === 'production'
+    ? 'Error interno del servidor'
+    : err.message
+  return c.json({ error: message }, 500)
 })
 
 // ── Iniciar servidor ──────────────────────────────────────────────────────────
