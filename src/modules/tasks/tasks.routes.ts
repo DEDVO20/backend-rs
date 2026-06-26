@@ -52,7 +52,7 @@ app.get('/templates',
       .select('*, services(name)')
       .order('frequency')
       .order('title')
-    if (error) throw error
+    if (error) return c.json({ error: error.message }, 500)
     return c.json(data)
   },
 )
@@ -66,7 +66,7 @@ app.post('/templates',
       .insert(c.req.valid('json'))
       .select('*, services(name)')
       .single()
-    if (error) throw error
+    if (error) return c.json({ error: error.message }, 500)
     return c.json(data, 201)
   },
 )
@@ -81,7 +81,7 @@ app.patch('/templates/:id',
       .eq('id', c.req.param('id')!)
       .select('*, services(name)')
       .single()
-    if (error) throw error
+    if (error) return c.json({ error: error.message }, 500)
     return c.json(data)
   },
 )
@@ -93,7 +93,7 @@ app.delete('/templates/:id',
       .from('task_templates')
       .delete()
       .eq('id', c.req.param('id')!)
-    if (error) throw error
+    if (error) return c.json({ error: error.message }, 500)
     return c.json({ ok: true })
   },
 )

@@ -40,7 +40,7 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? 'http://localhost:5173')
   .map(o => o.trim())
 
 app.use('*', cors({
-  origin:      (origin) => allowedOrigins.includes(origin) ? origin : allowedOrigins[0]!,
+  origin:       (origin) => allowedOrigins.includes(origin) ? origin : null,
   allowMethods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization'],
   exposeHeaders: ['Content-Length'],
