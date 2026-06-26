@@ -374,7 +374,8 @@ app.post('/debtors/import',
   },
 )
 
-// ── Contacts — Excel import (update phone/email on existing debtors) ──────
+// ── Contacts — Excel/CSV import (update phone/email on existing debtors) ──────
+// Columnas: A=Empresa, B=NIT, C=Celular, D=Email tesorería, E=Teléfono
 
 app.post('/contacts/import',
   requireRole('admin', 'rs_admin', 'rs_staff'),
@@ -390,7 +391,10 @@ app.post('/contacts/import',
       return c.json({ error: 'Campo "file" requerido' }, 400)
     }
 
-    // Parse Excel with SheetJS-style approach using raw buffer
+    const fileName = (file as File).name ?? ''
+    const isCsv = fileName.toLowerCase().endsWith('.csv')
+
+    // Parse file: xlsx can handle both .xlsx and .csv natively
     const buffer = await (file as File).arrayBuffer()
     let rows: string[][]
 
@@ -400,42 +404,42 @@ app.post('/contacts/import',
       const ws = wb.Sheets[wb.SheetNames[0]!]!
       rows = utils.sheet_to_json<string[]>(ws, { header: 1, defval: '' })
     } catch {
-      return c.json({ error: 'No se pudo leer el archivo Excel' }, 400)
+      return c.json({ error: `No se pudo leer el archivo ${isCsv ? 'CSV' : 'Excel'}` }, 400)
     }
 
     if (rows.length < 2) {
       return c.json({ error: 'El archivo debe tener al menos una fila de datos' }, 400)
     }
 
-    // Skip header row, map columns: A=empresa, B=abreviatura, C=asesor, D=NIT/celular, E=emailFact, F=contactoComercial, G=emailComercial, H=contactoTesoreria, I=emailTesoreria
-    const dataRows = rows.slice(1).filter(r => r[3]) // must have NIT/celular (col D)
+    // Nueva estructura de columnas:
+    // A (0) = Empresa, B (1) = NIT, C (2) = Celular, D (3) = Email tesorería, E (4) = Teléfono
+    const dataRows = rows.slice(1).filter(r => String(r[1] ?? '').trim() !== '') // NIT en col B
 
     let updated = 0
     let notFound = 0
     const errors: string[] = []
 
     for (const row of dataRows) {
-      const nit      = String(row[3] ?? '').trim()
-      const phone    = String(row[3] ?? '').trim()
-      const email    = String(row[4] ?? '').trim()
-      const contact  = String(row[5] ?? '').trim()
-      const emailCom = String(row[6] ?? '').trim()
+      const nit      = String(row[1] ?? '').trim().replace(/\D/g, '') // col B — NIT
+      const celular  = String(row[2] ?? '').trim().replace(/\D/g, '') // col C — Celular
+      const email    = String(row[3] ?? '').trim()                     // col D — Email tesorería
+      const telefono = String(row[4] ?? '').trim().replace(/\D/g, '') // col E — Teléfono fijo
 
       if (!nit) continue
 
-      // Try to match by debtor_document (NIT)
       const updateData: Record<string, string> = {}
-      // If it looks like a phone number (starts with 3, length 10), set as phone
-      if (/^3\d{9}$/.test(nit.replace(/\D/g, ''))) {
-        updateData.phone = nit.replace(/\D/g, '')
-        updateData.whatsapp = nit.replace(/\D/g, '')
+      if (celular && /^3\d{9}$/.test(celular)) {
+        updateData.phone    = celular
+        updateData.whatsapp = celular
+      } else if (celular) {
+        updateData.phone = celular
       }
       if (email && email.includes('@')) updateData.email = email
-      if (contact) updateData.notes = `Contacto comercial: ${contact}${emailCom ? ` (${emailCom})` : ''}`
+      if (telefono) updateData.phone_alt = telefono
 
       if (Object.keys(updateData).length === 0) continue
 
-      // Update all debtors with this document number
+      // Actualizar todos los deudores con este NIT
       const { data: matched, error } = await supabase
         .from('collection_debtors')
         .update(updateData)
@@ -450,12 +454,7 @@ app.post('/contacts/import',
       if (matched && matched.length > 0) {
         updated += matched.length
       } else {
-        // Try matching by phone if NIT didn't match
-        if (/^3\d{9}$/.test(nit.replace(/\D/g, ''))) {
-          notFound++
-        } else {
-          notFound++
-        }
+        notFound++
       }
     }
 
