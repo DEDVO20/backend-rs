@@ -52,7 +52,7 @@ export class CollectionService {
   static async getStats(companyId: string | null) {
     let debtorsQ = supabase
       .from('collection_debtors')
-      .select('id, status, phone, email, collection_debts(outstanding_amount, overdue_91_plus)')
+      .select('id, status, phone, email, collection_debts(outstanding_amount, overdue_1_30, overdue_31_60, overdue_61_90, overdue_91_plus, not_yet_due)')
     if (companyId) debtorsQ = debtorsQ.eq('company_id', companyId)
     const { data: debtors, error } = await debtorsQ
 
@@ -64,10 +64,20 @@ export class CollectionService {
     const inCollection = debtors?.filter(d => d.status === 'in_collection').length ?? 0
     const noContact = debtors?.filter(d => !d.phone && !d.email).length ?? 0
 
-    const saldoVencido = debtors?.reduce((sum, d) => {
+    // Saldos por tramo
+    let saldo1_30 = 0, saldo31_60 = 0, saldo61_90 = 0, saldo91Plus = 0, saldoNoVencido = 0, saldoTotal = 0
+    debtors?.forEach(d => {
       const debts: any[] = (d as any).collection_debts ?? []
-      return sum + debts.reduce((s: number, x: any) => s + (x.outstanding_amount ?? 0), 0)
-    }, 0) ?? 0
+      debts.forEach((x: any) => {
+        saldo1_30     += x.overdue_1_30 ?? 0
+        saldo31_60    += x.overdue_31_60 ?? 0
+        saldo61_90    += x.overdue_61_90 ?? 0
+        saldo91Plus   += x.overdue_91_plus ?? 0
+        saldoNoVencido += x.not_yet_due ?? 0
+        saldoTotal    += x.outstanding_amount ?? 0
+      })
+    })
+    const saldoVencido = saldo1_30 + saldo31_60 + saldo61_90 + saldo91Plus
 
     const mora91 = debtors?.filter(d => {
       const debts: any[] = (d as any).collection_debts ?? []
@@ -96,7 +106,9 @@ export class CollectionService {
     const contacted = debtors?.filter(d => d.status !== 'pending').length ?? 0
 
     return {
-      total, active, paid, inCollection, noContact, saldoVencido, mora91,
+      total, active, paid, inCollection, noContact,
+      saldoVencido, saldo1_30, saldo31_60, saldo61_90, saldo91Plus, saldoNoVencido,
+      mora91,
       acuerdosActivos: agreements?.length ?? 0,
       tasksHoy, tasksVencidas,
       contactabilidad: total > 0 ? Math.round((contacted / total) * 100) : 0,
