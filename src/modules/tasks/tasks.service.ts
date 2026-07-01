@@ -106,26 +106,187 @@ export class TasksService {
     month?: number
     day?:   number
   }): Promise<{ generated: Record<string, number> }> {
-    const { year, month, day } = params
+    const now   = new Date()
+    const year  = params.year
+    const month = params.month ?? (now.getMonth() + 1)
+    const day   = params.day   ?? now.getDate()
+
+    const MES = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic']
+    const pad = (n: number) => String(n).padStart(2, '0')
+    const lastDayOf = (y: number, m: number) => new Date(y, m, 0).getDate()
+
+    // Dos queries separados porque no hay FK directa entre task_templates y company_services
+    const [{ data: templates, error: errT }, { data: activeServices, error: errCS }] = await Promise.all([
+      supabase
+        .from('task_templates')
+        .select('id, title, frequency, due_day, create_day, owner_type, service_id, requires_document')
+        .eq('active', true),
+      supabase
+        .from('company_services')
+        .select('company_id, service_id')
+        .eq('active', true),
+    ])
+
+    if (errT)  throw new Error(`Error cargando plantillas: ${errT.message}`)
+    if (errCS) throw new Error(`Error cargando servicios de empresa: ${errCS.message}`)
+
+    // Agrupar company_services por service_id para lookup eficiente
+    const serviceToCompanies = new Map<string, string[]>()
+    for (const cs of activeServices ?? []) {
+      const list = serviceToCompanies.get(cs.service_id) ?? []
+      list.push(cs.company_id)
+      serviceToCompanies.set(cs.service_id, list)
+    }
+
+    type Row = {
+      template_id:       string
+      title:             string
+      frequency:         string
+      due_day:           number | null
+      create_day:        number | null
+      owner_type:        string
+      service_id:        string
+      requires_document: boolean
+      company_id:        string
+    }
+
+    // Producto cartesiano: cada plantilla × empresas que tienen ese servicio activo
+    const rows: Row[] = (templates ?? []).flatMap(t => {
+      const companies = serviceToCompanies.get(t.service_id) ?? []
+      return companies.map(company_id => ({
+        template_id:       t.id,
+        title:             t.title,
+        frequency:         t.frequency,
+        due_day:           t.due_day,
+        create_day:        t.create_day,
+        owner_type:        t.owner_type,
+        service_id:        t.service_id,
+        requires_document: t.requires_document,
+        company_id,
+      }))
+    })
+
+    type TaskInsert = {
+      company_id:        string
+      title:             string
+      status:            string
+      due_date:          string
+      owner_type:        string
+      unique_key:        string
+      service_id:        string
+      requires_document: boolean
+      create_day?:       number
+    }
+
+    const buckets: Record<string, TaskInsert[]> = {
+      annual: [], monthly: [], weekly: [], semestral: [], trimestral: [],
+    }
+
+    // ── Anuales ──────────────────────────────────────────────────────────────
+    for (const r of rows.filter(r => r.frequency === 'annual')) {
+      const dueDate = new Date(year + 1, 0, r.due_day ?? 1)
+      buckets.annual.push({
+        company_id:        r.company_id,
+        title:             `${r.title} — ${year}`,
+        status:            'pending',
+        due_date:          dueDate.toISOString().split('T')[0],
+        owner_type:        r.owner_type,
+        unique_key:        `${r.company_id}_${r.template_id}_annual_${year}`,
+        service_id:        r.service_id,
+        requires_document: r.requires_document,
+      })
+    }
+
+    // ── Mensuales ─────────────────────────────────────────────────────────────
+    for (const r of rows.filter(r => r.frequency === 'monthly')) {
+      const lastDay  = lastDayOf(year, month)
+      const dueDay   = Math.min(r.due_day ?? lastDay, lastDay)
+      const createDay = Math.min(r.create_day ?? 1, r.due_day ?? 1)
+      const dueDate  = new Date(year, month - 1, dueDay)
+      buckets.monthly.push({
+        company_id:        r.company_id,
+        title:             `${r.title} — ${MES[month - 1]} ${year}`,
+        status:            'pending',
+        due_date:          dueDate.toISOString().split('T')[0],
+        owner_type:        r.owner_type,
+        unique_key:        `${r.company_id}_${r.template_id}_${year}_${pad(month)}`,
+        create_day:        createDay,
+        service_id:        r.service_id,
+        requires_document: r.requires_document,
+      })
+    }
+
+    // ── Semanales (solo días 7, 15, 21, 28) ──────────────────────────────────
+    if ([7, 15, 21, 28].includes(day)) {
+      const dueDate = new Date(year, month - 1, day)
+      for (const r of rows.filter(r => r.frequency === 'weekly')) {
+        buckets.weekly.push({
+          company_id:        r.company_id,
+          title:             `${r.title} — ${pad(day)} ${MES[month - 1]} ${year}`,
+          status:            'pending',
+          due_date:          dueDate.toISOString().split('T')[0],
+          owner_type:        r.owner_type,
+          unique_key:        `${r.company_id}_${r.template_id}_${year}_${pad(month)}_${pad(day)}`,
+          create_day:        day - 2,
+          service_id:        r.service_id,
+          requires_document: r.requires_document,
+        })
+      }
+    }
+
+    // ── Semestrales (meses 6 y 12) ────────────────────────────────────────────
+    if ([6, 12].includes(month)) {
+      for (const r of rows.filter(r => r.frequency === 'annual' && r.title === 'Cálculo primas y verificación pago')) {
+        const lastDay   = lastDayOf(year, month)
+        const dueDay    = Math.min(r.due_day ?? lastDay, lastDay)
+        const createDay = Math.min(r.create_day ?? 1, r.due_day ?? 1)
+        const dueDate   = new Date(year, month - 1, dueDay)
+        buckets.semestral.push({
+          company_id:        r.company_id,
+          title:             `${r.title} — ${MES[month - 1]} ${year}`,
+          status:            'pending',
+          due_date:          dueDate.toISOString().split('T')[0],
+          owner_type:        r.owner_type,
+          unique_key:        `${r.company_id}_${r.template_id}_${year}_${pad(month)}`,
+          create_day:        createDay,
+          service_id:        r.service_id,
+          requires_document: r.requires_document,
+        })
+      }
+    }
+
+    // ── Trimestrales (meses 4, 8, 12) ─────────────────────────────────────────
+    if ([4, 8, 12].includes(month)) {
+      for (const r of rows.filter(r => r.frequency === 'annual' && r.title === 'Cotización dotaciones y verificación pago')) {
+        const lastDay   = lastDayOf(year, month)
+        const dueDay    = Math.min(r.due_day ?? lastDay, lastDay)
+        const createDay = Math.min(r.create_day ?? 1, r.due_day ?? 1)
+        const dueDate   = new Date(year, month - 1, dueDay)
+        buckets.trimestral.push({
+          company_id:        r.company_id,
+          title:             `${r.title} — ${MES[month - 1]} ${year}`,
+          status:            'pending',
+          due_date:          dueDate.toISOString().split('T')[0],
+          owner_type:        r.owner_type,
+          unique_key:        `${r.company_id}_${r.template_id}_${year}_${pad(month)}`,
+          create_day:        createDay,
+          service_id:        r.service_id,
+          requires_document: r.requires_document,
+        })
+      }
+    }
+
+    // ── Insertar ignorando duplicados por unique_key ───────────────────────────
     const results: Record<string, number> = {}
 
-    const rpcs: Array<{
-      name:   string
-      fn:     string
-      args:   Record<string, number>
-    }> = [
-      { name: 'annual',     fn: 'generate_annual_tasks',     args: { p_year: year } },
-      { name: 'monthly',    fn: 'generate_monthly_tasks',    args: { p_year: year, p_month: month ?? new Date().getMonth() + 1 } },
-      { name: 'weekly',     fn: 'generate_weekly_tasks',     args: { p_year: year, p_month: month ?? new Date().getMonth() + 1, p_day: day ?? new Date().getDate() } },
-      { name: 'semestral',  fn: 'generate_semestral_tasks',  args: { p_year: year, p_month: month ?? new Date().getMonth() + 1 } },
-      { name: 'trimestral', fn: 'generate_trimestral_tasks', args: { p_year: year, p_month: month ?? new Date().getMonth() + 1 } },
-    ]
-
     await Promise.all(
-      rpcs.map(async ({ name, fn, args }) => {
-        const { data, error } = await supabase.rpc(fn as any, args)
-        if (error) throw Object.assign(new Error(`RPC ${fn} falló: ${error.message}`), { fn })
-        results[name] = typeof data === 'number' ? data : (data as any)?.count ?? 0
+      Object.entries(buckets).map(async ([name, tasks]) => {
+        if (!tasks.length) { results[name] = 0; return }
+        const { error: insertError } = await supabase
+          .from('tasks')
+          .upsert(tasks, { onConflict: 'unique_key', ignoreDuplicates: true })
+        if (insertError) throw new Error(`Error generando tareas ${name}: ${insertError.message}`)
+        results[name] = tasks.length
       }),
     )
 

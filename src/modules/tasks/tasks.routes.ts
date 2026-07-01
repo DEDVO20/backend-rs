@@ -168,14 +168,32 @@ app.delete('/:id',
   },
 )
 
-// POST /api/tasks/generate — genera tareas periódicas llamando a las RPC de Supabase
+// POST /api/tasks/generate — genera tareas periódicas
 app.post('/generate',
   requireRole('admin', 'rs_admin'),
   zValidator('json', generateTasksSchema),
   async (c) => {
-    const body = c.req.valid('json')
-    const result = await TasksService.generateTasks(body)
-    return c.json(result, 201)
+    const start = Date.now()
+    const body  = c.req.valid('json')
+    try {
+      const result = await TasksService.generateTasks(body)
+      await supabase.from('cron_logs').insert({
+        job_name:    'generate-tasks-manual',
+        status:      'success',
+        result:      { ...result, ...body },
+        duration_ms: Date.now() - start,
+      })
+      return c.json(result, 201)
+    } catch (err) {
+      await supabase.from('cron_logs').insert({
+        job_name:    'generate-tasks-manual',
+        status:      'failed',
+        result:      {},
+        error:       err instanceof Error ? err.message : String(err),
+        duration_ms: Date.now() - start,
+      })
+      throw err
+    }
   },
 )
 
@@ -183,7 +201,14 @@ app.post('/generate',
 app.post('/reminders',
   requireRole('admin', 'rs_admin'),
   async (c) => {
+    const start = Date.now()
     const count = await TasksService.sendReminders()
+    await supabase.from('cron_logs').insert({
+      job_name:    'send-reminders-manual',
+      status:      'success',
+      result:      { sent: count },
+      duration_ms: Date.now() - start,
+    })
     return c.json({ sent: count })
   },
 )
