@@ -47,11 +47,21 @@ const templateSchema = z.object({
 app.get('/templates',
   requireRole('admin', 'rs_admin', 'rs_staff'),
   async (c) => {
-    const { data, error } = await supabase
+    const { frequency, owner_type, requires_document, active, service_id } = c.req.query()
+
+    let q = supabase
       .from('task_templates')
       .select('*, services(name)')
       .order('frequency')
       .order('title')
+
+    if (frequency)          q = q.eq('frequency', frequency)
+    if (owner_type)         q = q.eq('owner_type', owner_type)
+    if (service_id)         q = q.eq('service_id', service_id)
+    if (requires_document !== undefined) q = q.eq('requires_document', requires_document === 'true')
+    if (active !== undefined)            q = q.eq('active', active === 'true')
+
+    const { data, error } = await q
     if (error) return c.json({ error: error.message }, 500)
     return c.json(data)
   },

@@ -182,27 +182,30 @@ export class TasksService {
       annual: [], monthly: [], weekly: [], semestral: [], trimestral: [],
     }
 
-    // ── Anuales ──────────────────────────────────────────────────────────────
-    for (const r of rows.filter(r => r.frequency === 'annual')) {
-      const dueDate = new Date(year + 1, 0, r.due_day ?? 1)
-      buckets.annual.push({
-        company_id:        r.company_id,
-        title:             `${r.title} — ${year}`,
-        status:            'pending',
-        due_date:          dueDate.toISOString().split('T')[0],
-        owner_type:        r.owner_type,
-        unique_key:        `${r.company_id}_${r.template_id}_annual_${year}`,
-        service_id:        r.service_id,
-        requires_document: r.requires_document,
-      })
+    // ── Anuales (solo el 1 de enero) ─────────────────────────────────────────
+    if (month === 1 && day === 1) {
+      for (const r of rows.filter(r => r.frequency === 'annual')) {
+        const dueDate = new Date(year + 1, 0, r.due_day ?? 1)
+        buckets.annual.push({
+          company_id:        r.company_id,
+          title:             `${r.title} — ${year}`,
+          status:            'pending',
+          due_date:          dueDate.toISOString().split('T')[0],
+          owner_type:        r.owner_type,
+          unique_key:        `${r.company_id}_${r.template_id}_annual_${year}`,
+          service_id:        r.service_id,
+          requires_document: r.requires_document,
+        })
+      }
     }
 
-    // ── Mensuales ─────────────────────────────────────────────────────────────
+    // ── Mensuales (solo las que tienen create_day === hoy) ────────────────────
     for (const r of rows.filter(r => r.frequency === 'monthly')) {
-      const lastDay  = lastDayOf(year, month)
-      const dueDay   = Math.min(r.due_day ?? lastDay, lastDay)
+      const lastDay   = lastDayOf(year, month)
       const createDay = Math.min(r.create_day ?? 1, r.due_day ?? 1)
-      const dueDate  = new Date(year, month - 1, dueDay)
+      if (createDay !== day) continue
+      const dueDay  = Math.min(r.due_day ?? lastDay, lastDay)
+      const dueDate = new Date(year, month - 1, dueDay)
       buckets.monthly.push({
         company_id:        r.company_id,
         title:             `${r.title} — ${MES[month - 1]} ${year}`,
@@ -234,13 +237,14 @@ export class TasksService {
       }
     }
 
-    // ── Semestrales (meses 6 y 12) ────────────────────────────────────────────
+    // ── Semestrales (meses 6 y 12, según create_day) ──────────────────────────
     if ([6, 12].includes(month)) {
       for (const r of rows.filter(r => r.frequency === 'annual' && r.title === 'Cálculo primas y verificación pago')) {
         const lastDay   = lastDayOf(year, month)
-        const dueDay    = Math.min(r.due_day ?? lastDay, lastDay)
         const createDay = Math.min(r.create_day ?? 1, r.due_day ?? 1)
-        const dueDate   = new Date(year, month - 1, dueDay)
+        if (createDay !== day) continue
+        const dueDay  = Math.min(r.due_day ?? lastDay, lastDay)
+        const dueDate = new Date(year, month - 1, dueDay)
         buckets.semestral.push({
           company_id:        r.company_id,
           title:             `${r.title} — ${MES[month - 1]} ${year}`,
@@ -255,13 +259,14 @@ export class TasksService {
       }
     }
 
-    // ── Trimestrales (meses 4, 8, 12) ─────────────────────────────────────────
+    // ── Trimestrales (meses 4, 8, 12, según create_day) ───────────────────────
     if ([4, 8, 12].includes(month)) {
       for (const r of rows.filter(r => r.frequency === 'annual' && r.title === 'Cotización dotaciones y verificación pago')) {
         const lastDay   = lastDayOf(year, month)
-        const dueDay    = Math.min(r.due_day ?? lastDay, lastDay)
         const createDay = Math.min(r.create_day ?? 1, r.due_day ?? 1)
-        const dueDate   = new Date(year, month - 1, dueDay)
+        if (createDay !== day) continue
+        const dueDay  = Math.min(r.due_day ?? lastDay, lastDay)
+        const dueDate = new Date(year, month - 1, dueDay)
         buckets.trimestral.push({
           company_id:        r.company_id,
           title:             `${r.title} — ${MES[month - 1]} ${year}`,

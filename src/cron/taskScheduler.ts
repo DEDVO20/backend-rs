@@ -107,9 +107,9 @@ async function setupRepeatableJobs() {
     await cronQueue.removeRepeatableByKey(job.key)
   }
 
-  // Generar tareas — 1ro de cada mes a las 6:00 AM (Colombia UTC-5)
+  // Generar tareas — diario a las 6:00 AM (Colombia UTC-5), filtra por create_day internamente
   await cronQueue.add('generate-tasks', {}, {
-    repeat: { pattern: '0 11 1 * *' },
+    repeat: { pattern: '0 11 * * *' },
   })
 
   // Recordatorios — Diario a las 7:00 AM
