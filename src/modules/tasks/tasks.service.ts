@@ -20,13 +20,13 @@ export class TasksService {
 
     let q = supabase
       .from('tasks')
-      .select('*,services(name)', { count: 'exact' })
+      .select('*,services(name),companies(name)', { count: 'exact' })
       .order('due_date', { ascending: true })
       .range(from, from + limit - 1)
 
     if (!isInternal) {
       if (!userCompanyId) return { data: [], total: 0, page, limit }
-      q = q.eq('company_id', userCompanyId)
+      q = q.eq('company_id', userCompanyId).eq('owner_type', 'client')
     } else if (company_id) {
       q = q.eq('company_id', company_id)
     }
