@@ -20,7 +20,7 @@ export class TasksService {
 
     let q = supabase
       .from('tasks')
-      .select('*,services(name),companies(name)', { count: 'exact' })
+      .select('*,services!tasks_service_id_fkey(name),companies(name)', { count: 'exact' })
       .order('due_date', { ascending: true })
       .range(from, from + limit - 1)
 
@@ -43,7 +43,7 @@ export class TasksService {
   static async getById(id: string) {
     const { data, error } = await supabase
       .from('tasks')
-      .select('*,services(name),documents(*)')
+      .select('*,services!tasks_service_id_fkey(name),documents(*)')
       .eq('id', id)
       .single()
 
@@ -119,7 +119,7 @@ export class TasksService {
     const [{ data: templates, error: errT }, { data: activeServices, error: errCS }] = await Promise.all([
       supabase
         .from('task_templates')
-        .select('id, title, frequency, due_day, create_day, owner_type, service_id, requires_document')
+        .select('id, title, frequency, due_day, create_day, owner_type, service_id, requires_document, provider_service_id')
         .eq('active', true),
       supabase
         .from('company_services')
@@ -132,50 +132,67 @@ export class TasksService {
 
     // Agrupar company_services por service_id para lookup eficiente
     const serviceToCompanies = new Map<string, string[]>()
+    // Y el inverso: servicios activos por empresa, para resolver dependencias
+    const companyActiveServices = new Map<string, Set<string>>()
     for (const cs of activeServices ?? []) {
       const list = serviceToCompanies.get(cs.service_id) ?? []
       list.push(cs.company_id)
       serviceToCompanies.set(cs.service_id, list)
+
+      const set = companyActiveServices.get(cs.company_id) ?? new Set<string>()
+      set.add(cs.service_id)
+      companyActiveServices.set(cs.company_id, set)
     }
 
     type Row = {
-      template_id:       string
-      title:             string
-      frequency:         string
-      due_day:           number | null
-      create_day:        number | null
-      owner_type:        string
-      service_id:        string
-      requires_document: boolean
-      company_id:        string
+      template_id:         string
+      title:               string
+      frequency:           string
+      due_day:             number | null
+      create_day:          number | null
+      owner_type:          string
+      service_id:          string
+      requires_document:   boolean
+      company_id:          string
+      provider_service_id: string | null
     }
 
-    // Producto cartesiano: cada plantilla × empresas que tienen ese servicio activo
+    // Producto cartesiano: cada plantilla × empresas que tienen ese servicio activo.
+    // Dependencias entre servicios: si la tarea es del cliente pero otro servicio
+    // contratado por la misma empresa puede producir el documento (provider_service_id),
+    // la tarea se asigna al equipo interno de ese servicio en vez del cliente.
     const rows: Row[] = (templates ?? []).flatMap(t => {
       const companies = serviceToCompanies.get(t.service_id) ?? []
-      return companies.map(company_id => ({
-        template_id:       t.id,
-        title:             t.title,
-        frequency:         t.frequency,
-        due_day:           t.due_day,
-        create_day:        t.create_day,
-        owner_type:        t.owner_type,
-        service_id:        t.service_id,
-        requires_document: t.requires_document,
-        company_id,
-      }))
+      return companies.map(company_id => {
+        const providerHired = !!t.provider_service_id
+          && (companyActiveServices.get(company_id)?.has(t.provider_service_id) ?? false)
+        const redirected = t.owner_type === 'client' && providerHired
+        return {
+          template_id:         t.id,
+          title:               t.title,
+          frequency:           t.frequency,
+          due_day:             t.due_day,
+          create_day:          t.create_day,
+          owner_type:          redirected ? 'rs_team' : t.owner_type,
+          service_id:          t.service_id,
+          requires_document:   t.requires_document,
+          company_id,
+          provider_service_id: redirected ? t.provider_service_id : null,
+        }
+      })
     })
 
     type TaskInsert = {
-      company_id:        string
-      title:             string
-      status:            string
-      due_date:          string
-      owner_type:        string
-      unique_key:        string
-      service_id:        string
-      requires_document: boolean
-      create_day?:       number
+      company_id:          string
+      title:               string
+      status:              string
+      due_date:            string
+      owner_type:          string
+      unique_key:          string
+      service_id:          string
+      requires_document:   boolean
+      create_day?:         number
+      provider_service_id: string | null
     }
 
     const buckets: Record<string, TaskInsert[]> = {
@@ -195,6 +212,7 @@ export class TasksService {
           unique_key:        `${r.company_id}_${r.template_id}_annual_${year}`,
           service_id:        r.service_id,
           requires_document: r.requires_document,
+          provider_service_id: r.provider_service_id,
         })
       }
     }
@@ -216,6 +234,7 @@ export class TasksService {
         create_day:        createDay,
         service_id:        r.service_id,
         requires_document: r.requires_document,
+        provider_service_id: r.provider_service_id,
       })
     }
 
@@ -233,6 +252,7 @@ export class TasksService {
           create_day:        day - 2,
           service_id:        r.service_id,
           requires_document: r.requires_document,
+          provider_service_id: r.provider_service_id,
         })
       }
     }
@@ -255,6 +275,7 @@ export class TasksService {
           create_day:        createDay,
           service_id:        r.service_id,
           requires_document: r.requires_document,
+          provider_service_id: r.provider_service_id,
         })
       }
     }
@@ -277,6 +298,7 @@ export class TasksService {
           create_day:        createDay,
           service_id:        r.service_id,
           requires_document: r.requires_document,
+          provider_service_id: r.provider_service_id,
         })
       }
     }
