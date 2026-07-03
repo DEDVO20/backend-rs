@@ -795,40 +795,53 @@ export class CollectionService {
     }
 
     // ── Paso 2: Marcar facturas pagadas ─────────────────────────────────────
+    // El CSV es la foto completa de la cartera de la empresa: TODA factura
+    // de la empresa que no venga en el CSV se considera pagada — incluyendo
+    // las de deudores que ya no aparecen en la importación.
     onProgress?.(82, 'Detectando facturas pagadas...')
 
     let paidDebts = 0
-    for (const [debtorId, csvInvoices] of csvInvoicesByDebtor) {
-      // Obtener todas las facturas actuales de este deudor
-      const { data: allDebts } = await supabase
-        .from('collection_debts')
-        .select('id, siigo_document, outstanding_amount')
-        .eq('debtor_id', debtorId)
+    const { data: allCompanyDebts } = await supabase
+      .from('collection_debts')
+      .select('id, debtor_id, siigo_document, outstanding_amount')
+      .eq('company_id', companyId)
 
-      if (!allDebts) continue
-
-      // Facturas que NO aparecen en el CSV → marcar outstanding_amount = 0 (pagada)
-      for (const debt of allDebts) {
-        if (!csvInvoices.has(debt.siigo_document) && (debt.outstanding_amount ?? 0) > 0) {
-          await supabase.from('collection_debts')
-            .update({ outstanding_amount: 0, overdue_1_30: 0, overdue_31_60: 0, overdue_61_90: 0, overdue_91_plus: 0, not_yet_due: 0 })
-            .eq('id', debt.id)
-          paidDebts++
-        }
+    const paidDebtIds: string[] = []
+    for (const debt of allCompanyDebts ?? []) {
+      const inCsv = csvInvoicesByDebtor.get(debt.debtor_id)?.has(debt.siigo_document) ?? false
+      if (!inCsv && (debt.outstanding_amount ?? 0) > 0) {
+        paidDebtIds.push(debt.id)
       }
     }
 
-    // ── Paso 3: Recalcular tramo y status de cada deudor ────────────────────
+    if (paidDebtIds.length) {
+      const { error: paidErr } = await supabase.from('collection_debts')
+        .update({ outstanding_amount: 0, overdue_1_30: 0, overdue_31_60: 0, overdue_61_90: 0, overdue_91_plus: 0, not_yet_due: 0 })
+        .in('id', paidDebtIds)
+      if (!paidErr) paidDebts = paidDebtIds.length
+    }
+
+    // ── Paso 3: Recalcular tramo y status de TODOS los deudores de la empresa ─
     onProgress?.(90, 'Actualizando tramos y estados...')
 
-    let paidDebtors = 0
-    for (const debtorId of touchedDebtorIds) {
-      const { data: debts } = await supabase
-        .from('collection_debts')
-        .select('outstanding_amount, overdue_1_30, overdue_31_60, overdue_61_90, overdue_91_plus')
-        .eq('debtor_id', debtorId)
+    const [{ data: allDebtors }, { data: debtsAfter }] = await Promise.all([
+      supabase.from('collection_debtors').select('id, status').eq('company_id', companyId),
+      supabase.from('collection_debts')
+        .select('debtor_id, outstanding_amount, overdue_1_30, overdue_31_60, overdue_61_90, overdue_91_plus')
+        .eq('company_id', companyId),
+    ])
 
-      if (!debts) continue
+    const debtsByDebtor = new Map<string, NonNullable<typeof debtsAfter>>()
+    for (const d of debtsAfter ?? []) {
+      const list = debtsByDebtor.get(d.debtor_id) ?? []
+      list.push(d)
+      debtsByDebtor.set(d.debtor_id, list)
+    }
+
+    let paidDebtors = 0
+    for (const debtor of allDebtors ?? []) {
+      const debts = debtsByDebtor.get(debtor.id)
+      if (!debts?.length) continue // sin facturas registradas: no tocar
 
       const totalOutstanding = debts.reduce((s, d) => s + (d.outstanding_amount ?? 0), 0)
 
@@ -842,11 +855,16 @@ export class CollectionService {
       const update: Record<string, unknown> = { prev_max_tramo: maxTramo }
 
       if (totalOutstanding <= 0) {
-        update.status = 'paid'
-        paidDebtors++
+        if (debtor.status !== 'paid') {
+          update.status = 'paid'
+          paidDebtors++
+        }
+      } else if (debtor.status === 'paid') {
+        // Estaba pagado pero volvió a tener deuda → reactivar
+        update.status = 'pending'
       }
 
-      await supabase.from('collection_debtors').update(update).eq('id', debtorId)
+      await supabase.from('collection_debtors').update(update).eq('id', debtor.id)
     }
 
     onProgress?.(100, '¡Importación completada!')

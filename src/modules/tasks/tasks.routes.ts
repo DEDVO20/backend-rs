@@ -42,6 +42,7 @@ const templateSchema = z.object({
   owner_type:         z.enum(['rs_team', 'client']).default('rs_team'),
   requires_document:  z.boolean().default(false),
   active:             z.boolean().default(true),
+  provider_service_id: z.string().uuid().nullable().optional(),
 })
 
 app.get('/templates',
@@ -51,7 +52,7 @@ app.get('/templates',
 
     let q = supabase
       .from('task_templates')
-      .select('*, services(name)')
+      .select('*, services!fk_template_service(name)')
       .order('frequency')
       .order('title')
 
@@ -74,7 +75,7 @@ app.post('/templates',
     const { data, error } = await supabase
       .from('task_templates')
       .insert(c.req.valid('json'))
-      .select('*, services(name)')
+      .select('*, services!fk_template_service(name)')
       .single()
     if (error) return c.json({ error: error.message }, 500)
     return c.json(data, 201)
@@ -89,7 +90,7 @@ app.patch('/templates/:id',
       .from('task_templates')
       .update(c.req.valid('json'))
       .eq('id', c.req.param('id')!)
-      .select('*, services(name)')
+      .select('*, services!fk_template_service(name)')
       .single()
     if (error) return c.json({ error: error.message }, 500)
     return c.json(data)
