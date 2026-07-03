@@ -800,36 +800,57 @@ export class CollectionService {
     // las de deudores que ya no aparecen en la importación.
     onProgress?.(82, 'Detectando facturas pagadas...')
 
+    // Se limpia por deudor (no por company_id de la factura) para cubrir
+    // facturas viejas con company_id inconsistente colgadas de estos deudores.
     let paidDebts = 0
-    const { data: allCompanyDebts } = await supabase
-      .from('collection_debts')
-      .select('id, debtor_id, siigo_document, outstanding_amount')
+    const { data: allDebtors } = await supabase
+      .from('collection_debtors')
+      .select('id, status')
       .eq('company_id', companyId)
 
+    const debtorIds = (allDebtors ?? []).map(d => d.id)
+
+    const chunk = <T,>(arr: T[], size: number): T[][] => {
+      const out: T[][] = []
+      for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size))
+      return out
+    }
+
+    const allCompanyDebts: Array<{ id: string; debtor_id: string; siigo_document: string; outstanding_amount: number | null }> = []
+    for (const ids of chunk(debtorIds, 200)) {
+      const { data } = await supabase
+        .from('collection_debts')
+        .select('id, debtor_id, siigo_document, outstanding_amount')
+        .in('debtor_id', ids)
+      allCompanyDebts.push(...(data ?? []))
+    }
+
     const paidDebtIds: string[] = []
-    for (const debt of allCompanyDebts ?? []) {
+    for (const debt of allCompanyDebts) {
       const inCsv = csvInvoicesByDebtor.get(debt.debtor_id)?.has(debt.siigo_document) ?? false
       if (!inCsv && (debt.outstanding_amount ?? 0) > 0) {
         paidDebtIds.push(debt.id)
       }
     }
 
-    if (paidDebtIds.length) {
+    for (const ids of chunk(paidDebtIds, 200)) {
       const { error: paidErr } = await supabase.from('collection_debts')
         .update({ outstanding_amount: 0, overdue_1_30: 0, overdue_31_60: 0, overdue_61_90: 0, overdue_91_plus: 0, not_yet_due: 0 })
-        .in('id', paidDebtIds)
-      if (!paidErr) paidDebts = paidDebtIds.length
+        .in('id', ids)
+      if (!paidErr) paidDebts += ids.length
     }
 
     // ── Paso 3: Recalcular tramo y status de TODOS los deudores de la empresa ─
     onProgress?.(90, 'Actualizando tramos y estados...')
 
-    const [{ data: allDebtors }, { data: debtsAfter }] = await Promise.all([
-      supabase.from('collection_debtors').select('id, status').eq('company_id', companyId),
-      supabase.from('collection_debts')
+    const debtsAfter: Array<{ debtor_id: string; outstanding_amount: number | null; overdue_1_30: number | null; overdue_31_60: number | null; overdue_61_90: number | null; overdue_91_plus: number | null }> = []
+    for (const ids of chunk(debtorIds, 200)) {
+      const { data } = await supabase
+        .from('collection_debts')
         .select('debtor_id, outstanding_amount, overdue_1_30, overdue_31_60, overdue_61_90, overdue_91_plus')
-        .eq('company_id', companyId),
-    ])
+        .in('debtor_id', ids)
+      debtsAfter.push(...(data ?? []))
+    }
 
     const debtsByDebtor = new Map<string, NonNullable<typeof debtsAfter>>()
     for (const d of debtsAfter ?? []) {
