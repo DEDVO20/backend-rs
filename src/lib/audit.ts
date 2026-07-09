@@ -10,6 +10,7 @@ export type AuditAction =
   | 'approve' | 'reject'
   | 'upload'  | 'download'
   | 'send_campaign' | 'generate_tasks'
+  | 'manual_close'
 
 export interface AuditEntry {
   action:      AuditAction

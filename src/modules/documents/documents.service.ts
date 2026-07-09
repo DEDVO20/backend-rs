@@ -12,12 +12,12 @@ type UpdateInput  = z.infer<typeof updateDocumentSchema>
 
 export class DocumentsService {
   static async list(query: ListQuery, userCompanyId: string | null, isInternal: boolean) {
-    const { category, company_id, page, limit } = query
+    const { category, service_id, company_id, page, limit } = query
     const from = (page - 1) * limit
 
     let q = supabase
       .from('documents')
-      .select('*', { count: 'exact' })
+      .select('*, company:companies(name), service:services(name)', { count: 'exact' })
       .order('created_at', { ascending: false })
       .range(from, from + limit - 1)
 
@@ -28,7 +28,8 @@ export class DocumentsService {
       q = q.eq('company_id', company_id)
     }
 
-    if (category) q = q.eq('category', category)
+    if (category)   q = q.eq('category', category)
+    if (service_id) q = q.eq('service_id', service_id)
 
     const { data, error, count } = await q
     if (error) throw error
@@ -91,7 +92,7 @@ export class DocumentsService {
   // Sube un archivo a Supabase Storage y crea el registro en la tabla documents
   static async upload(
     file: File,
-    meta: { title: string; category?: string; description?: string },
+    meta: { title: string; category?: string; description?: string; service_id?: string },
     companyId: string | null,
     uploadedBy: string,
   ) {

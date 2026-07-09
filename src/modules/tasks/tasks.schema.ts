@@ -14,6 +14,10 @@ export const updateTaskSchema = z.object({
   document_id: z.string().uuid().nullable().optional(),
 })
 
+export const closeTaskSchema = z.object({
+  reason: z.string().min(3, 'El motivo debe tener al menos 3 caracteres').max(500),
+})
+
 export const createTaskSchema = z.object({
   company_id:        z.string().uuid(),
   title:             z.string().min(3),

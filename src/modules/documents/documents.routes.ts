@@ -9,6 +9,7 @@ import {
   createDocumentSchema,
   updateDocumentSchema,
 } from './documents.schema.js'
+import { supabase } from '../../lib/supabase.js'
 
 const INTERNAL_ROLES = ['admin', 'rs_admin', 'rs_staff'] as const
 
@@ -26,6 +27,39 @@ app.get('/',
     return c.json(result)
   },
 )
+
+// ── Áreas de documentos = servicios contratados ─────────────────────────────
+// MUST be before /:id to avoid route collision
+
+// GET /api/documents/areas — clientes: servicios activos de su empresa;
+// roles internos: los contratados por ?company_id, o todos los servicios activos
+app.get('/areas', async (c) => {
+  const { role, companyId: userCompanyId } = c.get('user')
+  const isInternal = (INTERNAL_ROLES as readonly string[]).includes(role)
+  const companyId = isInternal ? (c.req.query('company_id') || null) : userCompanyId
+
+  if (companyId) {
+    const { data, error } = await supabase
+      .from('company_services')
+      .select('services(id, name)')
+      .eq('company_id', companyId)
+      .eq('active', true)
+    if (error) return c.json({ error: error.message }, 500)
+    const areas = (data ?? [])
+      .map((r: any) => r.services)
+      .filter(Boolean)
+      .sort((a: any, b: any) => a.name.localeCompare(b.name))
+    return c.json(areas)
+  }
+
+  const { data, error } = await supabase
+    .from('services')
+    .select('id, name')
+    .eq('active', true)
+    .order('name')
+  if (error) return c.json({ error: error.message }, 500)
+  return c.json(data)
+})
 
 // GET /api/documents/:id
 app.get('/:id', async (c) => {
@@ -72,19 +106,19 @@ app.post('/confirm-upload', async (c) => {
   const { id: uploadedBy, companyId } = c.get('user')
   if (!companyId) return c.json({ error: 'Sin empresa asignada' }, 400)
 
-  const { path, title, category, fileName, fileSize, contentType } = await c.req.json<{
-    path: string; title: string; category?: string
+  const { path, title, category, service_id, fileName, fileSize, contentType } = await c.req.json<{
+    path: string; title: string; category?: string; service_id?: string
     fileName: string; fileSize: number; contentType: string
   }>()
 
   if (!path || !title) return c.json({ error: 'path y title requeridos' }, 400)
 
-  const { supabase } = await import('../../lib/supabase.js')
   const { data: urlData } = await supabase.storage.from('documents').getPublicUrl(path)
 
   const { data, error } = await supabase.from('documents').insert({
     title,
     category:      category ?? 'general',
+    service_id:    service_id ?? null,
     company_id:    companyId,
     uploaded_by:   uploadedBy,
     storage_path:  path,
@@ -120,9 +154,14 @@ app.post('/upload',
       title,
       category:    body['category'] as string | undefined,
       description: body['description'] as string | undefined,
+      service_id:  (body['service_id'] as string) || undefined,
     }
 
-    const data = await DocumentsService.upload(file, meta, companyId, id)
+    // Staff puede subir documentos a nombre de una empresa específica
+    const bodyCompany = (body['company_id'] as string) || undefined
+    const targetCompany = isStaff && bodyCompany ? bodyCompany : companyId
+
+    const data = await DocumentsService.upload(file, meta, targetCompany, id)
     return c.json(data, 201)
   },
 )

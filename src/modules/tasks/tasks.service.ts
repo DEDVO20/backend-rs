@@ -101,6 +101,31 @@ export class TasksService {
     return data
   }
 
+  // Cierre manual por un admin: marca la tarea como completada saltando el
+  // flujo normal (owner_type / documento requerido), dejando trazabilidad.
+  static async closeManually(id: string, userId: string, reason: string) {
+    const task = await TasksService.getById(id)
+    if (task.status === 'done') {
+      throw Object.assign(new Error('La tarea ya está completada'), { statusCode: 409 })
+    }
+
+    const { data, error } = await supabase
+      .from('tasks')
+      .update({
+        status:          'done',
+        closed_manually: true,
+        closed_by:       userId,
+        closure_reason:  reason,
+        closed_at:       new Date().toISOString(),
+      })
+      .eq('id', id)
+      .select()
+      .single()
+
+    if (error) throw error
+    return data
+  }
+
   static async generateTasks(params: {
     year:   number
     month?: number

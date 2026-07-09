@@ -10,7 +10,9 @@ import {
   updateTaskSchema,
   createTaskSchema,
   generateTasksSchema,
+  closeTaskSchema,
 } from './tasks.schema.js'
+import { auditAsync } from '../../lib/audit.js'
 
 const INTERNAL_ROLES = ['admin', 'rs_admin', 'rs_staff'] as const
 
@@ -164,6 +166,29 @@ app.patch('/:id',
     }
 
     const data = await TasksService.update(c.req.param('id')!, body)
+    return c.json(data)
+  },
+)
+
+// POST /api/tasks/:id/close — cierre manual por admin: salta las reglas de
+// owner_type y documento requerido, con motivo obligatorio y audit log
+app.post('/:id/close',
+  requireRole('admin', 'rs_admin'),
+  zValidator('json', closeTaskSchema),
+  async (c) => {
+    const user = c.get('user')
+    const { reason } = c.req.valid('json')
+    const data = await TasksService.closeManually(c.req.param('id')!, user.id, reason)
+
+    auditAsync({
+      action:      'manual_close',
+      resource:    'tasks',
+      resource_id: data.id,
+      metadata:    { reason, title: data.title, company_id: data.company_id },
+      user,
+      c,
+    })
+
     return c.json(data)
   },
 )
