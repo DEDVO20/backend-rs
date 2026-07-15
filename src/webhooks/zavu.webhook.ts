@@ -33,27 +33,66 @@ function verifySignature(rawBody: string, header: string, secret: string): boole
   }
 }
 
+// Idempotencia: Zavu reintenta hasta 5 veces ante fallos — recordar los últimos
+// event.id procesados para no duplicar inserciones/notificaciones
+const SEEN_MAX = 5000
+const seenEvents = new Set<string>()
+
+function markSeen(id: string) {
+  seenEvents.add(id)
+  if (seenEvents.size > SEEN_MAX) {
+    // Set conserva orden de inserción — descartar los más antiguos
+    for (const k of seenEvents) {
+      seenEvents.delete(k)
+      if (seenEvents.size <= SEEN_MAX * 0.8) break
+    }
+  }
+}
+
 zavuWebhook.post('/', async (c) => {
   const rawBody = await c.req.text()
   const header  = c.req.header('x-zavu-signature') ?? ''
+  const secret  = process.env.ZAVU_WEBHOOK_SECRET
 
-  const secret = process.env.ZAVU_WEBHOOK_SECRET!
-
-  const validSig = verifySignature(rawBody, header, secret)
-
-  if (!validSig) {
-    logger.warn({ headerPrefix: header.substring(0, 40) }, 'Webhook Zavu: firma no verificada (procesando igualmente)')
+  if (!secret) {
+    logger.error('ZAVU_WEBHOOK_SECRET no configurado — webhook rechazado')
+    return c.json({ error: 'Webhook no configurado' }, 500)
   }
 
-  const event = JSON.parse(rawBody) as {
+  // Firma inválida o ausente → 401 (antes se procesaba igual y respondía 200,
+  // lo que ocultaba errores de configuración y permitía payloads sin firmar)
+  if (!verifySignature(rawBody, header, secret)) {
+    logger.warn({ headerPrefix: header.substring(0, 40) }, 'Webhook Zavu: firma inválida — rechazado')
+    return c.json({ error: 'Firma inválida' }, 401)
+  }
+
+  let event: {
     id:       string
     type:     string
     senderId: string
     data:     Record<string, unknown>
   }
+  try {
+    event = JSON.parse(rawBody)
+  } catch {
+    logger.warn('Webhook Zavu: body no es JSON válido')
+    return c.json({ error: 'JSON inválido' }, 400)
+  }
 
-  logger.info({ type: event.type, eventId: event.id, validSig }, 'Webhook Zavu recibido')
+  if (!event?.id || !event?.type) {
+    return c.json({ error: 'Evento inválido — faltan id o type' }, 400)
+  }
 
+  // Reintento de un evento ya procesado → 200 sin reprocesar
+  if (seenEvents.has(event.id)) {
+    logger.debug({ eventId: event.id }, 'Webhook Zavu: evento duplicado ignorado')
+    return c.json({ ok: true, duplicate: true })
+  }
+  markSeen(event.id)
+
+  logger.info({ type: event.type, eventId: event.id }, 'Webhook Zavu recibido')
+
+  // Responder rápido y procesar async (Zavu espera respuesta < 30s)
   void processEvent(event)
 
   return c.json({ ok: true })
