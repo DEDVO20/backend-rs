@@ -1,4 +1,5 @@
 import { supabase } from '../../lib/supabase.js'
+import { logger }   from '../../lib/logger.js'
 import { NotificationService } from '../../notifications/NotificationService.js'
 import type { z } from 'zod'
 import type {
@@ -461,11 +462,16 @@ export class CollectionService {
 
         return {
           to, text, debtorId: d.id, dueDate, currency, saldo,
-          // Variables para la plantilla de WhatsApp aprobada por Meta
+          // Variables para la plantilla de WhatsApp aprobada por Meta.
+          // Se envían todas las conocidas: la plantilla usa las que declare.
           templateVariables: {
-            nombre:   d.debtor_name ?? '',
-            company:  companyName,
-            facturas: facturasStr,
+            nombre:    d.debtor_name ?? '',
+            company:   companyName,
+            empresa:   companyName,
+            saldo:     new Intl.NumberFormat('es-CO', { style: 'currency', currency }).format(saldo),
+            dias_mora: String(maxDays),
+            asesor:    advisorName,
+            facturas:  facturasStr,
           },
         }
       })
@@ -480,8 +486,16 @@ export class CollectionService {
     // Enviar mensajes individuales con la cola de BullMQ (reintentos automáticos).
     // WhatsApp fuera de la ventana de 24h exige plantilla aprobada por Meta
     // (messageType 'template'); el texto libre rebota con el error 131047.
-    const waTemplateId = process.env.ZAVU_WA_TEMPLATE_ID
+    // Plantilla elegida en la campaña; ZAVU_WA_TEMPLATE_ID queda como fallback global
+    const waTemplateId = campaign.zavu_template_id ?? process.env.ZAVU_WA_TEMPLATE_ID
     const useTemplate  = channel === 'whatsapp' && !!waTemplateId
+
+    if (channel === 'whatsapp' && !waTemplateId) {
+      logger.warn(
+        { campaignId },
+        'Campaña de WhatsApp sin plantilla (ni zavu_template_id ni ZAVU_WA_TEMPLATE_ID) — saldrá como TEXTO y rebotará fuera de la ventana de 24h (error Meta 131047)',
+      )
+    }
 
     await Promise.allSettled(
       contacts.map(c =>

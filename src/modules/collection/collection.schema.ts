@@ -47,6 +47,7 @@ export const createCampaignSchema = z.object({
   scheduled_at:     z.string().datetime().optional(),
   debtor_ids:       z.array(z.string().uuid()).optional(),
   message_template: z.string().optional(),
+  zavu_template_id: z.string().optional(),
   company_id:       z.string().uuid().optional(),
 })
 
