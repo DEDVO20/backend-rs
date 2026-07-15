@@ -6,6 +6,9 @@ const envSchema = z.object({
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(10),
   ZAVU_API_KEY:              z.string().min(1),
   ZAVU_WEBHOOK_SECRET:       z.string().min(1),
+  // Plantilla de WhatsApp aprobada por Meta para campañas de cobranza
+  // (fuera de la ventana de 24h solo se pueden enviar plantillas)
+  ZAVU_WA_TEMPLATE_ID:       z.string().optional(),
   RS_TEAM_EMAIL:             z.string().email(),
   PLATFORM_URL:              z.string().url(),
   REDIS_URL:                 z.string().url(),

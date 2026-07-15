@@ -459,7 +459,15 @@ export class CollectionService {
           .replace(/\{\{asesor\}\}/g, advisorName)
           .replace(/\{\{facturas\}\}/g, facturasStr)
 
-        return { to, text, debtorId: d.id, dueDate, currency, saldo }
+        return {
+          to, text, debtorId: d.id, dueDate, currency, saldo,
+          // Variables para la plantilla de WhatsApp aprobada por Meta
+          templateVariables: {
+            nombre:   d.debtor_name ?? '',
+            company:  companyName,
+            facturas: facturasStr,
+          },
+        }
       })
 
     if (!contacts.length) {
@@ -469,16 +477,25 @@ export class CollectionService {
       return { sent: 0 }
     }
 
-    // Enviar mensajes individuales con la cola de BullMQ (reintentos automáticos)
+    // Enviar mensajes individuales con la cola de BullMQ (reintentos automáticos).
+    // WhatsApp fuera de la ventana de 24h exige plantilla aprobada por Meta
+    // (messageType 'template'); el texto libre rebota con el error 131047.
+    const waTemplateId = process.env.ZAVU_WA_TEMPLATE_ID
+    const useTemplate  = channel === 'whatsapp' && !!waTemplateId
+
     await Promise.allSettled(
       contacts.map(c =>
         NotificationService.enqueue({
           channel: channel as any,
           to: c.to,
-          template: 'raw-text',
+          template: useTemplate ? 'wa-template' : 'raw-text',
           data: { text: c.text },
           companyId: campaign.company_id,
           metadata: { campaignId, debtorId: c.debtorId },
+          ...(useTemplate && {
+            templateId:        waTemplateId,
+            templateVariables: c.templateVariables,
+          }),
         }),
       ),
     )

@@ -13,6 +13,10 @@ export type NotificationPayload = {
   data:       Record<string, unknown>
   companyId?: string
   metadata?:  Record<string, unknown>
+  // Plantilla de WhatsApp aprobada por Meta (Zavu) — obligatoria fuera de la
+  // ventana de 24h; si viene, se envía messageType 'template' en vez de texto
+  templateId?:        string
+  templateVariables?: Record<string, string>
 }
 
 export class NotificationService {
@@ -64,15 +68,26 @@ export class NotificationService {
     let messageId:  string | null = null
 
     try {
-      const { text, html, subject } = await renderTemplate(payload.template, payload.data)
+      if (payload.channel === 'whatsapp' && payload.templateId) {
+        // Plantilla aprobada por Meta — no se renderiza texto local
+        messageId = await ZavuChannel.send({
+          to:                payload.to,
+          channel:           'whatsapp',
+          text:              '',
+          templateId:        payload.templateId,
+          templateVariables: payload.templateVariables,
+        })
+      } else {
+        const { text, html, subject } = await renderTemplate(payload.template, payload.data)
 
-      messageId = await ZavuChannel.send({
-        to:      payload.to,
-        channel: payload.channel,
-        text,
-        html,
-        subject,
-      })
+        messageId = await ZavuChannel.send({
+          to:      payload.to,
+          channel: payload.channel,
+          text,
+          html,
+          subject,
+        })
+      }
     } catch (err) {
       status   = 'failed'
       errorMsg = err instanceof Error ? err.message : String(err)

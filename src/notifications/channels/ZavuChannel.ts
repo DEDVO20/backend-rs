@@ -24,24 +24,41 @@ export type ChannelPayload = {
   text:     string
   subject?: string
   html?:    string
+  // Plantilla aprobada por Meta — requerida en WhatsApp fuera de la ventana
+  // de 24 horas (los mensajes "text" rebotan con el error 131047)
+  templateId?:        string
+  templateVariables?: Record<string, string>
 }
 
 export class ZavuChannel {
   static async send(payload: ChannelPayload): Promise<string> {
-    const body: Record<string, unknown> = {
-      to:      payload.to,
-      channel: payload.channel,
-      text:    payload.text,
-    }
+    let body: Record<string, unknown>
 
-    if (payload.channel === 'email') {
-      if (payload.subject) body['subject']  = payload.subject
-      if (payload.html)    body['htmlBody'] = payload.html
+    if (payload.channel === 'whatsapp' && payload.templateId) {
+      body = {
+        to:          payload.to,
+        channel:     'whatsapp',
+        messageType: 'template',
+        content: {
+          templateId:        payload.templateId,
+          templateVariables: payload.templateVariables ?? {},
+        },
+      }
+    } else {
+      body = {
+        to:      payload.to,
+        channel: payload.channel,
+        text:    payload.text,
+      }
+      if (payload.channel === 'email') {
+        if (payload.subject) body['subject']  = payload.subject
+        if (payload.html)    body['htmlBody'] = payload.html
+      }
     }
 
     const result = await zavuPost(body)
     const messageId = (result as any)?.message?.id ?? (result as any)?.id ?? 'unknown'
-    logger.info({ messageId, channel: payload.channel, to: payload.to }, 'Mensaje enviado')
+    logger.info({ messageId, channel: payload.channel, to: payload.to, template: payload.templateId ?? null }, 'Mensaje enviado')
     return messageId
   }
 
