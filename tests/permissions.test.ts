@@ -55,6 +55,24 @@ describe('canAccess', () => {
     expect(canAccess('client_user', 'documents')).toBe(true)
   })
 
+  it('accounting: solo admin, rs_admin y contador', () => {
+    expect(canAccess('admin', 'accounting')).toBe(true)
+    expect(canAccess('rs_admin', 'accounting')).toBe(true)
+    expect(canAccess('contador', 'accounting')).toBe(true)
+    expect(canAccess('rs_staff', 'accounting')).toBe(false)
+    expect(canAccess('client_owner', 'accounting')).toBe(false)
+    expect(canAccess('client_user', 'accounting')).toBe(false)
+  })
+
+  it('contador accede a tasks y documents pero NO a collection ni settings', () => {
+    expect(canAccess('contador', 'tasks')).toBe(true)
+    expect(canAccess('contador', 'documents')).toBe(true)
+    expect(canAccess('contador', 'dashboard')).toBe(true)
+    expect(canAccess('contador', 'collection')).toBe(false)
+    expect(canAccess('contador', 'settings')).toBe(false)
+    expect(canAccess('contador', 'users_admin')).toBe(false)
+  })
+
   it('todos los roles acceden al dashboard', () => {
     const roles: Role[] = ['admin', 'rs_admin', 'rs_staff', 'client_owner', 'client_user']
     for (const role of roles) {

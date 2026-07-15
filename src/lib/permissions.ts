@@ -8,17 +8,19 @@ export type Role =
   | 'admin'
   | 'rs_admin'
   | 'rs_staff'
+  | 'contador'
   | 'client_owner'
   | 'client_user'
 
 export const MODULE_PERMISSIONS = {
-  dashboard:            ['admin', 'rs_admin', 'rs_staff', 'client_owner', 'client_user'],
+  dashboard:            ['admin', 'rs_admin', 'rs_staff', 'contador', 'client_owner', 'client_user'],
   onboarding:           ['admin', 'rs_admin', 'rs_staff'],
   companies:            ['admin', 'rs_admin', 'rs_staff', 'client_owner'],
-  tasks:                ['admin', 'rs_admin', 'rs_staff', 'client_owner', 'client_user'],
+  tasks:                ['admin', 'rs_admin', 'rs_staff', 'contador', 'client_owner', 'client_user'],
   operational_requests: ['admin', 'rs_admin', 'rs_staff', 'client_owner', 'client_user'],
   collection:           ['admin', 'rs_admin', 'rs_staff', 'client_owner'],
-  documents:            ['admin', 'rs_admin', 'rs_staff', 'client_owner', 'client_user'],
+  accounting:           ['admin', 'rs_admin', 'contador'],
+  documents:            ['admin', 'rs_admin', 'rs_staff', 'contador', 'client_owner', 'client_user'],
   team_management:      ['admin', 'rs_admin', 'client_owner'],
   users_admin:          ['admin'],
   settings:             ['admin', 'rs_admin'],
@@ -43,7 +45,7 @@ export function hasRole(userRole: Role, ...allowed: Role[]): boolean {
 }
 
 /** Roles internos de la firma */
-export const RS_ROLES: Role[] = ['admin', 'rs_admin', 'rs_staff']
+export const RS_ROLES: Role[] = ['admin', 'rs_admin', 'rs_staff', 'contador']
 
 /** Roles de cliente */
 export const CLIENT_ROLES: Role[] = ['client_owner', 'client_user']

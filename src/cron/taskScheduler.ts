@@ -65,6 +65,13 @@ async function processJob(jobName: string) {
         break
       }
 
+      case 'tax-calendar-tasks': {
+        const { AccountingService } = await import('../modules/accounting/accounting.service.js')
+        result = await AccountingService.generateTaxTasks()
+        logger.info({ result }, 'Cron: tareas de calendario tributario generadas')
+        break
+      }
+
       default:
         logger.warn({ jobName }, 'Cron: job desconocido')
         return
@@ -122,5 +129,10 @@ async function setupRepeatableJobs() {
     repeat: { pattern: '0 6 * * *' },
   })
 
-  logger.info('Cron jobs registrados: generate-tasks (1ro/mes 6AM), send-reminders (diario 7AM), mark-overdue (diario 1AM)')
+  // Calendario tributario — diario a las 6:30 AM: crea tareas 5 días antes del vencimiento
+  await cronQueue.add('tax-calendar-tasks', {}, {
+    repeat: { pattern: '30 11 * * *' },
+  })
+
+  logger.info('Cron jobs registrados: generate-tasks (diario 6AM), send-reminders (diario 7AM), mark-overdue (diario 1AM), tax-calendar-tasks (diario 6:30AM)')
 }

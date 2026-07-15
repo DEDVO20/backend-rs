@@ -11,7 +11,7 @@ import {
 } from './documents.schema.js'
 import { supabase } from '../../lib/supabase.js'
 
-const INTERNAL_ROLES = ['admin', 'rs_admin', 'rs_staff'] as const
+const INTERNAL_ROLES = ['admin', 'rs_admin', 'rs_staff', 'contador'] as const
 
 const app = new Hono()
 

@@ -14,7 +14,7 @@ import {
 } from './tasks.schema.js'
 import { auditAsync } from '../../lib/audit.js'
 
-const INTERNAL_ROLES = ['admin', 'rs_admin', 'rs_staff'] as const
+const INTERNAL_ROLES = ['admin', 'rs_admin', 'rs_staff', 'contador'] as const
 
 const app = new Hono()
 

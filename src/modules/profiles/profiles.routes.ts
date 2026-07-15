@@ -16,7 +16,7 @@ const updateProfileSchema = z.object({
 })
 
 const updateProfileAdminSchema = updateProfileSchema.extend({
-  role: z.enum(['admin', 'rs_admin', 'rs_staff', 'client_owner', 'client_user']).optional(),
+  role: z.enum(['admin', 'rs_admin', 'rs_staff', 'contador', 'client_owner', 'client_user']).optional(),
   active: z.boolean().optional(),
   company_id: z.string().uuid().nullable().optional(),
 })
@@ -131,7 +131,7 @@ app.get('/company/:companyId/team', async (c) => {
 const inviteAdminSchema = z.object({
   full_name: z.string().min(2),
   email: z.string().email(),
-  role: z.enum(['admin', 'rs_admin', 'rs_staff']),
+  role: z.enum(['admin', 'rs_admin', 'rs_staff', 'contador']),
 })
 
 app.post('/invite',

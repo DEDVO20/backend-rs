@@ -69,20 +69,66 @@ function fromMocks() {
 describe('Webhook Zavu', () => {
   beforeEach(() => vi.clearAllMocks())
 
-  it('procesa el evento aunque la firma sea inválida (log warning)', async () => {
-    const res = await post({ id: 'evt-1', type: 'message.inbound', senderId: 'z', data: { channel: 'sms', from: '+57300', text: 'test' } }, { 'x-zavu-signature': 'firma_falsa' })
-    expect(res.status).toBe(200)
+  it('rechaza con 401 cuando la firma es inválida y NO procesa el evento', async () => {
+    const res = await post({ id: 'evt-bad-sig', type: 'message.inbound', senderId: 'z', data: { channel: 'sms', from: '+57300', text: 'test' } }, { 'x-zavu-signature': 'firma_falsa' })
+    expect(res.status).toBe(401)
+    await new Promise(r => setTimeout(r, 20))
+    expect(supabase.from).not.toHaveBeenCalled()
   })
 
-  it('procesa el evento cuando falta la cabecera de firma', async () => {
-    const raw = JSON.stringify({ id: 'evt-2', type: 'message.inbound', senderId: 'z', data: { channel: 'sms', from: '+57300', text: 'test' } })
+  it('rechaza con 401 cuando falta la cabecera de firma', async () => {
+    const raw = JSON.stringify({ id: 'evt-no-sig', type: 'message.inbound', senderId: 'z', data: { channel: 'sms', from: '+57300', text: 'test' } })
     const req = new Request('http://localhost/', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: raw,
     })
     const res = await zavuWebhook.fetch(req)
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(401)
+  })
+
+  it('rechaza con 401 cuando el timestamp es viejo (replay)', async () => {
+    const raw = JSON.stringify({ id: 'evt-replay', type: 'message.inbound', senderId: 'z', data: {} })
+    const oldTs = Math.floor(Date.now() / 1000) - 600 // 10 min atrás
+    const hmac = createHmac('sha256', WEBHOOK_SECRET).update(`${oldTs}.${raw}`).digest('hex')
+    const req = new Request('http://localhost/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-zavu-signature': `t=${oldTs},v1=${hmac}` },
+      body: raw,
+    })
+    const res = await zavuWebhook.fetch(req)
+    expect(res.status).toBe(401)
+  })
+
+  it('rechaza con 400 cuando el body no es JSON válido', async () => {
+    const raw = 'esto no es json'
+    const req = new Request('http://localhost/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-zavu-signature': sign(raw) },
+      body: raw,
+    })
+    const res = await zavuWebhook.fetch(req)
+    expect(res.status).toBe(400)
+  })
+
+  it('rechaza con 400 cuando el evento no trae id o type', async () => {
+    const res = await post({ data: { foo: 'bar' } })
+    expect(res.status).toBe(400)
+  })
+
+  it('ignora eventos duplicados (mismo event.id) sin reprocesarlos', async () => {
+    const event = { id: 'evt-dup', type: 'message.delivered', senderId: 'z', data: { messageId: 'zavu_msg_dup' } }
+
+    const first = await post(event)
+    expect(first.status).toBe(200)
+    await new Promise(r => setTimeout(r, 20))
+    const callsAfterFirst = vi.mocked(supabase.from).mock.calls.length
+
+    const second = await post(event)
+    expect(second.status).toBe(200)
+    expect(await second.json()).toMatchObject({ duplicate: true })
+    await new Promise(r => setTimeout(r, 20))
+    expect(vi.mocked(supabase.from).mock.calls.length).toBe(callsAfterFirst)
   })
 
   it('message.inbound guarda el mensaje en collection_inbound_messages', async () => {
@@ -154,7 +200,7 @@ describe('Webhook Zavu', () => {
   })
 
   it('evento desconocido retorna 200 sin tocar la DB', async () => {
-    const res = await post({ type: 'message.unknown_event', foo: 'bar' })
+    const res = await post({ id: 'evt-unknown', type: 'message.unknown_event', senderId: 'z', data: {} })
     expect(res.status).toBe(200)
     expect(supabase.from).not.toHaveBeenCalled()
   })

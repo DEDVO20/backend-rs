@@ -26,6 +26,7 @@ import { companiesRoutes }  from './modules/companies/companies.routes.js'
 import { tasksRoutes }      from './modules/tasks/tasks.routes.js'
 import { requestsRoutes }   from './modules/operational-requests/requests.routes.js'
 import { collectionRoutes } from './modules/collection/collection.routes.js'
+import { accountingRoutes } from './modules/accounting/accounting.routes.js'
 import { documentsRoutes }  from './modules/documents/documents.routes.js'
 import { auditRoutes }      from './modules/audit/audit.routes.js'
 
@@ -104,6 +105,7 @@ app.route('/api/companies',   companiesRoutes)
 app.route('/api/tasks',       tasksRoutes)
 app.route('/api/requests',    requestsRoutes)
 app.route('/api/collection',  collectionRoutes)
+app.route('/api/accounting',  accountingRoutes)
 app.route('/api/documents',   documentsRoutes)
 app.route('/api/audit',       auditRoutes)
 
