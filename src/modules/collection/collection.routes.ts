@@ -187,7 +187,13 @@ app.get('/campaigns', async (c) => {
   const { companyId, role } = c.get('user')
   const isStaff = ['admin', 'rs_admin', 'rs_staff'].includes(role)
   if (!companyId && !isStaff) return c.json({ error: 'Sin empresa' }, 400)
-  const data = await CollectionService.listCampaigns(companyId ?? null)
+
+  const page  = Math.max(1, Number(c.req.query('page') ?? 1) || 1)
+  const limit = Math.min(Math.max(1, Number(c.req.query('limit') ?? 10) || 10), 100)
+  // Staff puede filtrar el historial por empresa
+  const queryCompany = isStaff ? (c.req.query('company_id') || null) : null
+
+  const data = await CollectionService.listCampaigns(companyId ?? queryCompany, page, limit)
   return c.json(data)
 })
 
@@ -501,8 +507,12 @@ app.get('/templates', async (c) => {
   const { companyId, role } = c.get('user')
   const isStaff = ['admin', 'rs_admin', 'rs_staff'].includes(role)
 
-  // Traer plantillas locales
-  const localTemplates = await CollectionService.listTemplates(isStaff ? null : companyId)
+  // Staff puede filtrar por empresa (?company_id=) para ver sus plantillas
+  // personalizadas + las globales; sin filtro ve todas (panel de administración)
+  const queryCompany = c.req.query('company_id') || null
+  const effectiveCompany = isStaff ? queryCompany : companyId
+
+  const localTemplates = await CollectionService.listTemplates(effectiveCompany)
 
   // Traer plantillas de Zavu en paralelo
   let zavuTemplates: any[] = []
@@ -540,7 +550,10 @@ app.post('/templates',
   zValidator('json', createTemplateSchema),
   async (c) => {
     const { companyId } = c.get('user')
-    const data = await CollectionService.createTemplate(c.req.valid('json'), companyId ?? null)
+    const input = c.req.valid('json')
+    // Staff elige la empresa en el body; vacío = plantilla global
+    const targetCompany = input.company_id ?? companyId ?? null
+    const data = await CollectionService.createTemplate(input, targetCompany)
     return c.json(data, 201)
   },
 )

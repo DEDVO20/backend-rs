@@ -5,6 +5,11 @@ export const listDebtorsQuerySchema = z.object({
   search:     z.string().optional(),
   assigned:   z.string().uuid().optional(),
   company_id: z.string().uuid().optional(),
+  // Filtro por datos de contacto disponibles
+  contact:    z.enum(['phone','email','none']).optional(),
+  // Ordenamiento por campos calculados (saldo, días de mora, antigüedad)
+  sort:       z.enum(['antiguedad','mora','saldo']).optional(),
+  dir:        z.enum(['asc','desc']).default('desc'),
   page:       z.coerce.number().int().positive().default(1),
   limit:      z.coerce.number().int().positive().max(500).default(20),
 })
@@ -94,6 +99,8 @@ export const createTemplateSchema = z.object({
   is_active:          z.boolean().default(true),
   is_global:          z.boolean().default(false),
   tramo:              z.number().int().min(0).optional(),
+  // null/ausente = plantilla global; con valor = personalizada para esa empresa
+  company_id:         z.string().uuid().nullable().optional(),
 })
 
 export const createCollectionTaskSchema = z.object({

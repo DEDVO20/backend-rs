@@ -120,14 +120,20 @@ export class CollectionService {
   // ── Debtors ───────────────────────────────────────────────────────────────
 
   static async listDebtors(query: ListDebtorsQuery, companyId: string | null) {
-    const { status, search, assigned, page, limit } = query
+    const { status, search, assigned, page, limit, contact, sort, dir } = query
     const from = (page - 1) * limit
+
+    // Contacto y orden dependen de campos calculados (saldo, mora, antigüedad):
+    // en esos casos se trae el conjunto filtrado completo y se pagina en memoria
+    const postProcess = !!contact || !!sort
 
     let q = supabase
       .from('collection_debtors')
       .select('*, companies(name), collection_debts(outstanding_amount,overdue_1_30,overdue_31_60,overdue_61_90,overdue_91_plus,not_yet_due,total_balance,currency,due_date,siigo_document)', { count: 'exact' })
       .order('updated_at', { ascending: false })
-      .range(from, from + limit - 1)
+
+    if (postProcess) q = q.limit(2000)
+    else q = q.range(from, from + limit - 1)
 
     if (companyId) q = q.eq('company_id', companyId)
 
@@ -157,13 +163,15 @@ export class CollectionService {
     const today = new Date()
     today.setHours(0, 0, 0, 0)
 
-    const mappedData = (data ?? []).map((d: any) => {
+    let mappedData = (data ?? []).map((d: any) => {
       const debts = d.collection_debts ?? []
 
-      // Calculate days_overdue
+      // days_overdue (mora) y fecha vencida más antigua (antigüedad)
       let maxDays = 0
+      let oldestDue: string | null = null
       for (const debt of debts) {
         if ((debt.outstanding_amount ?? 0) > 0 && debt.due_date) {
+          if (!oldestDue || debt.due_date < oldestDue) oldestDue = debt.due_date
           const dueDate = new Date(debt.due_date)
           dueDate.setHours(0, 0, 0, 0)
           if (dueDate < today) {
@@ -176,13 +184,45 @@ export class CollectionService {
         }
       }
 
+      const outstanding = debts.reduce((a: number, x: any) => a + (x.outstanding_amount ?? 0), 0)
+
       return {
         ...d,
         days_overdue: maxDays,
+        outstanding_balance: outstanding,
+        oldest_due_date: oldestDue,
         company: d.companies ? { name: (d.companies as any).name } : null,
         assigned_user: d.assigned_user_id ? { full_name: advisorsMap.get(d.assigned_user_id) ?? null } : null
       }
     })
+
+    // Filtro por datos de contacto
+    if (contact) {
+      mappedData = mappedData.filter((d: any) => {
+        const hasPhone = !!(d.phone || d.whatsapp)
+        const hasEmail = !!d.email
+        if (contact === 'phone') return hasPhone
+        if (contact === 'email') return hasEmail
+        return !hasPhone && !hasEmail // 'none' = sin contacto
+      })
+    }
+
+    // Orden por campos calculados
+    if (sort) {
+      const ageOf = (d: any) => d.oldest_due_date ? today.getTime() - new Date(d.oldest_due_date).getTime() : -1
+      mappedData.sort((a: any, b: any) => {
+        let cmp = 0
+        if (sort === 'saldo')      cmp = (a.outstanding_balance ?? 0) - (b.outstanding_balance ?? 0)
+        else if (sort === 'mora')  cmp = (a.days_overdue ?? 0) - (b.days_overdue ?? 0)
+        else                       cmp = ageOf(a) - ageOf(b)
+        return dir === 'asc' ? cmp : -cmp
+      })
+    }
+
+    if (postProcess) {
+      const total = mappedData.length
+      return { data: mappedData.slice(from, from + limit), total, page, limit }
+    }
 
     return { data: mappedData, total: count ?? 0, page, limit }
   }
@@ -332,17 +372,20 @@ export class CollectionService {
 
   // ── Campaigns ─────────────────────────────────────────────────────────────
 
-  static async listCampaigns(companyId: string | null) {
+  static async listCampaigns(companyId: string | null, page = 1, limit = 10) {
+    const from = (page - 1) * limit
+
     let q = supabase
       .from('collection_campaigns')
-      .select('*,collection_templates(name,channel)')
+      .select('*, collection_templates(name,channel), companies(name)', { count: 'exact' })
       .order('created_at', { ascending: false })
+      .range(from, from + limit - 1)
 
     if (companyId) q = q.eq('company_id', companyId)
 
-    const { data, error } = await q
+    const { data, error, count } = await q
     if (error) throw error
-    return data
+    return { data, total: count ?? 0, page, limit }
   }
 
   static async createCampaign(input: CreateCampaignInput, companyId: string, createdBy: string) {
@@ -573,10 +616,12 @@ export class CollectionService {
   static async listTemplates(companyId: string | null) {
     let q = supabase
       .from('collection_templates')
-      .select('*')
+      .select('*, companies(name)')
       .eq('is_active', true)
       .order('name')
 
+    // Con empresa: sus plantillas personalizadas + las globales.
+    // Sin empresa (staff): todas, para el panel de administración.
     if (companyId) {
       q = q.or(`company_id.eq.${companyId},is_global.eq.true`)
     }
@@ -589,7 +634,12 @@ export class CollectionService {
   static async createTemplate(input: CreateTemplateInput, companyId: string | null) {
     const { data, error } = await supabase
       .from('collection_templates')
-      .insert({ ...input, company_id: companyId })
+      .insert({
+        ...input,
+        company_id: companyId,
+        // Una plantilla asignada a una empresa nunca es global
+        is_global:  companyId ? false : true,
+      })
       .select()
       .single()
 
@@ -598,9 +648,13 @@ export class CollectionService {
   }
 
   static async updateTemplate(id: string, input: Partial<CreateTemplateInput>) {
+    const patch: Record<string, unknown> = { ...input }
+    // Mantener is_global consistente si se reasigna la empresa
+    if (input.company_id !== undefined) patch.is_global = !input.company_id
+
     const { data, error } = await supabase
       .from('collection_templates')
-      .update(input)
+      .update(patch)
       .eq('id', id)
       .select()
       .single()
