@@ -1,5 +1,6 @@
 import { supabase } from '../../lib/supabase.js'
 import { logger }   from '../../lib/logger.js'
+import { NotificationService } from '../../notifications/NotificationService.js'
 import type { z }   from 'zod'
 import type { masterItemSchema, updateMasterItemSchema, updateEntrySchema } from './accounting.schema.js'
 
@@ -7,14 +8,45 @@ type MasterInput       = z.infer<typeof masterItemSchema>
 type MasterUpdateInput = z.infer<typeof updateMasterItemSchema>
 type EntryUpdateInput  = z.infer<typeof updateEntrySchema>
 
-// Cuántos días antes del vencimiento se crea la tarea (punto 4 del spec)
-const DAYS_BEFORE_DUE = 5
+// Anticipación por defecto si la tarea de la maestra no define notice_days
+const DEFAULT_NOTICE_DAYS = 5
+
+// Máximo horizonte que revisa el cron (cubre notice_days de hasta ~4 meses)
+const MAX_NOTICE_DAYS = 120
+
+// Hitos de recordatorio: se notifica al contador cuando faltan estos días
+const REMINDER_MILESTONES = [30, 15, 7, 3, 1, 0]
+
+const PLATFORM_URL = process.env.PLATFORM_URL ?? 'https://app.tudominio.com'
 
 const toDateStr = (d: Date) => d.toISOString().split('T')[0]!
+
+// Días completos entre hoy y una fecha (yyyy-mm-dd), en zona local del server
+function daysUntil(dueDate: string, today: Date): number {
+  const due = new Date(dueDate + 'T00:00:00')
+  const t   = new Date(today); t.setHours(0, 0, 0, 0)
+  return Math.round((due.getTime() - t.getTime()) / 86_400_000)
+}
 
 export class AccountingService {
 
   // ── Helpers ────────────────────────────────────────────────────────────────
+
+  /** Correos de los contadores activos; fallback al equipo si no hay ninguno */
+  static async contadorRecipients(): Promise<string[]> {
+    const { data } = await supabase
+      .from('profiles')
+      .select('email')
+      .eq('role', 'contador')
+      .eq('active', true)
+
+    const emails = (data ?? []).map((p: any) => p.email).filter(Boolean)
+    if (emails.length) return emails
+
+    // Sin contadores registrados → notificar al equipo interno
+    const fallback = process.env.RS_TEAM_EMAIL
+    return fallback ? [fallback] : []
+  }
 
   /** IDs de los servicios que representan el módulo contable */
   static async accountingServiceIds(): Promise<string[]> {
@@ -254,16 +286,17 @@ export class AccountingService {
     }
   }
 
-  // ── Cron: crear tareas 5 días antes del vencimiento (punto 4) ──────────────
+  // ── Cron: crear tareas según la anticipación de cada obligación (punto 4) ──
 
   static async generateTaxTasks() {
     const today = new Date()
     const todayStr = toDateStr(today)
-    const limitStr = toDateStr(new Date(today.getTime() + DAYS_BEFORE_DUE * 86_400_000))
+    // Horizonte máximo; luego se filtra por notice_days de cada tarea
+    const limitStr = toDateStr(new Date(today.getTime() + MAX_NOTICE_DAYS * 86_400_000))
 
     const { data: entries, error } = await supabase
       .from('company_tax_entries')
-      .select('id, company_id, due_date, master:tax_calendar_master(title)')
+      .select('id, company_id, due_date, master:tax_calendar_master(title, notice_days), companies(name)')
       .not('due_date', 'is', null)
       .gte('due_date', todayStr)
       .lte('due_date', limitStr)
@@ -271,10 +304,17 @@ export class AccountingService {
 
     if (!entries?.length) return { created: 0 }
 
+    // Solo las que ya entraron en su ventana de anticipación
+    const inWindow = (entries as any[]).filter(e => {
+      const notice = e.master?.notice_days ?? DEFAULT_NOTICE_DAYS
+      return daysUntil(e.due_date, today) <= notice
+    })
+    if (!inWindow.length) return { created: 0 }
+
     const serviceIds = await AccountingService.accountingServiceIds()
     const serviceId  = serviceIds[0] ?? null
 
-    const rows = entries.map((e: any) => ({
+    const rows = inWindow.map((e: any) => ({
       company_id:        e.company_id,
       title:             `${e.master?.title ?? 'Obligación tributaria'} — vence ${e.due_date}`,
       status:            'pending',
@@ -285,12 +325,105 @@ export class AccountingService {
       requires_document: false,
     }))
 
-    const { error: insertErr } = await supabase
+    // upsert con ignoreDuplicates → solo inserta las que aún no existían.
+    // select() devuelve las filas realmente insertadas para poder notificar.
+    const { data: inserted, error: insertErr } = await supabase
       .from('tasks')
       .upsert(rows, { onConflict: 'unique_key', ignoreDuplicates: true })
+      .select('id, title, company_id, due_date, companies(name)')
     if (insertErr) throw insertErr
 
-    logger.info({ count: rows.length }, 'Cron: tareas de calendario tributario generadas')
-    return { created: rows.length }
+    const created = inserted ?? []
+
+    // Notificar al contador las tareas recién creadas (anticipación de la obligación)
+    if (created.length) {
+      const recipients = await AccountingService.contadorRecipients()
+      if (recipients.length) {
+        const items = created
+          .map((t: any) => `• ${t.title}  (${t.companies?.name ?? ''})`)
+          .join('\n')
+        for (const to of recipients) {
+          void NotificationService.enqueue({
+            channel:  'email',
+            template: 'tax-calendar-digest',
+            to,
+            data: {
+              subject: `${created.length} nueva(s) tarea(s) del calendario tributario`,
+              title:   'Nuevas obligaciones tributarias',
+              intro:   `Se crearon ${created.length} tarea(s) próximas a vencer según su anticipación configurada:`,
+              items,
+              url:     `${PLATFORM_URL}/app/accounting`,
+            },
+          })
+        }
+      }
+    }
+
+    logger.info({ created: created.length }, 'Cron: tareas de calendario tributario generadas')
+    return { created: created.length }
+  }
+
+  // ── Cron: recordatorios al contador por hitos de vencimiento ───────────────
+
+  static async sendTaxReminders() {
+    const today = new Date()
+    const todayStr = toDateStr(today)
+    const limitStr = toDateStr(new Date(today.getTime() + MAX_NOTICE_DAYS * 86_400_000))
+
+    const { data: entries, error } = await supabase
+      .from('company_tax_entries')
+      .select('id, due_date, master:tax_calendar_master(title, notice_days), companies(name)')
+      .not('due_date', 'is', null)
+      .gte('due_date', todayStr)
+      .lte('due_date', limitStr)
+    if (error) throw error
+
+    if (!entries?.length) return { reminded: 0 }
+
+    // Incluir las que hoy caen en un hito de recordatorio dentro de su ventana
+    const due: { title: string; company: string; days: number; date: string }[] = []
+    for (const e of entries as any[]) {
+      const notice = e.master?.notice_days ?? DEFAULT_NOTICE_DAYS
+      const d = daysUntil(e.due_date, today)
+      if (d <= notice && REMINDER_MILESTONES.includes(d)) {
+        due.push({
+          title:   e.master?.title ?? 'Obligación tributaria',
+          company: e.companies?.name ?? '',
+          days:    d,
+          date:    e.due_date,
+        })
+      }
+    }
+
+    if (!due.length) return { reminded: 0 }
+
+    const recipients = await AccountingService.contadorRecipients()
+    if (!recipients.length) return { reminded: 0 }
+
+    due.sort((a, b) => a.days - b.days)
+    const items = due
+      .map(x => {
+        const when = x.days === 0 ? 'vence hoy' : x.days === 1 ? 'vence mañana' : `faltan ${x.days} días`
+        return `• ${x.title} (${x.company}) — ${when} · ${x.date}`
+      })
+      .join('\n')
+
+    for (const to of recipients) {
+      void NotificationService.enqueue({
+        channel:  'email',
+        template: 'tax-calendar-digest',
+        to,
+        data: {
+          subject: `Recordatorio: ${due.length} obligación(es) tributaria(s) próxima(s)`,
+          title:   'Recordatorio de calendario tributario',
+          intro:   'Estas obligaciones tributarias están próximas a vencer:',
+          items,
+          url:     `${PLATFORM_URL}/app/accounting`,
+        },
+      })
+    }
+
+    logger.info({ reminders: due.length, recipients: recipients.length }, 'Cron: recordatorios de calendario tributario enviados')
+    return { reminded: due.length }
   }
 }

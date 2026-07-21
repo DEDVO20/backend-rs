@@ -127,4 +127,31 @@ app.post('/run-cron',
   },
 )
 
+// POST /api/accounting/run-reminders — disparo manual de recordatorios al contador
+app.post('/run-reminders',
+  requireRole('admin', 'rs_admin'),
+  async (c) => {
+    const start = Date.now()
+    try {
+      const result = await AccountingService.sendTaxReminders()
+      await supabase.from('cron_logs').insert({
+        job_name:    'tax-calendar-reminders-manual',
+        status:      'success',
+        result,
+        duration_ms: Date.now() - start,
+      })
+      return c.json(result)
+    } catch (err) {
+      await supabase.from('cron_logs').insert({
+        job_name:    'tax-calendar-reminders-manual',
+        status:      'failed',
+        result:      {},
+        error:       err instanceof Error ? err.message : String(err),
+        duration_ms: Date.now() - start,
+      })
+      throw err
+    }
+  },
+)
+
 export const accountingRoutes = app

@@ -5,6 +5,9 @@ export const masterItemSchema = z.object({
   description:  z.string().max(500).optional(),
   is_mandatory: z.boolean(),
   sort_order:   z.coerce.number().int().default(0),
+  // Días de anticipación: con cuántos días antes del vencimiento se crea la
+  // tarea y empiezan los recordatorios (algunas obligaciones requieren un mes+)
+  notice_days:  z.coerce.number().int().min(1).max(120).default(5),
 })
 
 export const updateMasterItemSchema = masterItemSchema.partial()

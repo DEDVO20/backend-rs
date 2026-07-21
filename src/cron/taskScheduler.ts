@@ -72,6 +72,28 @@ async function processJob(jobName: string) {
         break
       }
 
+      case 'tax-calendar-reminders': {
+        const { AccountingService } = await import('../modules/accounting/accounting.service.js')
+        result = await AccountingService.sendTaxReminders()
+        logger.info({ result }, 'Cron: recordatorios de calendario tributario enviados')
+        break
+      }
+
+      case 'participations-monthly': {
+        // Solo procesar el último día del mes
+        const now = new Date()
+        const isLastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate() === now.getDate()
+        if (!isLastDay) {
+          result = { skipped: 'no es el último día del mes' }
+          logger.info(result, 'Cron: participaciones — día no aplica')
+          break
+        }
+        const { ParticipationsService } = await import('../modules/participations/participations.service.js')
+        result = await ParticipationsService.generateMonthly()
+        logger.info({ result }, 'Cron: participaciones mensuales generadas')
+        break
+      }
+
       default:
         logger.warn({ jobName }, 'Cron: job desconocido')
         return
@@ -129,10 +151,20 @@ async function setupRepeatableJobs() {
     repeat: { pattern: '0 6 * * *' },
   })
 
-  // Calendario tributario — diario a las 6:30 AM: crea tareas 5 días antes del vencimiento
+  // Calendario tributario — diario 6:30 AM: crea tareas según la anticipación de cada obligación
   await cronQueue.add('tax-calendar-tasks', {}, {
     repeat: { pattern: '30 11 * * *' },
   })
 
-  logger.info('Cron jobs registrados: generate-tasks (diario 6AM), send-reminders (diario 7AM), mark-overdue (diario 1AM), tax-calendar-tasks (diario 6:30AM)')
+  // Recordatorios del calendario tributario al contador — diario 7:15 AM
+  await cronQueue.add('tax-calendar-reminders', {}, {
+    repeat: { pattern: '15 12 * * *' },
+  })
+
+  // Participaciones de terceros — corre días 28-31 a las 11 PM; procesa solo el último día del mes
+  await cronQueue.add('participations-monthly', {}, {
+    repeat: { pattern: '0 23 28-31 * *' },
+  })
+
+  logger.info('Cron jobs registrados: generate-tasks (diario 6AM), send-reminders (diario 7AM), mark-overdue (diario 1AM), tax-calendar-tasks (diario 6:30AM), tax-calendar-reminders (diario 7:15AM), participations-monthly (fin de mes 11PM)')
 }

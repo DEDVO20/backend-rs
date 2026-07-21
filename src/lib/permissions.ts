@@ -20,6 +20,7 @@ export const MODULE_PERMISSIONS = {
   operational_requests: ['admin', 'rs_admin', 'rs_staff', 'client_owner', 'client_user'],
   collection:           ['admin', 'rs_admin', 'rs_staff', 'client_owner'],
   accounting:           ['admin', 'rs_admin', 'contador'],
+  participations:       ['admin', 'rs_admin', 'contador'],
   documents:            ['admin', 'rs_admin', 'rs_staff', 'contador', 'client_owner', 'client_user'],
   team_management:      ['admin', 'rs_admin', 'client_owner'],
   users_admin:          ['admin'],

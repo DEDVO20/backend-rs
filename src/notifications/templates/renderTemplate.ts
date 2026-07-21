@@ -156,6 +156,17 @@ const templates: Record<string, Builder> = {
     text: `Solicitud ${str(d.requestTitle)} (#${str(d.ticketId)}) resuelta.${d.notes ? ` Notas: ${str(d.notes)}` : ''}`,
   }),
 
+  // ── Calendario tributario (notificaciones al contador) ───────────────────
+  'tax-calendar-digest': (d) => ({
+    subject: str(d.subject ?? 'Calendario tributario'),
+    html: layout(str(d.title ?? 'Calendario tributario'), `
+      <p>${str(d.intro)}</p>
+      <div class="info">${str(d.items).replace(/\n/g, '<br>')}</div>
+      <p><a class="btn" href="${str(d.url ?? '')}">Ver dashboard contable</a></p>
+    `),
+    text: `${str(d.intro)}\n${str(d.items)}`,
+  }),
+
   // ── Texto libre (campañas masivas) ───────────────────────────────────────
   'raw-text': (d) => ({
     subject: str(d.subject ?? 'Mensaje'),
