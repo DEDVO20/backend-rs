@@ -1,17 +1,21 @@
-import { supabase }           from '../../lib/supabase.js'
+import { supabase } from '../../lib/supabase.js'
 import { NotificationService } from '../../notifications/NotificationService.js'
-import type { z }             from 'zod'
+import type { z } from 'zod'
 import type {
   listTasksQuerySchema,
   updateTaskSchema,
   createTaskSchema,
 } from './tasks.schema.js'
 
-type ListQuery   = z.infer<typeof listTasksQuerySchema>
+type ListQuery = z.infer<typeof listTasksQuerySchema>
 type UpdateInput = z.infer<typeof updateTaskSchema>
 type CreateInput = z.infer<typeof createTaskSchema>
 
 const PLATFORM_URL = process.env.PLATFORM_URL ?? 'https://app.tudominio.com'
+
+// Notificaciones por correo de las tareas (recordatorio y vencida).
+// Apagadas por defecto; poner TASK_EMAILS_ENABLED=true para reactivarlas.
+const TASK_EMAILS_ENABLED = process.env.TASK_EMAILS_ENABLED === 'false'
 
 export class TasksService {
   static async list(query: ListQuery, userCompanyId: string | null, isInternal: boolean) {
@@ -31,7 +35,7 @@ export class TasksService {
       q = q.eq('company_id', company_id)
     }
 
-    if (status)     q = q.eq('status', status)
+    if (status) q = q.eq('status', status)
     if (owner_type) q = q.eq('owner_type', owner_type)
     if (service_id) q = q.eq('service_id', service_id)
 
@@ -75,7 +79,7 @@ export class TasksService {
     if (error) throw error
 
     // Notificar al owner cuando una tarea vence
-    if (input.status === 'overdue' && task.company_id) {
+    if (TASK_EMAILS_ENABLED && input.status === 'overdue' && task.company_id) {
       const { data: owner } = await supabase
         .from('profiles')
         .select('email')
@@ -86,11 +90,11 @@ export class TasksService {
 
       if (owner?.email) {
         void NotificationService.enqueue({
-          channel:  'email',
+          channel: 'email',
           template: 'task-overdue',
-          to:       owner.email,
+          to: owner.email,
           data: {
-            taskTitle:   task.title,
+            taskTitle: task.title,
             companyName: '',
           },
           companyId: task.company_id,
@@ -112,11 +116,11 @@ export class TasksService {
     const { data, error } = await supabase
       .from('tasks')
       .update({
-        status:          'done',
+        status: 'done',
         closed_manually: true,
-        closed_by:       userId,
-        closure_reason:  reason,
-        closed_at:       new Date().toISOString(),
+        closed_by: userId,
+        closure_reason: reason,
+        closed_at: new Date().toISOString(),
       })
       .eq('id', id)
       .select()
@@ -127,16 +131,16 @@ export class TasksService {
   }
 
   static async generateTasks(params: {
-    year:   number
+    year: number
     month?: number
-    day?:   number
+    day?: number
   }): Promise<{ generated: Record<string, number> }> {
-    const now   = new Date()
-    const year  = params.year
+    const now = new Date()
+    const year = params.year
     const month = params.month ?? (now.getMonth() + 1)
-    const day   = params.day   ?? now.getDate()
+    const day = params.day ?? now.getDate()
 
-    const MES = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic']
+    const MES = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
     const pad = (n: number) => String(n).padStart(2, '0')
     const lastDayOf = (y: number, m: number) => new Date(y, m, 0).getDate()
 
@@ -152,7 +156,7 @@ export class TasksService {
         .eq('active', true),
     ])
 
-    if (errT)  throw new Error(`Error cargando plantillas: ${errT.message}`)
+    if (errT) throw new Error(`Error cargando plantillas: ${errT.message}`)
     if (errCS) throw new Error(`Error cargando servicios de empresa: ${errCS.message}`)
 
     // Agrupar company_services por service_id para lookup eficiente
@@ -170,15 +174,15 @@ export class TasksService {
     }
 
     type Row = {
-      template_id:         string
-      title:               string
-      frequency:           string
-      due_day:             number | null
-      create_day:          number | null
-      owner_type:          string
-      service_id:          string
-      requires_document:   boolean
-      company_id:          string
+      template_id: string
+      title: string
+      frequency: string
+      due_day: number | null
+      create_day: number | null
+      owner_type: string
+      service_id: string
+      requires_document: boolean
+      company_id: string
       provider_service_id: string | null
     }
 
@@ -193,14 +197,14 @@ export class TasksService {
           && (companyActiveServices.get(company_id)?.has(t.provider_service_id) ?? false)
         const redirected = t.owner_type === 'client' && providerHired
         return {
-          template_id:         t.id,
-          title:               t.title,
-          frequency:           t.frequency,
-          due_day:             t.due_day,
-          create_day:          t.create_day,
-          owner_type:          redirected ? 'rs_team' : t.owner_type,
-          service_id:          t.service_id,
-          requires_document:   t.requires_document,
+          template_id: t.id,
+          title: t.title,
+          frequency: t.frequency,
+          due_day: t.due_day,
+          create_day: t.create_day,
+          owner_type: redirected ? 'rs_team' : t.owner_type,
+          service_id: t.service_id,
+          requires_document: t.requires_document,
           company_id,
           provider_service_id: redirected ? t.provider_service_id : null,
         }
@@ -208,15 +212,15 @@ export class TasksService {
     })
 
     type TaskInsert = {
-      company_id:          string
-      title:               string
-      status:              string
-      due_date:            string
-      owner_type:          string
-      unique_key:          string
-      service_id:          string
-      requires_document:   boolean
-      create_day?:         number
+      company_id: string
+      title: string
+      status: string
+      due_date: string
+      owner_type: string
+      unique_key: string
+      service_id: string
+      requires_document: boolean
+      create_day?: number
       provider_service_id: string | null
     }
 
@@ -229,13 +233,13 @@ export class TasksService {
       for (const r of rows.filter(r => r.frequency === 'annual')) {
         const dueDate = new Date(year + 1, 0, r.due_day ?? 1)
         buckets.annual.push({
-          company_id:        r.company_id,
-          title:             `${r.title} — ${year}`,
-          status:            'pending',
-          due_date:          dueDate.toISOString().split('T')[0],
-          owner_type:        r.owner_type,
-          unique_key:        `${r.company_id}_${r.template_id}_annual_${year}`,
-          service_id:        r.service_id,
+          company_id: r.company_id,
+          title: `${r.title} — ${year}`,
+          status: 'pending',
+          due_date: dueDate.toISOString().split('T')[0],
+          owner_type: r.owner_type,
+          unique_key: `${r.company_id}_${r.template_id}_annual_${year}`,
+          service_id: r.service_id,
           requires_document: r.requires_document,
           provider_service_id: r.provider_service_id,
         })
@@ -244,20 +248,20 @@ export class TasksService {
 
     // ── Mensuales (solo las que tienen create_day === hoy) ────────────────────
     for (const r of rows.filter(r => r.frequency === 'monthly')) {
-      const lastDay   = lastDayOf(year, month)
+      const lastDay = lastDayOf(year, month)
       const createDay = Math.min(r.create_day ?? 1, r.due_day ?? 1)
       if (createDay !== day) continue
-      const dueDay  = Math.min(r.due_day ?? lastDay, lastDay)
+      const dueDay = Math.min(r.due_day ?? lastDay, lastDay)
       const dueDate = new Date(year, month - 1, dueDay)
       buckets.monthly.push({
-        company_id:        r.company_id,
-        title:             `${r.title} — ${MES[month - 1]} ${year}`,
-        status:            'pending',
-        due_date:          dueDate.toISOString().split('T')[0],
-        owner_type:        r.owner_type,
-        unique_key:        `${r.company_id}_${r.template_id}_${year}_${pad(month)}`,
-        create_day:        createDay,
-        service_id:        r.service_id,
+        company_id: r.company_id,
+        title: `${r.title} — ${MES[month - 1]} ${year}`,
+        status: 'pending',
+        due_date: dueDate.toISOString().split('T')[0],
+        owner_type: r.owner_type,
+        unique_key: `${r.company_id}_${r.template_id}_${year}_${pad(month)}`,
+        create_day: createDay,
+        service_id: r.service_id,
         requires_document: r.requires_document,
         provider_service_id: r.provider_service_id,
       })
@@ -268,14 +272,14 @@ export class TasksService {
       const dueDate = new Date(year, month - 1, day)
       for (const r of rows.filter(r => r.frequency === 'weekly')) {
         buckets.weekly.push({
-          company_id:        r.company_id,
-          title:             `${r.title} — ${pad(day)} ${MES[month - 1]} ${year}`,
-          status:            'pending',
-          due_date:          dueDate.toISOString().split('T')[0],
-          owner_type:        r.owner_type,
-          unique_key:        `${r.company_id}_${r.template_id}_${year}_${pad(month)}_${pad(day)}`,
-          create_day:        day - 2,
-          service_id:        r.service_id,
+          company_id: r.company_id,
+          title: `${r.title} — ${pad(day)} ${MES[month - 1]} ${year}`,
+          status: 'pending',
+          due_date: dueDate.toISOString().split('T')[0],
+          owner_type: r.owner_type,
+          unique_key: `${r.company_id}_${r.template_id}_${year}_${pad(month)}_${pad(day)}`,
+          create_day: day - 2,
+          service_id: r.service_id,
           requires_document: r.requires_document,
           provider_service_id: r.provider_service_id,
         })
@@ -285,20 +289,20 @@ export class TasksService {
     // ── Semestrales (meses 6 y 12, según create_day) ──────────────────────────
     if ([6, 12].includes(month)) {
       for (const r of rows.filter(r => r.frequency === 'annual' && r.title === 'Cálculo primas y verificación pago')) {
-        const lastDay   = lastDayOf(year, month)
+        const lastDay = lastDayOf(year, month)
         const createDay = Math.min(r.create_day ?? 1, r.due_day ?? 1)
         if (createDay !== day) continue
-        const dueDay  = Math.min(r.due_day ?? lastDay, lastDay)
+        const dueDay = Math.min(r.due_day ?? lastDay, lastDay)
         const dueDate = new Date(year, month - 1, dueDay)
         buckets.semestral.push({
-          company_id:        r.company_id,
-          title:             `${r.title} — ${MES[month - 1]} ${year}`,
-          status:            'pending',
-          due_date:          dueDate.toISOString().split('T')[0],
-          owner_type:        r.owner_type,
-          unique_key:        `${r.company_id}_${r.template_id}_${year}_${pad(month)}`,
-          create_day:        createDay,
-          service_id:        r.service_id,
+          company_id: r.company_id,
+          title: `${r.title} — ${MES[month - 1]} ${year}`,
+          status: 'pending',
+          due_date: dueDate.toISOString().split('T')[0],
+          owner_type: r.owner_type,
+          unique_key: `${r.company_id}_${r.template_id}_${year}_${pad(month)}`,
+          create_day: createDay,
+          service_id: r.service_id,
           requires_document: r.requires_document,
           provider_service_id: r.provider_service_id,
         })
@@ -308,20 +312,20 @@ export class TasksService {
     // ── Trimestrales (meses 4, 8, 12, según create_day) ───────────────────────
     if ([4, 8, 12].includes(month)) {
       for (const r of rows.filter(r => r.frequency === 'annual' && r.title === 'Cotización dotaciones y verificación pago')) {
-        const lastDay   = lastDayOf(year, month)
+        const lastDay = lastDayOf(year, month)
         const createDay = Math.min(r.create_day ?? 1, r.due_day ?? 1)
         if (createDay !== day) continue
-        const dueDay  = Math.min(r.due_day ?? lastDay, lastDay)
+        const dueDay = Math.min(r.due_day ?? lastDay, lastDay)
         const dueDate = new Date(year, month - 1, dueDay)
         buckets.trimestral.push({
-          company_id:        r.company_id,
-          title:             `${r.title} — ${MES[month - 1]} ${year}`,
-          status:            'pending',
-          due_date:          dueDate.toISOString().split('T')[0],
-          owner_type:        r.owner_type,
-          unique_key:        `${r.company_id}_${r.template_id}_${year}_${pad(month)}`,
-          create_day:        createDay,
-          service_id:        r.service_id,
+          company_id: r.company_id,
+          title: `${r.title} — ${MES[month - 1]} ${year}`,
+          status: 'pending',
+          due_date: dueDate.toISOString().split('T')[0],
+          owner_type: r.owner_type,
+          unique_key: `${r.company_id}_${r.template_id}_${year}_${pad(month)}`,
+          create_day: createDay,
+          service_id: r.service_id,
           requires_document: r.requires_document,
           provider_service_id: r.provider_service_id,
         })
@@ -346,6 +350,9 @@ export class TasksService {
   }
 
   static async sendReminders(): Promise<number> {
+    // Correos de tareas desactivados (TASK_EMAILS_ENABLED)
+    if (!TASK_EMAILS_ENABLED) return 0
+
     const tomorrow = new Date()
     tomorrow.setDate(tomorrow.getDate() + 1)
     const dateStr = tomorrow.toISOString().split('T')[0]
@@ -369,14 +376,14 @@ export class TasksService {
       if (!owner?.email) continue
 
       void NotificationService.enqueue({
-        channel:  'email',
+        channel: 'email',
         template: 'task-reminder',
-        to:       owner.email,
+        to: owner.email,
         data: {
-          taskTitle:   task.title,
-          dueDate:     task.due_date,
+          taskTitle: task.title,
+          dueDate: task.due_date,
           companyName: company.name ?? '',
-          taskUrl:     `${PLATFORM_URL}/tasks/${task.id}`,
+          taskUrl: `${PLATFORM_URL}/tasks/${task.id}`,
         },
         companyId: task.company_id ?? undefined,
       })
