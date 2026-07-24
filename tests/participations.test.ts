@@ -3,6 +3,10 @@ import {
   calcParticipation,
   formatPurchaseOrder,
   validateInvoicing,
+  calcReceivable,
+  calcPayable,
+  deriveStatus,
+  normalizeInvoiceNumber,
 } from '../src/modules/participations/participations.domain.js'
 
 describe('calcParticipation', () => {
@@ -71,5 +75,110 @@ describe('validateInvoicing', () => {
     const r = validateInvoicing(monthly, null)
     expect(r.status).toBe('review')
     expect(r.reasons).toHaveLength(2)
+  })
+
+  it('review si el recaudo no coincide con lo facturado por Finto', () => {
+    const r = validateInvoicing(monthly, {
+      finto_invoice: 'F-1', finto_invoice_value: 500_000,
+      third_party_invoice: 'T-1', third_party_invoice_value: 100_000,
+      cash_receipt: 'RC-1', cash_receipt_value: 400_000,
+    })
+    expect(r.status).toBe('review')
+    expect(r.reasons.some(x => x.includes('recaudo'))).toBe(true)
+  })
+
+  it('review si el pago al tercero no coincide con la participación', () => {
+    const r = validateInvoicing(monthly, {
+      finto_invoice: 'F-1', finto_invoice_value: 500_000,
+      third_party_invoice: 'T-1', third_party_invoice_value: 100_000,
+      egress_voucher: 'CE-1', egress_voucher_value: 80_000,
+    })
+    expect(r.status).toBe('review')
+    expect(r.reasons.some(x => x.includes('pago al tercero'))).toBe(true)
+  })
+
+  it('no exige recaudo ni pago si aún no se registraron', () => {
+    const r = validateInvoicing(monthly, {
+      finto_invoice: 'F-1', finto_invoice_value: 500_000,
+      third_party_invoice: 'T-1', third_party_invoice_value: 100_000,
+    })
+    expect(r.status).toBe('validated')
+  })
+})
+
+describe('CxC Clientes / CxP Terceros', () => {
+  it('CxC = facturado por Finto − recaudado', () => {
+    expect(calcReceivable({ finto_invoice_value: 500_000, cash_receipt_value: 200_000 })).toBe(300_000)
+  })
+
+  it('CxC completo cuando no hay recaudo', () => {
+    expect(calcReceivable({ finto_invoice_value: 500_000 })).toBe(500_000)
+  })
+
+  it('CxP = facturado por el tercero − pagado', () => {
+    expect(calcPayable({ third_party_invoice_value: 100_000, egress_voucher_value: 100_000 })).toBe(0)
+  })
+
+  it('sin datos ambos saldos son 0', () => {
+    expect(calcReceivable(null)).toBe(0)
+    expect(calcPayable(null)).toBe(0)
+  })
+})
+
+describe('deriveStatus', () => {
+  const monthly = { service_value: 500_000, participation_value: 100_000 }
+
+  it('pending cuando no se ha registrado nada', () => {
+    expect(deriveStatus(monthly, null).status).toBe('pending')
+  })
+
+  it('validated con facturas correctas pero sin recaudar ni pagar', () => {
+    const r = deriveStatus(monthly, {
+      finto_invoice: 'F-1', finto_invoice_value: 500_000,
+      third_party_invoice: 'T-1', third_party_invoice_value: 100_000,
+    })
+    expect(r.status).toBe('validated')
+    expect(r.receivable).toBe(500_000)
+    expect(r.payable).toBe(100_000)
+  })
+
+  it('closed cuando además se recaudó y se pagó completo', () => {
+    const r = deriveStatus(monthly, {
+      finto_invoice: 'F-1', finto_invoice_value: 500_000,
+      third_party_invoice: 'T-1', third_party_invoice_value: 100_000,
+      cash_receipt: 'RC-1', cash_receipt_value: 500_000,
+      egress_voucher: 'CE-1', egress_voucher_value: 100_000,
+    })
+    expect(r.status).toBe('closed')
+    expect(r.receivable).toBe(0)
+    expect(r.payable).toBe(0)
+  })
+
+  it('sigue validated si solo se recaudó pero no se pagó al tercero', () => {
+    const r = deriveStatus(monthly, {
+      finto_invoice: 'F-1', finto_invoice_value: 500_000,
+      third_party_invoice: 'T-1', third_party_invoice_value: 100_000,
+      cash_receipt: 'RC-1', cash_receipt_value: 500_000,
+    })
+    expect(r.status).toBe('validated')
+    expect(r.receivable).toBe(0)
+    expect(r.payable).toBe(100_000)
+  })
+
+  it('review manda sobre cerrada si hay inconsistencia', () => {
+    const r = deriveStatus(monthly, {
+      finto_invoice: 'F-1', finto_invoice_value: 480_000,
+      third_party_invoice: 'T-1', third_party_invoice_value: 100_000,
+      cash_receipt: 'RC-1', cash_receipt_value: 480_000,
+      egress_voucher: 'CE-1', egress_voucher_value: 100_000,
+    })
+    expect(r.status).toBe('review')
+  })
+})
+
+describe('normalizeInvoiceNumber', () => {
+  it('ignora espacios, guiones y puntos, y no distingue mayúsculas', () => {
+    expect(normalizeInvoiceNumber('F-001')).toBe(normalizeInvoiceNumber('f 001'))
+    expect(normalizeInvoiceNumber('FE.123')).toBe('FE123')
   })
 })

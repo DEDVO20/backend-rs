@@ -24,14 +24,23 @@ export const upsertParticipationSchema = z.object({
   { message: 'Con tercero se requiere tercero, porcentaje y fecha de inicio' },
 )
 
-// ── Registro manual de facturación ───────────────────────────────────────────
+// ── Registro manual de facturación, recaudo y pago ───────────────────────────
 export const invoicingSchema = z.object({
+  // CxC Clientes: factura de Finto → recibo de caja
   finto_invoice:             z.string().max(60).nullable().optional(),
   finto_invoice_date:        z.string().date().nullable().optional(),
   finto_invoice_value:       z.number().nonnegative().nullable().optional(),
+  cash_receipt:              z.string().max(60).nullable().optional(),
+  cash_receipt_date:         z.string().date().nullable().optional(),
+  cash_receipt_value:        z.number().nonnegative().nullable().optional(),
+  cash_account:              z.string().max(120).nullable().optional(),
+  // CxP Terceros: factura del tercero → comprobante de egreso
   third_party_invoice:       z.string().max(60).nullable().optional(),
   third_party_invoice_date:  z.string().date().nullable().optional(),
   third_party_invoice_value: z.number().nonnegative().nullable().optional(),
+  egress_voucher:            z.string().max(60).nullable().optional(),
+  egress_voucher_date:       z.string().date().nullable().optional(),
+  egress_voucher_value:      z.number().nonnegative().nullable().optional(),
   observations:              z.string().max(1000).nullable().optional(),
 })
 

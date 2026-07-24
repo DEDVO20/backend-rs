@@ -71,6 +71,17 @@ app.get('/monthly', async (c) => {
   return c.json(data)
 })
 
+// GET /api/participations/invoice-check?type=finto|third&number=F-001&exclude=<monthlyId>
+// Alerta de factura ya registrada. Informativo: nunca bloquea el guardado.
+app.get('/invoice-check', async (c) => {
+  const type   = c.req.query('type') === 'third' ? 'third_party_invoice' : 'finto_invoice'
+  const number = c.req.query('number') ?? ''
+  if (!number.trim()) return c.json({ duplicate: null })
+
+  const duplicate = await ParticipationsService.findDuplicateInvoice(type, number, c.req.query('exclude'))
+  return c.json({ duplicate })
+})
+
 app.patch('/monthly/:id/invoicing',
   zValidator('json', invoicingSchema),
   async (c) => {

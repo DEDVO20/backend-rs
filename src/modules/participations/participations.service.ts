@@ -1,6 +1,9 @@
 import { supabase } from '../../lib/supabase.js'
 import { logger }   from '../../lib/logger.js'
-import { calcParticipation, formatPurchaseOrder, validateInvoicing, money } from './participations.domain.js'
+import {
+  calcParticipation, formatPurchaseOrder, money,
+  calcReceivable, calcPayable, deriveStatus, normalizeInvoiceNumber,
+} from './participations.domain.js'
 import type { z }   from 'zod'
 import type {
   thirdPartySchema, updateThirdPartySchema,
@@ -221,10 +224,51 @@ export class ParticipationsService {
 
     const { data, error, count } = await q
     if (error) throw error
-    return { data, total: count ?? 0, page, limit }
+
+    // CxC Clientes y CxP Terceros se calculan al vuelo (no se almacenan)
+    const one = (v: any) => Array.isArray(v) ? v[0] : v
+    const rows = (data ?? []).map((r: any) => {
+      const inv = one(r.participation_invoicing) ?? null
+      return { ...r, receivable: calcReceivable(inv), payable: calcPayable(inv) }
+    })
+
+    return { data: rows, total: count ?? 0, page, limit }
   }
 
   // ── Registro manual de facturación + conciliación (secciones 4 y 5) ──────────
+
+  /**
+   * Busca la misma factura registrada en otra participación.
+   * Es solo una alerta: nunca impide guardar.
+   */
+  static async findDuplicateInvoice(
+    field: 'finto_invoice' | 'third_party_invoice',
+    number: string,
+    excludeMonthlyId?: string,
+  ) {
+    const target = normalizeInvoiceNumber(number)
+    if (!target) return null
+
+    const { data, error } = await supabase
+      .from('participation_invoicing')
+      .select(`${field}, monthly_participation_id, monthly_participations(purchase_order, month, year)`)
+      .not(field, 'is', null)
+      .limit(500)
+    if (error) throw error
+
+    const one = (v: any) => Array.isArray(v) ? v[0] : v
+    const hit = (data ?? []).find((r: any) =>
+      r.monthly_participation_id !== excludeMonthlyId &&
+      normalizeInvoiceNumber(String(r[field] ?? '')) === target)
+
+    if (!hit) return null
+    const mp = one((hit as any).monthly_participations)
+    return {
+      purchase_order: mp?.purchase_order ?? null,
+      month:          mp?.month ?? null,
+      year:           mp?.year ?? null,
+    }
+  }
 
   static async upsertInvoicing(monthlyId: string, input: InvoicingInput, userId: string) {
     const { data: monthly, error: mErr } = await supabase
@@ -246,32 +290,53 @@ export class ParticipationsService {
       .single()
     if (error) throw error
 
-    // Reconciliar y actualizar estado
-    const { status, reasons } = validateInvoicing(monthly, inv)
+    // Conciliar: estado del ciclo completo + saldos CxC/CxP
+    const { status, reasons, receivable, payable } = deriveStatus(monthly, inv)
     await supabase
       .from('monthly_participations')
       .update({ status })
       .eq('id', monthlyId)
 
-    return { invoicing: inv, status, reasons }
+    // Alertas de factura ya registrada en otra participación (no bloquean)
+    const warnings: string[] = []
+    for (const [field, label] of [
+      ['finto_invoice', 'de Finto'],
+      ['third_party_invoice', 'del tercero'],
+    ] as const) {
+      const num = (input as any)[field]
+      if (!num) continue
+      const dup = await ParticipationsService.findDuplicateInvoice(field, num, monthlyId)
+      if (dup) warnings.push(`La factura ${label} "${num}" ya está registrada en ${dup.purchase_order}`)
+    }
+
+    return { invoicing: inv, status, reasons, receivable, payable, warnings }
   }
 
   // ── Estadísticas del panel ───────────────────────────────────────────────────
 
   static async stats(year?: number, month?: number) {
-    let q = supabase.from('monthly_participations').select('status, participation_value')
+    let q = supabase
+      .from('monthly_participations')
+      .select('status, participation_value, participation_invoicing(finto_invoice_value, cash_receipt_value, third_party_invoice_value, egress_voucher_value)')
     if (year)  q = q.eq('year', year)
     if (month) q = q.eq('month', month)
     const { data, error } = await q
     if (error) throw error
 
+    const one = (v: any) => Array.isArray(v) ? v[0] : v
     const rows = data ?? []
+    const sum = (fn: (r: any) => number) => money(rows.reduce((a: number, r: any) => a + fn(r), 0))
+
     return {
       total:     rows.length,
       pending:   rows.filter((r: any) => r.status === 'pending').length,
       review:    rows.filter((r: any) => r.status === 'review').length,
       validated: rows.filter((r: any) => r.status === 'validated').length,
-      total_value: money(rows.reduce((a: number, r: any) => a + Number(r.participation_value ?? 0), 0)),
+      closed:    rows.filter((r: any) => r.status === 'closed').length,
+      total_value: sum(r => Number(r.participation_value ?? 0)),
+      // Saldos derivados
+      receivable:  sum(r => calcReceivable(one(r.participation_invoicing) ?? null)),
+      payable:     sum(r => calcPayable(one(r.participation_invoicing) ?? null)),
     }
   }
 }
