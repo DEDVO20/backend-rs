@@ -251,6 +251,64 @@ function parseMoney(v: string): number {
   return parseFloat(clean) || 0
 }
 
+/**
+ * Monto que puede venir en dos formatos:
+ *  - JS/plano con punto decimal:  "5199569.78"
+ *  - colombiano con coma decimal: "$ 5.199.569,78"
+ * Si trae coma, la coma es el decimal; si no, el punto lo es.
+ */
+function parseAmount(v: string): number {
+  if (!v) return 0
+  let s = v.replace(/[$\s]/g, '')
+  if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.')
+  return parseFloat(s) || 0
+}
+
+// Rangos que NO son cartera por cobrar (pagos sin aplicar / saldos a favor):
+// se ignoran en el import (no crean deudores).
+const SKIP_RANGES = new Set(['Saldo a favor', 'Ingresos por identificar'])
+
+/**
+ * Formato SIIGO nuevo (pivote): [Identificacion,] Cliente, Socio, Creación,
+ * Factura, Rango, Moneda, Suma de Total factura, Suma de Cuenta13_COP.
+ * Si el reporte trae 'Identificacion' (NIT) se usa como clave del deudor;
+ * si no, se cae al nombre del cliente. Devuelve null para filas a ignorar.
+ */
+function mapSiigoRowNew(raw: Record<string, string>): Record<string, string> | null {
+  const rango = (raw['Rango'] ?? '').trim()
+  if (SKIP_RANGES.has(rango)) return null
+
+  const name = (raw['Cliente'] ?? '').trim()
+  if (!name) return null
+
+  // NIT si el reporte lo trae (con o sin tilde en el encabezado)
+  const nit = (raw['Identificacion'] ?? raw['Identificación'] ?? '').trim()
+
+  const saldo = parseAmount(raw['Suma de Cuenta13_COP'] ?? '')
+  const total = parseAmount(raw['Suma de Total factura'] ?? '')
+
+  const overdue: Record<string, string> = {
+    overdue_1_30: '0', overdue_31_60: '0', overdue_61_90: '0', overdue_91_plus: '0', not_yet_due: '0',
+  }
+  if      (rango === '1-30')                          overdue['overdue_1_30']    = String(saldo)
+  else if (rango === '31-60')                         overdue['overdue_31_60']   = String(saldo)
+  else if (rango === '61-90')                         overdue['overdue_61_90']   = String(saldo)
+  else if (rango === '>90' || rango === '91+')        overdue['overdue_91_plus'] = String(saldo)
+  else if (rango === 'Por vencer' || rango === 'No vencido') overdue['not_yet_due'] = String(saldo)
+
+  return {
+    debtor_document:    nit || name,   // preferir NIT; si no viene, el nombre
+    debtor_name:        name,
+    seller:             (raw['Socio'] ?? '').trim(),
+    siigo_document:     (raw['Factura'] ?? '').trim(),
+    due_date:           parseSiigoDate(raw['Creación'] ?? raw['Creacion'] ?? '') || '',
+    currency:           (raw['Moneda'] ?? 'COP').trim(),
+    total_balance:      String(total),
+    outstanding_amount: String(saldo),
+    ...overdue,
+  }
+}
+
 function parseSiigoDate(val: string): string | null {
   if (!val) return null
   const clean = val.trim()
@@ -335,13 +393,19 @@ app.post('/debtors/import',
     }
 
     const headers = parseCsvLine(lines[0]!)
+    // Formato nuevo (pivote) = usa la columna exacta 'Rango'.
+    // El formato viejo usa 'Rango vencimiento', así que no colisiona.
+    const isNewFormat = headers.includes('Rango')
 
     const rows: Array<Record<string, string>> = []
+    let ignored = 0
     for (let i = 1; i < lines.length; i++) {
       const values = parseCsvLine(lines[i]!)
       const raw: Record<string, string> = {}
       headers.forEach((h, idx) => { raw[h] = values[idx] ?? '' })
-      rows.push(mapSiigoRow(raw))
+      const mapped = isNewFormat ? mapSiigoRowNew(raw) : mapSiigoRow(raw)
+      if (mapped) rows.push(mapped)
+      else ignored++
     }
 
     // SSE: stream progress
@@ -360,7 +424,7 @@ app.post('/debtors/import',
             })
 
             send({ type: 'progress', progress: 100, message: '¡Importación completada!' })
-            send({ type: 'done', ...result })
+            send({ type: 'done', ...result, ignored })
             controller.close()
           },
         }),
@@ -376,7 +440,7 @@ app.post('/debtors/import',
 
     // Fallback JSON normal
     const result = await CollectionService.importDebtors(rows, companyId, createdBy)
-    return c.json(result, result.errors.length > 0 ? 207 : 200)
+    return c.json({ ...result, ignored }, result.errors.length > 0 ? 207 : 200)
   },
 )
 

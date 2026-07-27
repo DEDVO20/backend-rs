@@ -793,13 +793,26 @@ export class CollectionService {
         continue
       }
 
-      // Upsert debtor — NO sobreescribir status si ya existe
-      const { data: existing } = await supabase
+      // Upsert debtor — NO sobreescribir status si ya existe.
+      // Primero por documento; si no aparece (el formato nuevo usa el nombre
+      // como clave), se busca por nombre para no duplicar deudores creados
+      // antes con su NIT.
+      let { data: existing } = await supabase
         .from('collection_debtors')
         .select('id, status')
         .eq('company_id', companyId)
         .eq('debtor_document', debtor_document)
         .maybeSingle()
+
+      if (!existing) {
+        const { data: byName } = await supabase
+          .from('collection_debtors')
+          .select('id, status')
+          .eq('company_id', companyId)
+          .ilike('debtor_name', debtor_name)
+          .limit(1)
+        existing = byName?.[0] ?? null
+      }
 
       let debtorId: string
 
