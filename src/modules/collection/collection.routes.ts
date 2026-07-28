@@ -309,6 +309,61 @@ function mapSiigoRowNew(raw: Record<string, string>): Record<string, string> | n
   }
 }
 
+// Fecha en texto español: "16 jul 2026", "30 sept 2025" → yyyy-mm-dd
+const MESES_ES: Record<string, string> = {
+  ene: '01', feb: '02', mar: '03', abr: '04', may: '05', jun: '06',
+  jul: '07', ago: '08', sep: '09', oct: '10', nov: '11', dic: '12',
+}
+function parseSpanishDate(val: string): string | null {
+  if (!val) return null
+  const m = val.trim().toLowerCase().match(/^(\d{1,2})\s+([a-záéíóú.]+)\s+(\d{4})$/)
+  if (!m) return null
+  const mm = MESES_ES[m[2]!.replace('.', '').slice(0, 3)]
+  if (!mm) return null
+  return `${m[3]}-${mm}-${m[1]!.padStart(2, '0')}`
+}
+
+// Rango de mora a partir del número de días vencidos
+function bucketFromDays(days: number): string | null {
+  if (days <= 0)  return 'not_yet_due'
+  if (days <= 30) return 'overdue_1_30'
+  if (days <= 60) return 'overdue_31_60'
+  if (days <= 90) return 'overdue_61_90'
+  return 'overdue_91_plus'
+}
+
+/**
+ * Formato "Dashboard WIP": Cliente identificacion, Cliente nombre, Fecha
+ * factura, Nombre factura, Dias vencidos, Balance original.
+ * El tramo se calcula desde 'Dias vencidos' y la fecha viene en español.
+ */
+function mapSiigoRowWip(raw: Record<string, string>): Record<string, string> | null {
+  const nit  = (raw['Cliente identificacion'] ?? '').trim()
+  const name = (raw['Cliente nombre'] ?? '').trim()
+  if (!nit && !name) return null
+
+  const saldo = parseAmount(raw['Balance original'] ?? '')
+  const days  = parseInt(String(raw['Dias vencidos'] ?? '').replace(/[^\d-]/g, ''), 10) || 0
+
+  const overdue: Record<string, string> = {
+    overdue_1_30: '0', overdue_31_60: '0', overdue_61_90: '0', overdue_91_plus: '0', not_yet_due: '0',
+  }
+  const bucket = bucketFromDays(days)
+  if (bucket) overdue[bucket] = String(saldo)
+
+  return {
+    debtor_document:    nit || name,   // preferir NIT; si no viniera, el nombre
+    debtor_name:        name,
+    seller:             '',
+    siigo_document:     (raw['Nombre factura'] ?? '').trim(),
+    due_date:           parseSpanishDate(raw['Fecha factura'] ?? '') || '',
+    currency:           'COP',
+    total_balance:      String(saldo),
+    outstanding_amount: String(saldo),
+    ...overdue,
+  }
+}
+
 function parseSiigoDate(val: string): string | null {
   if (!val) return null
   const clean = val.trim()
@@ -393,9 +448,14 @@ app.post('/debtors/import',
     }
 
     const headers = parseCsvLine(lines[0]!)
-    // Formato nuevo (pivote) = usa la columna exacta 'Rango'.
-    // El formato viejo usa 'Rango vencimiento', así que no colisiona.
-    const isNewFormat = headers.includes('Rango')
+    // Cada formato se detecta por una columna que lo delata; así se ramifica
+    // sin afectar a los otros:
+    //   'Dias vencidos'     → Dashboard WIP (mapSiigoRowWip)
+    //   'Rango'             → pivote nuevo   (mapSiigoRowNew)
+    //   'Rango vencimiento' → formato viejo  (mapSiigoRow)
+    const mapper = headers.includes('Dias vencidos') ? mapSiigoRowWip
+                 : headers.includes('Rango')         ? mapSiigoRowNew
+                 :                                      mapSiigoRow
 
     const rows: Array<Record<string, string>> = []
     let ignored = 0
@@ -403,7 +463,7 @@ app.post('/debtors/import',
       const values = parseCsvLine(lines[i]!)
       const raw: Record<string, string> = {}
       headers.forEach((h, idx) => { raw[h] = values[idx] ?? '' })
-      const mapped = isNewFormat ? mapSiigoRowNew(raw) : mapSiigoRow(raw)
+      const mapped = mapper(raw)
       if (mapped) rows.push(mapped)
       else ignored++
     }
