@@ -7,6 +7,9 @@ import {
   calcPayable,
   deriveStatus,
   normalizeInvoiceNumber,
+  normalizeSiigoInvoice,
+  nitMatch,
+  parseSiigoDate,
 } from '../src/modules/participations/participations.domain.js'
 
 describe('calcParticipation', () => {
@@ -180,5 +183,30 @@ describe('normalizeInvoiceNumber', () => {
   it('ignora espacios, guiones y puntos, y no distingue mayúsculas', () => {
     expect(normalizeInvoiceNumber('F-001')).toBe(normalizeInvoiceNumber('f 001'))
     expect(normalizeInvoiceNumber('FE.123')).toBe('FE123')
+  })
+})
+
+describe('conciliación SIIGO', () => {
+  it('normalizeSiigoInvoice quita el sufijo de cuota', () => {
+    expect(normalizeSiigoInvoice('FV-4-4663-1')).toBe('FV-4-4663')
+    expect(normalizeSiigoInvoice('FV-4-4833')).toBe('FV-4-4833')
+    expect(normalizeSiigoInvoice('fv-4-4663-2')).toBe('FV-4-4663')
+  })
+
+  it('el recibo enlaza con la venta por número de factura normalizado', () => {
+    expect(normalizeSiigoInvoice('FV-4-4663-1')).toBe(normalizeSiigoInvoice('FV-4-4663'))
+  })
+
+  it('nitMatch tolera puntos, guiones y dígito de verificación', () => {
+    expect(nitMatch('900.062.985-1', '900062985')).toBe(true)
+    expect(nitMatch('901723460', '901723460')).toBe(true)
+    expect(nitMatch('900062985', '860075214')).toBe(false)
+    expect(nitMatch('', '900062985')).toBe(false)
+  })
+
+  it('parseSiigoDate interpreta dd/mm/yyyy', () => {
+    expect(parseSiigoDate('17/07/2026')).toEqual({ iso: '2026-07-17', year: 2026, month: 7 })
+    expect(parseSiigoDate('01/07/2026')).toEqual({ iso: '2026-07-01', year: 2026, month: 7 })
+    expect(parseSiigoDate('basura')).toBeNull()
   })
 })

@@ -3,6 +3,7 @@ import { logger }   from '../../lib/logger.js'
 import {
   calcParticipation, formatPurchaseOrder, money,
   calcReceivable, calcPayable, deriveStatus, normalizeInvoiceNumber,
+  normalizeSiigoInvoice, nitMatch, parseSiigoDate,
 } from './participations.domain.js'
 import type { z }   from 'zod'
 import type {
@@ -16,6 +17,81 @@ type ParticipationInput = z.infer<typeof upsertParticipationSchema>
 type InvoicingInput    = z.infer<typeof invoicingSchema>
 
 const toDateStr = (d: Date) => d.toISOString().split('T')[0]!
+
+const fmtCOP = (n: number) =>
+  new Intl.NumberFormat('es-CO', { style: 'currency', currency: 'COP', maximumFractionDigits: 0 }).format(n)
+
+// ── Parseo de reportes de SIIGO ──────────────────────────────────────────────
+
+const stripAccents = (s: string) => s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+
+/** Índice de columna cuyo encabezado contiene alguno de los términos */
+function colIndex(header: string[], ...terms: string[]): number {
+  return header.findIndex(h => terms.some(t => stripAccents(String(h)).includes(stripAccents(t))))
+}
+
+const toNum = (v: any) => {
+  const n = Number(String(v ?? '').replace(/[^\d.-]/g, ''))
+  return Number.isFinite(n) ? n : 0
+}
+
+type SaleRow = { invoice: string; iso: string; year: number; month: number; nit: string; subtotal: number }
+
+/** "Ventas por vendedor" → facturas de Finto con su valor antes de IVA (Subtotal) */
+function parseSalesReport(rows: string[][]): SaleRow[] {
+  if (!rows.length) return []
+  const header = rows[0]!.map(String)
+  const iComp = colIndex(header, 'comprobante')
+  const iDate = colIndex(header, 'fecha')
+  const iNit  = colIndex(header, 'identificacion', 'nit')
+  const iSub  = colIndex(header, 'subtotal')
+  if (iComp < 0 || iNit < 0 || iSub < 0) return []
+
+  const out: SaleRow[] = []
+  for (const r of rows.slice(1)) {
+    const comp = String(r[iComp] ?? '').trim()
+    if (!comp) continue
+    const d = iDate >= 0 ? parseSiigoDate(String(r[iDate] ?? '')) : null
+    out.push({
+      invoice:  normalizeSiigoInvoice(comp),
+      iso:      d?.iso ?? '',
+      year:     d?.year ?? 0,
+      month:    d?.month ?? 0,
+      nit:      String(r[iNit] ?? ''),
+      subtotal: toNum(r[iSub]),
+    })
+  }
+  return out
+}
+
+type ReceiptRow = { receipt: string; iso: string; invoice: string; nit: string; value: number }
+
+/** "Recibos de caja detallado por facturas" → recaudos ligados a cada factura */
+function parseReceiptsReport(rows: string[][]): ReceiptRow[] {
+  if (!rows.length) return []
+  const header = rows[0]!.map(String)
+  const iComp = colIndex(header, 'comprobante')
+  const iDate = colIndex(header, 'fecha')
+  const iInv  = colIndex(header, 'vencimiento')   // ← factura a la que se aplica
+  const iNit  = colIndex(header, 'identificacion', 'nit')
+  const iVal  = colIndex(header, 'valor')
+  if (iComp < 0 || iInv < 0 || iVal < 0) return []
+
+  const out: ReceiptRow[] = []
+  for (const r of rows.slice(1)) {
+    const comp = String(r[iComp] ?? '').trim()
+    if (!comp) continue
+    const d = iDate >= 0 ? parseSiigoDate(String(r[iDate] ?? '')) : null
+    out.push({
+      receipt: comp,
+      iso:     d?.iso ?? '',
+      invoice: normalizeSiigoInvoice(String(r[iInv] ?? '')),
+      nit:     iNit >= 0 ? String(r[iNit] ?? '') : '',
+      value:   toNum(r[iVal]),
+    })
+  }
+  return out
+}
 
 export class ParticipationsService {
 
@@ -310,6 +386,151 @@ export class ParticipationsService {
     }
 
     return { invoicing: inv, status, reasons, receivable, payable, warnings }
+  }
+
+  // ── Conciliación con reportes de SIIGO (lado CxC Clientes) ───────────────────
+
+  /**
+   * Empareja las participaciones del mes con dos reportes de SIIGO:
+   *  - Ventas por vendedor  → factura de Finto (finto_invoice + valor antes de IVA)
+   *  - Recibos de caja      → recaudo del cliente (cash_receipt + valor)
+   * Reutiliza los mismos campos del registro manual: no cambia la lógica de negocio.
+   * Con apply=false devuelve solo el reporte; con apply=true además escribe.
+   */
+  static async reconcileSiigo(opts: {
+    year: number; month: number
+    salesRows: string[][]; receiptRows: string[][]
+    apply: boolean; userId: string
+  }) {
+    const { year, month, salesRows, receiptRows, apply, userId } = opts
+
+    const sales    = parseSalesReport(salesRows).filter(s => s.year === year && s.month === month)
+    const receipts = parseReceiptsReport(receiptRows)
+
+    // Recibos agrupados por factura (puede haber pagos parciales de una misma factura)
+    const receiptsByInvoice = new Map<string, typeof receipts>()
+    for (const r of receipts) {
+      if (!r.invoice) continue
+      const list = receiptsByInvoice.get(r.invoice) ?? []
+      list.push(r); receiptsByInvoice.set(r.invoice, list)
+    }
+
+    // Participaciones del mes con NIT de la empresa y facturación actual
+    const { data: monthly, error } = await supabase
+      .from('monthly_participations')
+      .select(`
+        id, purchase_order, service_value, participation_value,
+        participation:service_participations(company_service:company_services(companies(name, nit))),
+        participation_invoicing(*)
+      `)
+      .eq('year', year)
+      .eq('month', month)
+    if (error) throw error
+
+    const one = (v: any) => Array.isArray(v) ? v[0] : v
+    type ResultRow = {
+      monthly_id: string; purchase_order: string; company: string
+      outcome: 'matched' | 'value_mismatch' | 'ambiguous' | 'not_found'
+      finto_invoice?: string; finto_value?: number
+      cash_receipt?: string;  cash_value?: number
+      note?: string
+    }
+    const results: ResultRow[] = []
+    const toApply: { id: string; existing: any; patch: Record<string, unknown> }[] = []
+
+    for (const mp of monthly ?? []) {
+      const company = one(one(one((mp as any).participation)?.company_service)?.companies)
+      const name = company?.name ?? '—'
+      const nit  = company?.nit ?? ''
+      const serviceValue = Number((mp as any).service_value)
+
+      const candidates = sales.filter(s => nitMatch(s.nit, nit))
+      const exact = candidates.filter(s => Math.abs(s.subtotal - serviceValue) < 1)
+
+      let chosen: (typeof sales)[number] | null = null
+      let outcome: ResultRow['outcome'] = 'not_found'
+      let note: string | undefined
+
+      if (exact.length === 1)      { chosen = exact[0]!; outcome = 'matched' }
+      else if (exact.length > 1)   { outcome = 'ambiguous'; note = `${exact.length} facturas con el mismo valor` }
+      else if (candidates.length === 1) { chosen = candidates[0]!; outcome = 'value_mismatch'; note = `Factura por ${fmtCOP(chosen.subtotal)} vs. servicio ${fmtCOP(serviceValue)}` }
+      else if (candidates.length > 1)   { outcome = 'ambiguous'; note = `${candidates.length} facturas del cliente en el mes` }
+
+      const row: ResultRow = { monthly_id: (mp as any).id, purchase_order: (mp as any).purchase_order, company: name, outcome }
+
+      if (chosen) {
+        row.finto_invoice = chosen.invoice
+        row.finto_value   = chosen.subtotal
+        const recs = receiptsByInvoice.get(chosen.invoice) ?? []
+        if (recs.length) {
+          const totalPaid = money(recs.reduce((a, r) => a + r.value, 0))
+          const latest = recs.reduce((a, r) => (r.iso > a.iso ? r : a), recs[0]!)
+          row.cash_receipt = recs.length === 1 ? recs[0]!.receipt : `${recs[0]!.receipt} (+${recs.length - 1})`
+          row.cash_value   = totalPaid
+          ;(row as any).cash_date = latest.iso
+          ;(row as any).finto_date = chosen.iso
+        }
+        if (note) row.note = note
+
+        toApply.push({
+          id: (mp as any).id,
+          existing: one((mp as any).participation_invoicing) ?? {},
+          patch: {
+            finto_invoice:      chosen.invoice,
+            finto_invoice_date: chosen.iso,
+            finto_invoice_value: chosen.subtotal,
+            ...(recs.length ? {
+              cash_receipt:       row.cash_receipt,
+              cash_receipt_date:  (row as any).cash_date,
+              cash_receipt_value: row.cash_value,
+            } : {}),
+          },
+        })
+      }
+
+      results.push(row)
+    }
+
+    // Aplicar (opcional): mezcla con la facturación existente para no pisar el lado CxP
+    let applied = 0
+    if (apply && toApply.length) {
+      for (const item of toApply) {
+        const merged = {
+          ...item.existing,
+          ...item.patch,
+          monthly_participation_id: item.id,
+          updated_by: userId,
+          updated_at: new Date().toISOString(),
+        }
+        delete (merged as any).id
+        const { data: inv, error: upErr } = await supabase
+          .from('participation_invoicing')
+          .upsert(merged, { onConflict: 'monthly_participation_id' })
+          .select()
+          .single()
+        if (upErr) throw upErr
+
+        const mp = (monthly ?? []).find((m: any) => m.id === item.id) as any
+        const { status } = deriveStatus(
+          { service_value: Number(mp.service_value), participation_value: Number(mp.participation_value ?? 0) },
+          inv,
+        )
+        await supabase.from('monthly_participations').update({ status }).eq('id', item.id)
+        applied += 1
+      }
+    }
+
+    const summary = {
+      total:          results.length,
+      matched:        results.filter(r => r.outcome === 'matched').length,
+      value_mismatch: results.filter(r => r.outcome === 'value_mismatch').length,
+      ambiguous:      results.filter(r => r.outcome === 'ambiguous').length,
+      not_found:      results.filter(r => r.outcome === 'not_found').length,
+      sales_rows:     sales.length,
+      receipt_rows:   receipts.length,
+      applied,
+    }
+    return { summary, results, applied: apply }
   }
 
   // ── Estadísticas del panel ───────────────────────────────────────────────────

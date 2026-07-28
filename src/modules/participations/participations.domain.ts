@@ -106,3 +106,41 @@ export function deriveStatus(
 export function normalizeInvoiceNumber(n: string): string {
   return n.replace(/[\s.\-_]/g, '').toUpperCase()
 }
+
+// ── Conciliación con reportes de SIIGO ───────────────────────────────────────
+
+/**
+ * Normaliza el comprobante de factura de SIIGO quitando el sufijo de cuota.
+ * En "Recibos de caja" la factura viene como "FV-4-4663-1" (cuota 1) y en
+ * "Ventas" como "FV-4-4663"; se comparan sin ese sufijo.
+ */
+export function normalizeSiigoInvoice(s: string): string {
+  const up = String(s ?? '').trim().toUpperCase()
+  // FV-<serie>-<numero>[-<cuota>] → conservar FV-<serie>-<numero>
+  const m = up.match(/^(FV-\d+-\d+)/)
+  if (m) return m[1]!
+  // Otros formatos: quitar un posible "-<n>" final de cuota
+  return up.replace(/-\d+$/, '')
+}
+
+/** NIT/documento normalizado a solo dígitos */
+export function normalizeNit(s: string): string {
+  return String(s ?? '').replace(/\D/g, '')
+}
+
+/** Compara dos NIT tolerando el dígito de verificación (900062985 ≡ 900062985-1) */
+export function nitMatch(a: string, b: string): boolean {
+  const x = normalizeNit(a), y = normalizeNit(b)
+  if (!x || !y) return false
+  if (x === y) return true
+  // Uno puede traer el dígito de verificación y el otro no
+  return x === y.slice(0, -1) || y === x.slice(0, -1)
+}
+
+/** Convierte una fecha SIIGO "dd/mm/yyyy" a { iso, year, month } */
+export function parseSiigoDate(s: string): { iso: string; year: number; month: number } | null {
+  const m = String(s ?? '').trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/)
+  if (!m) return null
+  const day = m[1]!.padStart(2, '0'), month = m[2]!.padStart(2, '0'), year = m[3]!
+  return { iso: `${year}-${month}-${day}`, year: Number(year), month: Number(month) }
+}

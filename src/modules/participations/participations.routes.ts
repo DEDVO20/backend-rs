@@ -92,6 +92,56 @@ app.patch('/monthly/:id/invoicing',
   },
 )
 
+// ── Conciliación con reportes de SIIGO (lado CxC) ────────────────────────────
+// multipart: file_sales (Ventas), file_receipts (Recibos), year, month, apply
+app.post('/reconcile-siigo',
+  requireRole('admin', 'rs_admin'),
+  async (c) => {
+    const ct = c.req.header('content-type') ?? ''
+    if (!ct.includes('multipart/form-data')) {
+      return c.json({ error: 'Se requiere multipart/form-data con file_sales y file_receipts' }, 400)
+    }
+    const form  = await c.req.formData()
+    const sales = form.get('file_sales')
+    const rcs   = form.get('file_receipts')
+    const year  = Number(form.get('year'))
+    const month = Number(form.get('month'))
+    const apply = String(form.get('apply') ?? '') === 'true'
+
+    if (!(sales instanceof File) || !(rcs instanceof File))
+      return c.json({ error: 'Faltan los archivos file_sales y file_receipts' }, 400)
+    if (!year || !month)
+      return c.json({ error: 'year y month son requeridos' }, 400)
+
+    const { read, utils } = await import('xlsx')
+    const readRows = async (f: File): Promise<string[][]> => {
+      // CSV: leer como texto UTF-8 (evita mojibake en encabezados con tilde);
+      // Excel: leer el binario tal cual.
+      const isCsv = (f.name ?? '').toLowerCase().endsWith('.csv')
+      const wb = isCsv
+        ? read(await f.text(), { type: 'string' })
+        : read(await f.arrayBuffer(), { type: 'array' })
+      const ws = wb.Sheets[wb.SheetNames[0]!]!
+      return utils.sheet_to_json<string[]>(ws, { header: 1, defval: '' })
+    }
+
+    let salesRows: string[][], receiptRows: string[][]
+    try {
+      salesRows   = await readRows(sales)
+      receiptRows = await readRows(rcs)
+    } catch {
+      return c.json({ error: 'No se pudieron leer los archivos Excel' }, 400)
+    }
+
+    const user = c.get('user')
+    const result = await ParticipationsService.reconcileSiigo({ year, month, salesRows, receiptRows, apply, userId: user.id })
+    if (apply) {
+      auditAsync({ action: 'update', resource: 'monthly_participations', metadata: { source: 'siigo', year, month, applied: result.summary.applied }, user, c })
+    }
+    return c.json(result)
+  },
+)
+
 // ── Estadísticas ──────────────────────────────────────────────────────────────
 
 app.get('/stats', async (c) => {
