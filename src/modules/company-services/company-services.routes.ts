@@ -17,6 +17,17 @@ const assignServiceSchema = z.object({
   responsible_user_id: z.string().uuid().optional(),
 })
 
+// GET /api/company-services/pairs — todas las relaciones activas empresa↔servicio
+// (para filtros que se condicionan entre sí). DEBE ir antes de /:companyId.
+app.get('/pairs', async (c) => {
+  const { data, error } = await supabase
+    .from('company_services')
+    .select('company_id, service_id')
+    .eq('active', true)
+  if (error) throw error
+  return c.json(data)
+})
+
 // GET /api/company-services/:companyId — servicios activos de una empresa
 app.get('/:companyId', async (c) => {
   const { data, error } = await supabase
