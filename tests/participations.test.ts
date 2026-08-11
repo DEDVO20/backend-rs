@@ -1,11 +1,13 @@
 import { describe, it, expect } from 'vitest'
 import {
   calcParticipation,
+  availableParticipation,
+  deriveInvoiceStatus,
   formatPurchaseOrder,
-  validateInvoicing,
-  calcReceivable,
-  calcPayable,
-  deriveStatus,
+  formatPaymentOrder,
+  excelSerialToISO,
+  extractInvoiceRef,
+  validateThirdPartyInvoice,
   normalizeInvoiceNumber,
   normalizeSiigoInvoice,
   nitMatch,
@@ -24,6 +26,89 @@ describe('calcParticipation', () => {
   it('0% da 0', () => {
     expect(calcParticipation(500_000, 0)).toBe(0)
   })
+
+  it('tipo fijo devuelve el monto fijo, ignora el %', () => {
+    expect(calcParticipation(500_000, 20, { type: 'fixed', fixedValue: 150_000 })).toBe(150_000)
+  })
+})
+
+describe('formatPaymentOrder', () => {
+  it('formatea OP-YYYYMM-NNNNNN', () => {
+    expect(formatPaymentOrder(2026, 8, 3)).toBe('OP-202608-000003')
+  })
+})
+
+describe('excelSerialToISO', () => {
+  it('convierte el serial de Excel a fecha', () => {
+    expect(excelSerialToISO(46204.51393518518)).toBe('2026-07-01')
+  })
+  it('null si no es válido', () => {
+    expect(excelSerialToISO(0)).toBeNull()
+  })
+})
+
+describe('extractInvoiceRef', () => {
+  it('extrae el FV de un texto libre', () => {
+    expect(extractInvoiceRef('Pago participación FV-4-9001 cuota 1')).toBe('FV-4-9001')
+    expect(extractInvoiceRef('FV-58964')).toBe('FV-58964')
+  })
+  it('null si no hay factura', () => {
+    expect(extractInvoiceRef('Traslado Fiducuenta')).toBe(null)
+  })
+})
+
+describe('validateThirdPartyInvoice', () => {
+  it('ok cuando el valor coincide con lo causado', () => {
+    expect(validateThirdPartyInvoice(100_000, { number: 'T-1', value: 100_000 }).ok).toBe(true)
+  })
+  it('falla si no coincide', () => {
+    const r = validateThirdPartyInvoice(100_000, { number: 'T-1', value: 90_000 })
+    expect(r.ok).toBe(false)
+    expect(r.reasons[0]).toContain('no coincide')
+  })
+  it('falla si no hay factura del tercero', () => {
+    expect(validateThirdPartyInvoice(100_000, { number: null, value: null }).ok).toBe(false)
+  })
+})
+
+describe('deriveInvoiceStatus', () => {
+  it('OC del mes sin FV → Pendiente de factura', () => {
+    expect(deriveInvoiceStatus({ finto_invoice: null, finto_invoice_value: 500_000, collected: 0 })).toBe('pending_invoice')
+  })
+  it('FV presente sin recaudo → Facturada (no pendiente)', () => {
+    expect(deriveInvoiceStatus({ finto_invoice: 'FV-4-1', finto_invoice_value: 500_000, collected: 0 })).toBe('invoiced')
+  })
+  it('sin recaudo → Facturada', () => {
+    expect(deriveInvoiceStatus({ finto_invoice_value: 500_000, collected: 0 })).toBe('invoiced')
+  })
+  it('recaudo parcial', () => {
+    expect(deriveInvoiceStatus({ finto_invoice_value: 500_000, collected: 200_000 })).toBe('partial_collection')
+  })
+  it('recaudo total → Disponible para pago', () => {
+    expect(deriveInvoiceStatus({ finto_invoice_value: 500_000, collected: 500_000 })).toBe('available')
+  })
+  it('con orden de pago → Pago en proceso', () => {
+    expect(deriveInvoiceStatus({ finto_invoice_value: 500_000, collected: 500_000, payment_order: 'OP-1' })).toBe('payment_in_process')
+  })
+  it('egreso completo → Cerrada', () => {
+    expect(deriveInvoiceStatus({ finto_invoice_value: 500_000, collected: 500_000, available_for_payment: 100_000, egress_voucher: 'CE-1', egress_voucher_value: 100_000 })).toBe('closed')
+  })
+})
+
+describe('availableParticipation (proporcional al recaudo)', () => {
+  it('porcentaje: proporcional al % recaudado', () => {
+    expect(availableParticipation({ type: 'percentage', participationValue: 100_000, invoiceValue: 500_000, collected: 250_000 })).toBe(50_000)
+  })
+  it('porcentaje: recaudo total libera todo', () => {
+    expect(availableParticipation({ type: 'percentage', participationValue: 100_000, invoiceValue: 500_000, collected: 500_000 })).toBe(100_000)
+  })
+  it('porcentaje: sin recaudo, $0', () => {
+    expect(availableParticipation({ type: 'percentage', participationValue: 100_000, invoiceValue: 500_000, collected: 0 })).toBe(0)
+  })
+  it('fijo: $0 hasta recaudo total, luego completo', () => {
+    expect(availableParticipation({ type: 'fixed', participationValue: 150_000, invoiceValue: 500_000, collected: 250_000 })).toBe(0)
+    expect(availableParticipation({ type: 'fixed', participationValue: 150_000, invoiceValue: 500_000, collected: 500_000 })).toBe(150_000)
+  })
 })
 
 describe('formatPurchaseOrder', () => {
@@ -32,150 +117,6 @@ describe('formatPurchaseOrder', () => {
   })
   it('rellena mes y secuencia', () => {
     expect(formatPurchaseOrder(2026, 12, 123)).toBe('OC-202612-000123')
-  })
-})
-
-describe('validateInvoicing', () => {
-  const monthly = { service_value: 500_000, participation_value: 100_000 }
-
-  it('validated cuando ambas facturas existen y los valores coinciden', () => {
-    const r = validateInvoicing(monthly, {
-      finto_invoice: 'F-1', finto_invoice_value: 500_000,
-      third_party_invoice: 'T-1', third_party_invoice_value: 100_000,
-    })
-    expect(r.status).toBe('validated')
-    expect(r.reasons).toHaveLength(0)
-  })
-
-  it('review si falta la factura del tercero', () => {
-    const r = validateInvoicing(monthly, {
-      finto_invoice: 'F-1', finto_invoice_value: 500_000,
-      third_party_invoice: null, third_party_invoice_value: null,
-    })
-    expect(r.status).toBe('review')
-    expect(r.reasons).toContain('No existe factura del tercero')
-  })
-
-  it('review si el valor de Finto no coincide', () => {
-    const r = validateInvoicing(monthly, {
-      finto_invoice: 'F-1', finto_invoice_value: 480_000,
-      third_party_invoice: 'T-1', third_party_invoice_value: 100_000,
-    })
-    expect(r.status).toBe('review')
-    expect(r.reasons.some(x => x.includes('Finto'))).toBe(true)
-  })
-
-  it('review si el valor del tercero no coincide con lo calculado', () => {
-    const r = validateInvoicing(monthly, {
-      finto_invoice: 'F-1', finto_invoice_value: 500_000,
-      third_party_invoice: 'T-1', third_party_invoice_value: 90_000,
-    })
-    expect(r.status).toBe('review')
-    expect(r.reasons.some(x => x.includes('tercero'))).toBe(true)
-  })
-
-  it('review con dos motivos cuando no hay ninguna factura', () => {
-    const r = validateInvoicing(monthly, null)
-    expect(r.status).toBe('review')
-    expect(r.reasons).toHaveLength(2)
-  })
-
-  it('review si el recaudo no coincide con lo facturado por Finto', () => {
-    const r = validateInvoicing(monthly, {
-      finto_invoice: 'F-1', finto_invoice_value: 500_000,
-      third_party_invoice: 'T-1', third_party_invoice_value: 100_000,
-      cash_receipt: 'RC-1', cash_receipt_value: 400_000,
-    })
-    expect(r.status).toBe('review')
-    expect(r.reasons.some(x => x.includes('recaudo'))).toBe(true)
-  })
-
-  it('review si el pago al tercero no coincide con la participación', () => {
-    const r = validateInvoicing(monthly, {
-      finto_invoice: 'F-1', finto_invoice_value: 500_000,
-      third_party_invoice: 'T-1', third_party_invoice_value: 100_000,
-      egress_voucher: 'CE-1', egress_voucher_value: 80_000,
-    })
-    expect(r.status).toBe('review')
-    expect(r.reasons.some(x => x.includes('pago al tercero'))).toBe(true)
-  })
-
-  it('no exige recaudo ni pago si aún no se registraron', () => {
-    const r = validateInvoicing(monthly, {
-      finto_invoice: 'F-1', finto_invoice_value: 500_000,
-      third_party_invoice: 'T-1', third_party_invoice_value: 100_000,
-    })
-    expect(r.status).toBe('validated')
-  })
-})
-
-describe('CxC Clientes / CxP Terceros', () => {
-  it('CxC = facturado por Finto − recaudado', () => {
-    expect(calcReceivable({ finto_invoice_value: 500_000, cash_receipt_value: 200_000 })).toBe(300_000)
-  })
-
-  it('CxC completo cuando no hay recaudo', () => {
-    expect(calcReceivable({ finto_invoice_value: 500_000 })).toBe(500_000)
-  })
-
-  it('CxP = facturado por el tercero − pagado', () => {
-    expect(calcPayable({ third_party_invoice_value: 100_000, egress_voucher_value: 100_000 })).toBe(0)
-  })
-
-  it('sin datos ambos saldos son 0', () => {
-    expect(calcReceivable(null)).toBe(0)
-    expect(calcPayable(null)).toBe(0)
-  })
-})
-
-describe('deriveStatus', () => {
-  const monthly = { service_value: 500_000, participation_value: 100_000 }
-
-  it('pending cuando no se ha registrado nada', () => {
-    expect(deriveStatus(monthly, null).status).toBe('pending')
-  })
-
-  it('validated con facturas correctas pero sin recaudar ni pagar', () => {
-    const r = deriveStatus(monthly, {
-      finto_invoice: 'F-1', finto_invoice_value: 500_000,
-      third_party_invoice: 'T-1', third_party_invoice_value: 100_000,
-    })
-    expect(r.status).toBe('validated')
-    expect(r.receivable).toBe(500_000)
-    expect(r.payable).toBe(100_000)
-  })
-
-  it('closed cuando además se recaudó y se pagó completo', () => {
-    const r = deriveStatus(monthly, {
-      finto_invoice: 'F-1', finto_invoice_value: 500_000,
-      third_party_invoice: 'T-1', third_party_invoice_value: 100_000,
-      cash_receipt: 'RC-1', cash_receipt_value: 500_000,
-      egress_voucher: 'CE-1', egress_voucher_value: 100_000,
-    })
-    expect(r.status).toBe('closed')
-    expect(r.receivable).toBe(0)
-    expect(r.payable).toBe(0)
-  })
-
-  it('sigue validated si solo se recaudó pero no se pagó al tercero', () => {
-    const r = deriveStatus(monthly, {
-      finto_invoice: 'F-1', finto_invoice_value: 500_000,
-      third_party_invoice: 'T-1', third_party_invoice_value: 100_000,
-      cash_receipt: 'RC-1', cash_receipt_value: 500_000,
-    })
-    expect(r.status).toBe('validated')
-    expect(r.receivable).toBe(0)
-    expect(r.payable).toBe(100_000)
-  })
-
-  it('review manda sobre cerrada si hay inconsistencia', () => {
-    const r = deriveStatus(monthly, {
-      finto_invoice: 'F-1', finto_invoice_value: 480_000,
-      third_party_invoice: 'T-1', third_party_invoice_value: 100_000,
-      cash_receipt: 'RC-1', cash_receipt_value: 480_000,
-      egress_voucher: 'CE-1', egress_voucher_value: 100_000,
-    })
-    expect(r.status).toBe('review')
   })
 })
 
@@ -208,5 +149,12 @@ describe('conciliación SIIGO', () => {
     expect(parseSiigoDate('17/07/2026')).toEqual({ iso: '2026-07-17', year: 2026, month: 7 })
     expect(parseSiigoDate('01/07/2026')).toEqual({ iso: '2026-07-01', year: 2026, month: 7 })
     expect(parseSiigoDate('basura')).toBeNull()
+  })
+
+  it('parseSiigoDate interpreta el serial de Excel', () => {
+    // 46235 = 2026-08-01 ; 46218 = 2026-07-15
+    expect(parseSiigoDate('46235')).toEqual({ iso: '2026-08-01', year: 2026, month: 8 })
+    expect(parseSiigoDate('46218')).toEqual({ iso: '2026-07-15', year: 2026, month: 7 })
+    expect(parseSiigoDate('123')).toBeNull()   // fuera de rango de fecha
   })
 })

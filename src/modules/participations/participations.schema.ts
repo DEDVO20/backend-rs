@@ -16,32 +16,35 @@ export const upsertParticipationSchema = z.object({
   service_value:      z.number().nonnegative(),          // valor mensual antes de IVA
   has_third_party:    z.boolean(),                       // "Tiene tercero"
   third_party_id:     z.string().uuid().nullable().optional(),
+  participation_type: z.enum(['percentage', 'fixed']).default('percentage'),
   percentage:         z.number().min(0).max(100).optional(),
+  fixed_value:        z.number().nonnegative().nullable().optional(),
   start_date:         z.string().date().optional(),
+  end_date:           z.string().date().nullable().optional(),
   active:             z.boolean().default(true),
 }).refine(
-  v => !v.has_third_party || (!!v.third_party_id && v.percentage !== undefined && !!v.start_date),
-  { message: 'Con tercero se requiere tercero, porcentaje y fecha de inicio' },
+  v => !v.has_third_party || (!!v.third_party_id && !!v.start_date),
+  { message: 'Con tercero se requiere tercero y fecha de inicio' },
+).refine(
+  v => {
+    if (!v.has_third_party) return true
+    if (v.participation_type === 'fixed') return (v.fixed_value ?? 0) > 0
+    return v.percentage !== undefined
+  },
+  { message: 'Indica el porcentaje, o el valor fijo si el tipo es fijo' },
 )
 
-// ── Registro manual de facturación, recaudo y pago ───────────────────────────
-export const invoicingSchema = z.object({
-  // CxC Clientes: factura de Finto → recibo de caja
-  finto_invoice:             z.string().max(60).nullable().optional(),
-  finto_invoice_date:        z.string().date().nullable().optional(),
-  finto_invoice_value:       z.number().nonnegative().nullable().optional(),
-  cash_receipt:              z.string().max(60).nullable().optional(),
-  cash_receipt_date:         z.string().date().nullable().optional(),
-  cash_receipt_value:        z.number().nonnegative().nullable().optional(),
-  cash_account:              z.string().max(120).nullable().optional(),
-  // CxP Terceros: factura del tercero → comprobante de egreso
-  third_party_invoice:       z.string().max(60).nullable().optional(),
+// Fase 3: factura del tercero y comprobante de egreso
+export const thirdPartyInvoiceSchema = z.object({
+  third_party_invoice:       z.string().min(1).max(60),
   third_party_invoice_date:  z.string().date().nullable().optional(),
-  third_party_invoice_value: z.number().nonnegative().nullable().optional(),
-  egress_voucher:            z.string().max(60).nullable().optional(),
-  egress_voucher_date:       z.string().date().nullable().optional(),
-  egress_voucher_value:      z.number().nonnegative().nullable().optional(),
-  observations:              z.string().max(1000).nullable().optional(),
+  third_party_invoice_value: z.number().nonnegative(),
+})
+
+export const egressSchema = z.object({
+  egress_voucher:       z.string().min(1).max(60),
+  egress_voucher_date:  z.string().date().nullable().optional(),
+  egress_voucher_value: z.number().nonnegative(),
 })
 
 export const generateParticipationsSchema = z.object({

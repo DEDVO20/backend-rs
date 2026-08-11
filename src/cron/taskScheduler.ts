@@ -79,18 +79,10 @@ async function processJob(jobName: string) {
         break
       }
 
-      case 'participations-monthly': {
-        // Solo procesar el último día del mes
-        const now = new Date()
-        const isLastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate() === now.getDate()
-        if (!isLastDay) {
-          result = { skipped: 'no es el último día del mes' }
-          logger.info(result, 'Cron: participaciones — día no aplica')
-          break
-        }
+      case 'participations-monthly-oc': {
         const { ParticipationsService } = await import('../modules/participations/participations.service.js')
-        result = await ParticipationsService.generateMonthly()
-        logger.info({ result }, 'Cron: participaciones mensuales generadas')
+        result = await ParticipationsService.generateMonthlyOCs()
+        logger.info({ result }, 'Cron: OC mensuales de participaciones generadas')
         break
       }
 
@@ -161,10 +153,10 @@ async function setupRepeatableJobs() {
     repeat: { pattern: '15 12 * * *' },
   })
 
-  // Participaciones de terceros — corre días 28-31 a las 11 PM; procesa solo el último día del mes
-  await cronQueue.add('participations-monthly', {}, {
-    repeat: { pattern: '0 23 28-31 * *' },
+  // OC mensuales de participaciones — día 1 de cada mes a las 6 AM Colombia (11 UTC)
+  await cronQueue.add('participations-monthly-oc', {}, {
+    repeat: { pattern: '0 11 1 * *' },
   })
 
-  logger.info('Cron jobs registrados: generate-tasks (diario 6AM), send-reminders (diario 7AM), mark-overdue (diario 1AM), tax-calendar-tasks (diario 6:30AM), tax-calendar-reminders (diario 7:15AM), participations-monthly (fin de mes 11PM)')
+  logger.info('Cron jobs registrados: generate-tasks (diario 6AM), send-reminders (diario 7AM), mark-overdue (diario 1AM), tax-calendar-tasks (diario 6:30AM), tax-calendar-reminders (diario 7:15AM), participations-monthly-oc (día 1 6AM)')
 }

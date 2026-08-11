@@ -2,12 +2,12 @@ import { Hono }       from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import { authMiddleware } from '../../middleware/auth.js'
 import { requireModule, requireRole } from '../../middleware/requireRole.js'
-import { supabase }   from '../../lib/supabase.js'
 import { auditAsync } from '../../lib/audit.js'
 import { ParticipationsService } from './participations.service.js'
 import {
   thirdPartySchema, updateThirdPartySchema,
-  upsertParticipationSchema, invoicingSchema, generateParticipationsSchema,
+  upsertParticipationSchema,
+  thirdPartyInvoiceSchema, egressSchema,
 } from './participations.schema.js'
 
 const app = new Hono()
@@ -57,72 +57,143 @@ app.put('/config',
   },
 )
 
-// ── Participaciones mensuales ─────────────────────────────────────────────────
+// ── Participaciones por factura ──────────────────────────────────────────────
 
-app.get('/monthly', async (c) => {
+// GET /api/participations/invoices — participaciones por factura
+app.get('/invoices', async (c) => {
   const q = c.req.query()
-  const data = await ParticipationsService.listMonthly({
-    year:   q.year ? Number(q.year) : undefined,
-    month:  q.month ? Number(q.month) : undefined,
-    status: q.status || undefined,
-    page:   Math.max(1, Number(q.page ?? 1) || 1),
-    limit:  Math.min(Math.max(1, Number(q.limit ?? 20) || 20), 100),
+  const data = await ParticipationsService.listInvoiceParticipations({
+    status:     q.status || undefined,
+    company_id: q.company_id || undefined,
+    period:     q.period || undefined,
+    year:       q.year || undefined,
+    from:       q.from || undefined,
+    to:         q.to || undefined,
+    page:  Math.max(1, Number(q.page ?? 1) || 1),
+    limit: Math.min(Math.max(1, Number(q.limit ?? 20) || 20), 100),
   })
   return c.json(data)
 })
 
-// GET /api/participations/invoice-check?type=finto|third&number=F-001&exclude=<monthlyId>
-// Alerta de factura ya registrada. Informativo: nunca bloquea el guardado.
-app.get('/invoice-check', async (c) => {
-  const type   = c.req.query('type') === 'third' ? 'third_party_invoice' : 'finto_invoice'
-  const number = c.req.query('number') ?? ''
-  if (!number.trim()) return c.json({ duplicate: null })
-
-  const duplicate = await ParticipationsService.findDuplicateInvoice(type, number, c.req.query('exclude'))
-  return c.json({ duplicate })
+// GET /api/participations/invoice-stats
+app.get('/invoice-stats', async (c) => {
+  const data = await ParticipationsService.invoiceStats({
+    company_id: c.req.query('company_id') || undefined,
+    period:     c.req.query('period') || undefined,
+    year:       c.req.query('year') || undefined,
+    from:       c.req.query('from') || undefined,
+    to:         c.req.query('to') || undefined,
+  })
+  return c.json(data)
 })
 
-app.patch('/monthly/:id/invoicing',
-  zValidator('json', invoicingSchema),
+// GET /api/participations/balances — panel de saldos: CxC (nos deben) y CxP
+// (debemos, por tercero). Filtros opcionales: ?period=YYYY-MM&company_id=
+app.get('/balances', async (c) => {
+  const data = await ParticipationsService.balances({
+    period:     c.req.query('period') || undefined,
+    company_id: c.req.query('company_id') || undefined,
+    year:       c.req.query('year') || undefined,
+    from:       c.req.query('from') || undefined,
+    to:         c.req.query('to') || undefined,
+  })
+  return c.json(data)
+})
+
+// GET /api/participations/conciliation — vista maestra (una fila por OC con las
+// 5 etapas). Filtros opcionales: ?period=YYYY-MM&company_id=
+app.get('/conciliation', async (c) => {
+  const data = await ParticipationsService.conciliation({
+    period:     c.req.query('period') || undefined,
+    company_id: c.req.query('company_id') || undefined,
+    year:       c.req.query('year') || undefined,
+    from:       c.req.query('from') || undefined,
+    to:         c.req.query('to') || undefined,
+  })
+  return c.json(data)
+})
+
+// GET /api/participations/conciliation/export — descarga la conciliación en Excel
+app.get('/conciliation/export', async (c) => {
+  const period = c.req.query('period') || undefined
+  const year = c.req.query('year') || undefined
+  const from = c.req.query('from') || undefined
+  const to = c.req.query('to') || undefined
+  const rows = await ParticipationsService.conciliation({
+    period, year, from, to,
+    company_id: c.req.query('company_id') || undefined,
+  })
+
+  const header = [
+    'Mes', 'Cliente', 'NIT cliente', 'Venta', 'OC', 'Tercero', 'NIT tercero', 'Participación',
+    '# F venta', '$ F venta', 'RC', '$ Recaudo',
+    '# F compra', '$ F compra', 'RP', '$ Pago', 'Estado',
+  ]
+  const aoa: (string | number)[][] = [header, ...rows.map((r: any) => [
+    r.mes ?? '', r.cliente ?? '', r.nit_cliente ?? '', r.venta ?? 0, r.oc ?? '', r.tercero ?? '', r.nit_tercero ?? '', r.participacion ?? 0,
+    r.f_venta ?? '', r.f_venta_valor ?? 0, r.rc ?? '', r.recaudo ?? 0,
+    r.f_compra ?? '', r.f_compra_valor ?? 0, r.rp ?? '', r.pago ?? 0, r.estado ?? '',
+  ])]
+
+  const { utils, write } = await import('xlsx')
+  const ws = utils.aoa_to_sheet(aoa)
+  const wb = utils.book_new()
+  utils.book_append_sheet(wb, ws, 'Conciliación')
+  const buf = write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer
+  const body = new Uint8Array(buf)
+
+  const fname = `conciliacion${period ? '-' + period : ''}.xlsx`
+  return c.body(body, 200, {
+    'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'Content-Disposition': `attachment; filename="${fname}"`,
+  })
+})
+
+// PATCH /api/participations/invoices/:id/third-party — factura del tercero (+OP)
+app.patch('/invoices/:id/third-party',
+  requireRole('admin', 'rs_admin', 'contador'),
+  zValidator('json', thirdPartyInvoiceSchema),
   async (c) => {
     const user = c.get('user')
-    const result = await ParticipationsService.upsertInvoicing(c.req.param('id')!, c.req.valid('json'), user.id)
-    auditAsync({ action: 'update', resource: 'participation_invoicing', resource_id: c.req.param('id')!, metadata: { status: result.status }, user, c })
+    const result = await ParticipationsService.registerThirdPartyInvoice(c.req.param('id')!, c.req.valid('json'))
+    auditAsync({ action: 'update', resource: 'invoice_participations', resource_id: c.req.param('id')!, metadata: { third_party_invoice: c.req.valid('json').third_party_invoice, payment_order: result.payment_order }, user, c })
     return c.json(result)
   },
 )
 
-// ── Conciliación con reportes de SIIGO (lado CxC) ────────────────────────────
-// multipart: file_sales (Ventas), file_receipts (Recibos), year, month, apply
-app.post('/reconcile-siigo',
+// PATCH /api/participations/invoices/:id/egress — comprobante de egreso (pago)
+app.patch('/invoices/:id/egress',
+  requireRole('admin', 'rs_admin', 'contador'),
+  zValidator('json', egressSchema),
+  async (c) => {
+    const user = c.get('user')
+    const result = await ParticipationsService.registerEgress(c.req.param('id')!, c.req.valid('json'))
+    auditAsync({ action: 'update', resource: 'invoice_participations', resource_id: c.req.param('id')!, metadata: { egress_voucher: c.req.valid('json').egress_voucher }, user, c })
+    return c.json(result)
+  },
+)
+
+// POST /api/participations/process-siigo — crea participaciones por factura y
+// aplica el recaudo. multipart: file_sales, file_receipts, apply
+app.post('/process-siigo',
   requireRole('admin', 'rs_admin'),
   async (c) => {
     const ct = c.req.header('content-type') ?? ''
-    if (!ct.includes('multipart/form-data')) {
+    if (!ct.includes('multipart/form-data'))
       return c.json({ error: 'Se requiere multipart/form-data con file_sales y file_receipts' }, 400)
-    }
+
     const form  = await c.req.formData()
     const sales = form.get('file_sales')
     const rcs   = form.get('file_receipts')
-    const year  = Number(form.get('year'))
-    const month = Number(form.get('month'))
     const apply = String(form.get('apply') ?? '') === 'true'
-
     if (!(sales instanceof File) || !(rcs instanceof File))
       return c.json({ error: 'Faltan los archivos file_sales y file_receipts' }, 400)
-    if (!year || !month)
-      return c.json({ error: 'year y month son requeridos' }, 400)
 
     const { read, utils } = await import('xlsx')
     const readRows = async (f: File): Promise<string[][]> => {
-      // CSV: leer como texto UTF-8 (evita mojibake en encabezados con tilde);
-      // Excel: leer el binario tal cual.
       const isCsv = (f.name ?? '').toLowerCase().endsWith('.csv')
-      const wb = isCsv
-        ? read(await f.text(), { type: 'string' })
-        : read(await f.arrayBuffer(), { type: 'array' })
-      const ws = wb.Sheets[wb.SheetNames[0]!]!
-      return utils.sheet_to_json<string[]>(ws, { header: 1, defval: '' })
+      const wb = isCsv ? read(await f.text(), { type: 'string' }) : read(await f.arrayBuffer(), { type: 'array' })
+      return utils.sheet_to_json<string[]>(wb.Sheets[wb.SheetNames[0]!]!, { header: 1, defval: '' })
     }
 
     let salesRows: string[][], receiptRows: string[][]
@@ -130,56 +201,90 @@ app.post('/reconcile-siigo',
       salesRows   = await readRows(sales)
       receiptRows = await readRows(rcs)
     } catch {
-      return c.json({ error: 'No se pudieron leer los archivos Excel' }, 400)
+      return c.json({ error: 'No se pudieron leer los archivos' }, 400)
     }
 
     const user = c.get('user')
-    const result = await ParticipationsService.reconcileSiigo({ year, month, salesRows, receiptRows, apply, userId: user.id })
-    if (apply) {
-      auditAsync({ action: 'update', resource: 'monthly_participations', metadata: { source: 'siigo', year, month, applied: result.summary.applied }, user, c })
-    }
+    const result = await ParticipationsService.processSiigo({ salesRows, receiptRows, apply })
+    if (apply) auditAsync({ action: 'update', resource: 'invoice_participations', metadata: { source: 'siigo', ...result.summary }, user, c })
     return c.json(result)
   },
 )
 
-// ── Estadísticas ──────────────────────────────────────────────────────────────
-
-app.get('/stats', async (c) => {
-  const q = c.req.query()
-  const data = await ParticipationsService.stats(
-    q.year ? Number(q.year) : undefined,
-    q.month ? Number(q.month) : undefined,
-  )
-  return c.json(data)
-})
-
-// ── Generación manual (cron a demanda) ────────────────────────────────────────
-
-app.post('/generate',
-  requireRole('admin', 'rs_admin'),
-  zValidator('json', generateParticipationsSchema),
+// POST /api/participations/import-egresos — importa pagos (RP) desde el reporte
+// "Movimiento por cuenta contable". multipart: file, apply
+app.post('/import-egresos',
+  requireRole('admin', 'rs_admin', 'contador'),
   async (c) => {
-    const start = Date.now()
-    const body  = c.req.valid('json')
+    const ct = c.req.header('content-type') ?? ''
+    if (!ct.includes('multipart/form-data'))
+      return c.json({ error: 'Se requiere multipart/form-data con el campo "file"' }, 400)
+    const form  = await c.req.formData()
+    const file  = form.get('file')
+    const apply = String(form.get('apply') ?? '') === 'true'
+    if (!(file instanceof File)) return c.json({ error: 'Falta el archivo' }, 400)
+
+    const { read, utils } = await import('xlsx')
+    let rows: string[][]
     try {
-      const result = await ParticipationsService.generateMonthly(body)
-      await supabase.from('cron_logs').insert({
-        job_name:    'participations-generate-manual',
-        status:      'success',
-        result,
-        duration_ms: Date.now() - start,
-      })
-      return c.json(result, 201)
-    } catch (err) {
-      await supabase.from('cron_logs').insert({
-        job_name:    'participations-generate-manual',
-        status:      'failed',
-        result:      {},
-        error:       err instanceof Error ? err.message : String(err),
-        duration_ms: Date.now() - start,
-      })
-      throw err
+      const isCsv = (file.name ?? '').toLowerCase().endsWith('.csv')
+      const wb = isCsv ? read(await file.text(), { type: 'string' }) : read(await file.arrayBuffer(), { type: 'array' })
+      rows = utils.sheet_to_json<string[]>(wb.Sheets[wb.SheetNames[0]!]!, { header: 1, defval: '' })
+    } catch {
+      return c.json({ error: 'No se pudo leer el archivo' }, 400)
     }
+
+    const user = c.get('user')
+    const result = await ParticipationsService.importEgresos(rows, apply)
+    if (apply) auditAsync({ action: 'update', resource: 'invoice_participations', metadata: { source: 'siigo-egresos', ...result.summary }, user, c })
+    return c.json(result)
+  },
+)
+
+// POST /api/participations/import-purchases — importa facturas de compra (del
+// tercero) y las concilia por OC (+OP). multipart: file, apply
+app.post('/import-purchases',
+  requireRole('admin', 'rs_admin', 'contador'),
+  async (c) => {
+    const ct = c.req.header('content-type') ?? ''
+    if (!ct.includes('multipart/form-data'))
+      return c.json({ error: 'Se requiere multipart/form-data con el campo "file"' }, 400)
+    const form  = await c.req.formData()
+    const file  = form.get('file')
+    const apply = String(form.get('apply') ?? '') === 'true'
+    if (!(file instanceof File)) return c.json({ error: 'Falta el archivo' }, 400)
+
+    const { read, utils } = await import('xlsx')
+    let rows: string[][]
+    try {
+      const isCsv = (file.name ?? '').toLowerCase().endsWith('.csv')
+      const wb = isCsv ? read(await file.text(), { type: 'string' }) : read(await file.arrayBuffer(), { type: 'array' })
+      rows = utils.sheet_to_json<string[]>(wb.Sheets[wb.SheetNames[0]!]!, { header: 1, defval: '' })
+    } catch {
+      return c.json({ error: 'No se pudo leer el archivo' }, 400)
+    }
+
+    const user = c.get('user')
+    const result = await ParticipationsService.importPurchases(rows, apply)
+    if (apply) auditAsync({ action: 'update', resource: 'invoice_participations', metadata: { source: 'siigo-compras', ...result.summary }, user, c })
+    return c.json(result)
+  },
+)
+
+// POST /api/participations/generate-monthly — genera la OC del mes para cada
+// servicio contratado con tercero. Body opcional: { period: "YYYY-MM" }.
+app.post('/generate-monthly',
+  requireRole('admin', 'rs_admin'),
+  async (c) => {
+    let period: string | undefined
+    try {
+      const body = await c.req.json<{ period?: string }>()
+      period = body?.period
+    } catch { /* sin body → periodo actual */ }
+    const user = c.get('user')
+    const result = await ParticipationsService.generateMonthlyOCs(period)
+    auditAsync({ action: 'create', resource: 'invoice_participations', metadata: { source: 'monthly-oc', period: result.period, created: result.created }, user, c })
+    return c.json(result)
   },
 )
 

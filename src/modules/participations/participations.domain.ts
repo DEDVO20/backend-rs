@@ -6,9 +6,41 @@
 
 export const money = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100
 
-/** Valor participación = valor del servicio × (porcentaje / 100) */
-export function calcParticipation(serviceValue: number, percentage: number): number {
+export type ParticipationType = 'percentage' | 'fixed'
+
+/**
+ * Valor de la participación.
+ *  - percentage: valor del servicio × (porcentaje / 100)
+ *  - fixed:      un monto fijo que cobra el tercero
+ */
+export function calcParticipation(
+  serviceValue: number,
+  percentage: number,
+  opts?: { type?: ParticipationType; fixedValue?: number | null },
+): number {
+  if (opts?.type === 'fixed') return money(Number(opts.fixedValue ?? 0))
   return money(serviceValue * (percentage / 100))
+}
+
+/**
+ * Participación disponible para pagar al tercero, según lo recaudado:
+ *  - percentage: proporcional al % recaudado de la factura
+ *  - fixed:      completo cuando el recaudo es total; $0 antes
+ */
+export function availableParticipation(input: {
+  type: ParticipationType
+  participationValue: number   // participación total calculada
+  invoiceValue: number         // valor de la factura de Finto
+  collected: number            // recaudado (recibos de caja)
+}): number {
+  const { type, participationValue, invoiceValue, collected } = input
+  if (invoiceValue <= 0) return 0
+  const fullyCollected = collected + 0.01 >= invoiceValue
+
+  if (type === 'fixed') return fullyCollected ? money(participationValue) : 0
+
+  const ratio = Math.min(1, Math.max(0, collected / invoiceValue))
+  return money(participationValue * ratio)
 }
 
 /** Número de orden de compra: OC-YYYYMM-NNNNNN */
@@ -16,95 +48,87 @@ export function formatPurchaseOrder(year: number, month: number, seq: number): s
   return `OC-${year}${String(month).padStart(2, '0')}-${String(seq).padStart(6, '0')}`
 }
 
-export type Invoicing = {
-  finto_invoice?: string | null;       finto_invoice_value?: number | null
-  third_party_invoice?: string | null; third_party_invoice_value?: number | null
-  cash_receipt?: string | null;        cash_receipt_value?: number | null
-  egress_voucher?: string | null;      egress_voucher_value?: number | null
-} | null
-
-export type ValidationResult = { status: 'validated' | 'review'; reasons: string[] }
-
-const eqMoney = (a?: number | null, b?: number | null) =>
-  a != null && b != null && Math.abs(a - b) < 0.01
-
-/** CxC Clientes = valor facturado por Finto − valor recaudado (recibo de caja) */
-export function calcReceivable(inv: Invoicing): number {
-  return money(Number(inv?.finto_invoice_value ?? 0) - Number(inv?.cash_receipt_value ?? 0))
-}
-
-/** CxP Terceros = valor facturado por el tercero − valor pagado (comprobante de egreso) */
-export function calcPayable(inv: Invoicing): number {
-  return money(Number(inv?.third_party_invoice_value ?? 0) - Number(inv?.egress_voucher_value ?? 0))
-}
-
-/** Concilia lo facturado/recaudado/pagado contra lo calculado (sección 5 del spec) */
-export function validateInvoicing(
-  monthly: { service_value: number; participation_value: number },
-  inv: Invoicing,
-): ValidationResult {
-  const reasons: string[] = []
-
-  if (!inv?.finto_invoice)       reasons.push('No existe factura de Finto')
-  if (!inv?.third_party_invoice) reasons.push('No existe factura del tercero')
-
-  if (inv?.finto_invoice && !eqMoney(inv.finto_invoice_value, monthly.service_value))
-    reasons.push('El valor de la factura de Finto no coincide con el valor del servicio')
-
-  if (inv?.third_party_invoice && !eqMoney(inv.third_party_invoice_value, monthly.participation_value))
-    reasons.push('El valor de la factura del tercero no coincide con la participación calculada')
-
-  // El recaudo y el pago solo se validan si ya fueron registrados: que falten
-  // no es un error, simplemente la participación aún no está cerrada.
-  if (inv?.cash_receipt && !eqMoney(inv.cash_receipt_value, inv.finto_invoice_value))
-    reasons.push('El recaudo no coincide con lo facturado por Finto')
-
-  if (inv?.egress_voucher && !eqMoney(inv.egress_voucher_value, monthly.participation_value))
-    reasons.push('El pago al tercero no coincide con la participación calculada')
-
-  return { status: reasons.length ? 'review' : 'validated', reasons }
-}
-
-export type ParticipationStatus = 'pending' | 'review' | 'validated' | 'closed'
-
-export type StatusResult = {
-  status:     ParticipationStatus
-  reasons:    string[]
-  receivable: number   // CxC Clientes
-  payable:    number   // CxP Terceros
+/** Número de orden de pago: OP-YYYYMM-NNNNNN */
+export function formatPaymentOrder(year: number, month: number, seq: number): string {
+  return `OP-${year}${String(month).padStart(2, '0')}-${String(seq).padStart(6, '0')}`
 }
 
 /**
- * Estado del ciclo completo:
- *  pending    → aún no se registró nada
- *  review     → hay inconsistencias (motivos)
- *  validated  → facturas correctas, falta recaudar y/o pagar
- *  closed     → además ya se recaudó al cliente y se pagó al tercero
+ * Concilia la factura del tercero contra lo causado (la participación).
+ * Si el valor coincide, se puede generar la Orden de Pago; si no, queda
+ * pendiente de revisión manual (sección 4 del flujo).
  */
-export function deriveStatus(
-  monthly: { service_value: number; participation_value: number },
-  inv: Invoicing,
-): StatusResult {
-  const receivable = calcReceivable(inv)
-  const payable    = calcPayable(inv)
-
-  const nothingRegistered = !inv?.finto_invoice && !inv?.third_party_invoice
-    && !inv?.cash_receipt && !inv?.egress_voucher
-
-  if (nothingRegistered) return { status: 'pending', reasons: [], receivable, payable }
-
-  const { status, reasons } = validateInvoicing(monthly, inv)
-  if (status === 'review') return { status: 'review', reasons, receivable, payable }
-
-  const collected = !!inv?.cash_receipt   && receivable <= 0.009
-  const paid      = !!inv?.egress_voucher && payable    <= 0.009
-
-  return { status: collected && paid ? 'closed' : 'validated', reasons, receivable, payable }
+export function validateThirdPartyInvoice(
+  participationValue: number,
+  thirdInvoice: { number?: string | null; value?: number | null },
+): { ok: boolean; reasons: string[] } {
+  const reasons: string[] = []
+  if (!thirdInvoice.number) reasons.push('No existe factura del tercero')
+  else if (thirdInvoice.value == null || Math.abs(thirdInvoice.value - participationValue) >= 0.01)
+    reasons.push('El valor de la factura del tercero no coincide con lo causado (participación)')
+  return { ok: reasons.length === 0, reasons }
 }
 
 /** Normaliza números de factura para comparar duplicados ("F-001" ≡ "f 001") */
 export function normalizeInvoiceNumber(n: string): string {
   return n.replace(/[\s.\-_]/g, '').toUpperCase()
+}
+
+// ── Estados del proceso por factura ──────────────────────────────────────────
+
+export type InvoiceStatus =
+  | 'pending_invoice'    // OC creada (servicio contratado), sin factura de venta aún
+  | 'invoiced'           // Facturada — FV creada, sin recaudo
+  | 'partial_collection' // Recaudo parcial
+  | 'available'          // Disponible para pago — recaudo total
+  | 'payment_in_process' // Pago en proceso — con Orden de Pago (Fase 3)
+  | 'paid'               // Pagada — egreso registrado (Fase 3)
+  | 'closed'             // Cerrada (Fase 3)
+
+export const INVOICE_STATUS_LABEL: Record<InvoiceStatus, string> = {
+  pending_invoice:     'Pendiente de factura',
+  invoiced:            'Facturada',
+  partial_collection:  'Recaudo parcial',
+  available:           'Disponible para pago',
+  payment_in_process:  'Pago en proceso',
+  paid:                'Pagada',
+  closed:              'Cerrada',
+}
+
+/**
+ * Estado de la participación por factura, derivado del recaudo (y del pago
+ * en fases siguientes). En Fase 2 llega hasta 'available'.
+ */
+export function deriveInvoiceStatus(ip: {
+  finto_invoice?: string | null
+  finto_invoice_value: number
+  collected: number
+  available_for_payment?: number
+  egress_voucher?: string | null
+  egress_voucher_value?: number | null
+  participation_value?: number
+  payment_order?: string | null
+}): InvoiceStatus {
+  const inv       = Number(ip.finto_invoice_value ?? 0)
+  const collected = Number(ip.collected ?? 0)
+
+  // OC generada por servicio contratado que aún no tiene factura de venta
+  if ('finto_invoice' in ip && !ip.finto_invoice
+      && !ip.egress_voucher && !ip.payment_order && collected <= 0)
+    return 'pending_invoice'
+
+  // Fase 3 (pago al tercero)
+  if (ip.egress_voucher) {
+    const paid = Number(ip.egress_voucher_value ?? 0)
+    const target = Number(ip.available_for_payment ?? ip.participation_value ?? 0)
+    return paid + 0.01 >= target && target > 0 ? 'closed' : 'paid'
+  }
+  if (ip.payment_order) return 'payment_in_process'
+
+  // Fase 2 (recaudo del cliente)
+  if (collected <= 0) return 'invoiced'
+  if (inv > 0 && collected + 0.01 >= inv) return 'available'
+  return 'partial_collection'
 }
 
 // ── Conciliación con reportes de SIIGO ───────────────────────────────────────
@@ -137,10 +161,38 @@ export function nitMatch(a: string, b: string): boolean {
   return x === y.slice(0, -1) || y === x.slice(0, -1)
 }
 
+/** Convierte un serial de fecha de Excel (46204.51…) a yyyy-mm-dd */
+export function excelSerialToISO(serial: number): string | null {
+  if (!serial || !isFinite(serial)) return null
+  // Época de Excel: 1899-12-30 (25569 días antes de la época Unix)
+  const d = new Date(Math.round((serial - 25569) * 86_400_000))
+  if (isNaN(d.getTime())) return null
+  return d.toISOString().split('T')[0]!
+}
+
+/** Extrae un número de factura (FV-…) de un texto libre; null si no hay */
+export function extractInvoiceRef(text: string): string | null {
+  const m = String(text ?? '').match(/[A-Za-z]{1,5}-?\d[\d-]*/)
+  return m ? m[0] : null
+}
+
 /** Convierte una fecha SIIGO "dd/mm/yyyy" a { iso, year, month } */
 export function parseSiigoDate(s: string): { iso: string; year: number; month: number } | null {
-  const m = String(s ?? '').trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/)
-  if (!m) return null
-  const day = m[1]!.padStart(2, '0'), month = m[2]!.padStart(2, '0'), year = m[3]!
-  return { iso: `${year}-${month}-${day}`, year: Number(year), month: Number(month) }
+  const raw = String(s ?? '').trim()
+  // Formato texto DD/MM/YYYY (o D/M/YYYY)
+  const m = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/)
+  if (m) {
+    const day = m[1]!.padStart(2, '0'), month = m[2]!.padStart(2, '0'), year = m[3]!
+    return { iso: `${year}-${month}-${day}`, year: Number(year), month: Number(month) }
+  }
+  // Serial de Excel (ej. 46235 → 2026-07-…). SIIGO exporta algunas fechas así.
+  const n = Number(raw)
+  if (Number.isFinite(n) && n > 20000 && n < 90000) {
+    const iso = excelSerialToISO(n)
+    if (iso) {
+      const [y, mo] = iso.split('-')
+      return { iso, year: Number(y), month: Number(mo) }
+    }
+  }
+  return null
 }
