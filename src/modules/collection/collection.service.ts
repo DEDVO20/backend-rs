@@ -120,7 +120,7 @@ export class CollectionService {
   // ── Debtors ───────────────────────────────────────────────────────────────
 
   static async listDebtors(query: ListDebtorsQuery, companyId: string | null) {
-    const { status, search, assigned, page, limit, contact, sort, dir } = query
+    const { status, search, assigned, socio, page, limit, contact, sort, dir } = query
     const from = (page - 1) * limit
 
     // Contacto y orden dependen de campos calculados (saldo, mora, antigüedad):
@@ -142,6 +142,7 @@ export class CollectionService {
     }
     // sin filtro de status → devuelve todos (cartera activa = vista por defecto)
     if (assigned) q = q.eq('assigned_user_id', assigned)
+    if (socio) q = q.eq('socio', socio)
     if (search) {
       q = q.or(`debtor_name.ilike.%${search}%,debtor_document.ilike.%${search}%`)
     }
@@ -225,6 +226,20 @@ export class CollectionService {
     }
 
     return { data: mappedData, total: count ?? 0, page, limit }
+  }
+
+  /** Lista los socios distintos (para el filtro de cartera) */
+  static async listSocios(companyId: string | null) {
+    let q = supabase.from('collection_debtors').select('socio').not('socio', 'is', null)
+    if (companyId) q = q.eq('company_id', companyId)
+    const { data, error } = await q
+    if (error) throw error
+    const set = new Set<string>()
+    for (const r of data ?? []) {
+      const s = String((r as any).socio ?? '').trim()
+      if (s) set.add(s)
+    }
+    return [...set].sort((a, b) => a.localeCompare(b))
   }
 
   static async getDebtor(id: string) {
@@ -816,11 +831,13 @@ export class CollectionService {
 
       let debtorId: string
 
+      const socio = row['socio']?.trim() || null
+
       if (existing) {
         debtorId = existing.id
-        // Solo actualizar nombre, no tocar status/phone/email (esos vienen de contactos)
+        // Solo actualizar nombre y socio, no tocar status/phone/email (esos vienen de contactos)
         await supabase.from('collection_debtors')
-          .update({ debtor_name })
+          .update({ debtor_name, ...(socio ? { socio } : {}) })
           .eq('id', debtorId)
       } else {
         const { data: newDebtor, error: debtorErr } = await supabase
@@ -829,6 +846,7 @@ export class CollectionService {
             company_id: companyId,
             debtor_document,
             debtor_name,
+            socio,
             status: 'pending',
             preferred_channel: 'phone',
           })

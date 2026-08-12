@@ -93,6 +93,15 @@ app.get('/debtors',
   },
 )
 
+// Socios distintos para el filtro de cartera (debe ir antes de /debtors/:id)
+app.get('/debtors/socios', async (c) => {
+  const { role, companyId: userCompanyId } = c.get('user')
+  const isStaff = ['admin', 'rs_admin', 'rs_staff'].includes(role)
+  const companyId = isStaff ? (c.req.query('company_id') ?? null) : (c.req.query('company_id') ?? userCompanyId ?? null)
+  const data = await CollectionService.listSocios(companyId)
+  return c.json(data)
+})
+
 app.get('/debtors/:id', async (c) => {
   const data = await CollectionService.getDebtor(c.req.param('id')!)
   return c.json(data)
@@ -299,7 +308,8 @@ function mapSiigoRowNew(raw: Record<string, string>): Record<string, string> | n
   return {
     debtor_document:    nit || name,   // preferir NIT; si no viene, el nombre
     debtor_name:        name,
-    seller:             (raw['Socio'] ?? '').trim(),
+    socio:              (raw['Socio'] ?? '').trim(),
+    seller:             '',
     siigo_document:     (raw['Factura'] ?? '').trim(),
     due_date:           parseSiigoDate(raw['Creación'] ?? raw['Creacion'] ?? '') || '',
     currency:           (raw['Moneda'] ?? 'COP').trim(),
