@@ -23,6 +23,7 @@ export const updateDebtorSchema = z.object({
   phone:             z.string().optional(),
   whatsapp:          z.string().optional(),
   email:             z.string().email().optional().or(z.literal('')),
+  email_contact_name: z.string().optional(),
   city:              z.string().optional(),
 })
 
@@ -68,6 +69,7 @@ export const createDebtorSchema = z.object({
   city:              z.string().optional(),
   phone:             z.string().optional(),
   email:             z.string().email().optional().or(z.literal('')),
+  email_contact_name: z.string().optional(),
   whatsapp:          z.string().optional(),
   preferred_channel: z.enum(['sms','email','whatsapp','phone','manual']).optional(),
   notes:             z.string().optional(),
