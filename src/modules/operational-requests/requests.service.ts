@@ -108,7 +108,27 @@ export class RequestsService {
     return data
   }
 
+  /** Estados finales: una vez alcanzados, el estado de la solicitud queda bloqueado. */
+  static readonly TERMINAL_STATUSES = ['resolved', 'closed', 'cancelled'] as const
+
   static async update(id: string, input: UpdateInput) {
+    // Si la solicitud ya está en un estado final, su estado no puede volver a cambiarse.
+    if (input.status !== undefined) {
+      const { data: current, error: curErr } = await supabase
+        .from('operational_requests')
+        .select('status')
+        .eq('id', id)
+        .single()
+      if (curErr) throw curErr
+
+      const isTerminal = (RequestsService.TERMINAL_STATUSES as readonly string[]).includes(current.status)
+      if (isTerminal && input.status !== current.status) {
+        const err = new Error('La solicitud está en un estado final (resuelta, cerrada o cancelada) y su estado ya no puede modificarse.') as Error & { statusCode: number }
+        err.statusCode = 409
+        throw err
+      }
+    }
+
     const extra: Record<string, unknown> = {}
     if (input.status === 'resolved') extra.completed_at = new Date().toISOString()
     if (input.status === 'closed')   extra.closed_at    = new Date().toISOString()

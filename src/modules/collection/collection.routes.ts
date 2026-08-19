@@ -65,7 +65,8 @@ app.get('/stats', async (c) => {
     if (!companyId) return c.json({ error: 'Sin empresa' }, 400)
   }
 
-  const result = await CollectionService.getStats(companyId)
+  const socio = c.req.query('socio') || null
+  const result = await CollectionService.getStats(companyId, socio)
   return c.json(result)
 })
 

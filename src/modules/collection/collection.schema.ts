@@ -1,7 +1,7 @@
 import { z } from 'zod'
 
 export const listDebtorsQuerySchema = z.object({
-  status:     z.enum(['pending','in_collection','promised','agreement','partially_paid','paid','uncontactable']).optional(),
+  status:     z.enum(['pending','in_collection','agreement','partially_paid','paid','uncontactable']).optional(),
   search:     z.string().optional(),
   assigned:   z.string().uuid().optional(),
   company_id: z.string().uuid().optional(),
@@ -16,7 +16,7 @@ export const listDebtorsQuerySchema = z.object({
 })
 
 export const updateDebtorSchema = z.object({
-  status:            z.enum(['pending','in_collection','promised','agreement','partially_paid','paid','uncontactable']).optional(),
+  status:            z.enum(['pending','in_collection','agreement','partially_paid','paid','uncontactable']).optional(),
   assigned_user_id:  z.string().uuid().nullable().optional(),
   preferred_channel: z.enum(['sms','email','whatsapp','phone','manual']).optional(),
   notes:             z.string().optional(),

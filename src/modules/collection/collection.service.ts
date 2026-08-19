@@ -50,11 +50,12 @@ function getTramoName(days: number): string {
 export class CollectionService {
   // ── Stats ─────────────────────────────────────────────────────────────────
 
-  static async getStats(companyId: string | null) {
+  static async getStats(companyId: string | null, socio: string | null = null) {
     let debtorsQ = supabase
       .from('collection_debtors')
       .select('id, status, phone, email, collection_debts(outstanding_amount, overdue_1_30, overdue_31_60, overdue_61_90, overdue_91_plus, not_yet_due)')
     if (companyId) debtorsQ = debtorsQ.eq('company_id', companyId)
+    if (socio) debtorsQ = debtorsQ.eq('socio', socio)
     const { data: debtors, error } = await debtorsQ
 
     if (error) throw error
@@ -91,6 +92,7 @@ export class CollectionService {
       .select('id, status, debtor_id, collection_debtors!inner(company_id)')
       .eq('status', 'active')
     if (companyId) agreementsQ = agreementsQ.eq('collection_debtors.company_id', companyId)
+    if (socio) agreementsQ = agreementsQ.eq('collection_debtors.socio', socio)
     const { data: agreements } = await agreementsQ
 
     // Tasks
@@ -98,6 +100,7 @@ export class CollectionService {
       .from('collection_tasks')
       .select('id, status, due_date, collection_debtors!inner(company_id)')
     if (companyId) tasksQ = tasksQ.eq('collection_debtors.company_id', companyId)
+    if (socio) tasksQ = tasksQ.eq('collection_debtors.socio', socio)
     const { data: tasks } = await tasksQ
 
     const today = new Date().toISOString().split('T')[0]
