@@ -45,23 +45,46 @@ function ocIndex(header: string[]): number {
   })
 }
 
+// Fecha de una celda: soporta "dd/mm/yyyy" y el serial numérico de Excel (46236)
+function parseDateCell(v: any): { iso: string; year: number; month: number } | null {
+  const s = String(v ?? '').trim()
+  if (!s) return null
+  if (/^\d{5}(\.\d+)?$/.test(s)) {           // serial de Excel (~40000-60000)
+    const iso = excelSerialToISO(Number(s))
+    if (!iso) return null
+    const [y, m] = iso.split('-')
+    return { iso, year: Number(y), month: Number(m) }
+  }
+  return parseSiigoDate(s)
+}
+
+/** Fila del encabezado real: el reporte de SIIGO suele traer título + empresa +
+ *  NIT antes de la fila de columnas. Busca la primera fila que tenga todas. */
+function findHeaderRow(rows: string[][], required: string[][]): number {
+  return rows.findIndex(r => {
+    const h = (r as any[]).map(String)
+    return required.every(terms => colIndex(h, ...terms) >= 0)
+  })
+}
+
 type SaleRow = { invoice: string; iso: string; year: number; month: number; nit: string; subtotal: number }
 
 /** "Ventas por vendedor" → facturas de Finto con su valor antes de IVA (Subtotal) */
 function parseSalesReport(rows: string[][]): SaleRow[] {
   if (!rows.length) return []
-  const header = rows[0]!.map(String)
+  const hIdx = findHeaderRow(rows, [['comprobante'], ['subtotal'], ['identificacion', 'nit']])
+  if (hIdx < 0) return []
+  const header = rows[hIdx]!.map(String)
   const iComp = colIndex(header, 'comprobante')
   const iDate = colIndex(header, 'fecha')
   const iNit  = colIndex(header, 'identificacion', 'nit')
   const iSub  = colIndex(header, 'subtotal')
-  if (iComp < 0 || iNit < 0 || iSub < 0) return []
 
   const out: SaleRow[] = []
-  for (const r of rows.slice(1)) {
+  for (const r of rows.slice(hIdx + 1)) {
     const comp = String(r[iComp] ?? '').trim()
     if (!comp) continue
-    const d = iDate >= 0 ? parseSiigoDate(String(r[iDate] ?? '')) : null
+    const d = iDate >= 0 ? parseDateCell(r[iDate]) : null
     out.push({
       invoice:  normalizeSiigoInvoice(comp),
       iso:      d?.iso ?? '',
@@ -79,19 +102,20 @@ type ReceiptRow = { receipt: string; iso: string; invoice: string; nit: string; 
 /** "Recibos de caja detallado por facturas" → recaudos ligados a cada factura */
 function parseReceiptsReport(rows: string[][]): ReceiptRow[] {
   if (!rows.length) return []
-  const header = rows[0]!.map(String)
+  const hIdx = findHeaderRow(rows, [['comprobante'], ['vencimiento'], ['valor']])
+  if (hIdx < 0) return []
+  const header = rows[hIdx]!.map(String)
   const iComp = colIndex(header, 'comprobante')
   const iDate = colIndex(header, 'fecha')
   const iInv  = colIndex(header, 'vencimiento')   // ← factura a la que se aplica
   const iNit  = colIndex(header, 'identificacion', 'nit')
   const iVal  = colIndex(header, 'valor')
-  if (iComp < 0 || iInv < 0 || iVal < 0) return []
 
   const out: ReceiptRow[] = []
-  for (const r of rows.slice(1)) {
+  for (const r of rows.slice(hIdx + 1)) {
     const comp = String(r[iComp] ?? '').trim()
     if (!comp) continue
-    const d = iDate >= 0 ? parseSiigoDate(String(r[iDate] ?? '')) : null
+    const d = iDate >= 0 ? parseDateCell(r[iDate]) : null
     out.push({
       receipt: comp,
       iso:     d?.iso ?? '',
