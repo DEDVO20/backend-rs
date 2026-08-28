@@ -1,7 +1,7 @@
 import { Hono }       from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import { authMiddleware } from '../../middleware/auth.js'
-import { requireModule, requireRole } from '../../middleware/requireRole.js'
+import { requireModule, requireRole, requirePermission } from '../../middleware/requireRole.js'
 import { supabase }   from '../../lib/supabase.js'
 import { auditAsync } from '../../lib/audit.js'
 import { AccountingService } from './accounting.service.js'
@@ -23,6 +23,7 @@ app.get('/master', async (c) => {
 // POST /api/accounting/master — agrega tarea y la propaga a todas las fichas
 app.post('/master',
   requireRole('admin'),
+  requirePermission('accounting', 'create'),
   zValidator('json', masterItemSchema),
   async (c) => {
     const user = c.get('user')
@@ -35,6 +36,7 @@ app.post('/master',
 // PATCH /api/accounting/master/:id
 app.patch('/master/:id',
   requireRole('admin'),
+  requirePermission('accounting', 'update'),
   zValidator('json', updateMasterItemSchema),
   async (c) => {
     const user = c.get('user')
@@ -47,6 +49,7 @@ app.patch('/master/:id',
 // DELETE /api/accounting/master/:id — elimina también las entradas en las fichas
 app.delete('/master/:id',
   requireRole('admin'),
+  requirePermission('accounting', 'delete'),
   async (c) => {
     const user = c.get('user')
     const id = c.req.param('id')!
@@ -72,6 +75,7 @@ app.get('/companies/:companyId', async (c) => {
 
 // PATCH /api/accounting/entries/:id — modificar fecha/notas de una entrada
 app.patch('/entries/:id',
+  requirePermission('accounting', 'update'),
   zValidator('json', updateEntrySchema),
   async (c) => {
     const user = c.get('user')

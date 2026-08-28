@@ -12,6 +12,7 @@ import {
   normalizeSiigoInvoice,
   nitMatch,
   parseSiigoDate,
+  parseColombianNumber,
 } from '../src/modules/participations/participations.domain.js'
 
 describe('calcParticipation', () => {
@@ -68,6 +69,24 @@ describe('validateThirdPartyInvoice', () => {
   })
   it('falla si no hay factura del tercero', () => {
     expect(validateThirdPartyInvoice(100_000, { number: null, value: null }).ok).toBe(false)
+  })
+})
+
+describe('parseColombianNumber (reporte consolidado)', () => {
+  it('punto = miles y coma = decimal', () => {
+    expect(parseColombianNumber('$33.823.175,51')).toBe(33_823_175.51)
+    expect(parseColombianNumber('$8.176.579,56')).toBe(8_176_579.56)
+    expect(parseColombianNumber('$0,00')).toBe(0)
+  })
+  it('entero sin separadores se toma tal cual (IDs)', () => {
+    expect(parseColombianNumber('11200501')).toBe(11_200_501)
+    expect(parseColombianNumber('447')).toBe(447)
+  })
+  it('tolera espacios, símbolo y vacío', () => {
+    expect(parseColombianNumber(' $ 1.234,50 ')).toBe(1_234.5)
+    expect(parseColombianNumber('')).toBe(0)
+    expect(parseColombianNumber(null)).toBe(0)
+    expect(parseColombianNumber('n/a')).toBe(0)
   })
 })
 

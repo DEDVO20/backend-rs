@@ -55,6 +55,8 @@ export const createCampaignSchema = z.object({
   debtor_ids:       z.array(z.string().uuid()).optional(),
   message_template: z.string().optional(),
   zavu_template_id: z.string().optional(),
+  // Imagen heredada de la plantilla — se incrusta en el email al enviar
+  image_url:        z.string().url().nullish(),
   company_id:       z.string().uuid().optional(),
 })
 
@@ -102,6 +104,8 @@ export const createTemplateSchema = z.object({
   is_active:          z.boolean().default(true),
   is_global:          z.boolean().default(false),
   tramo:              z.number().int().min(0).optional(),
+  // URL pública de la imagen adjunta (subida a Storage). Solo aplica a email.
+  image_url:          z.string().url().nullish(),
   // null/ausente = plantilla global; con valor = personalizada para esa empresa
   company_id:         z.string().uuid().nullable().optional(),
 })

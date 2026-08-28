@@ -4,8 +4,8 @@ import {
   calcParticipation, availableParticipation, deriveInvoiceStatus,
   formatPurchaseOrder, formatPaymentOrder, validateThirdPartyInvoice, money,
   normalizeInvoiceNumber,
-  normalizeSiigoInvoice, nitMatch, parseSiigoDate,
-  excelSerialToISO, extractInvoiceRef,
+  normalizeSiigoInvoice, nitMatch, normalizeNit, parseSiigoDate,
+  excelSerialToISO, extractInvoiceRef, parseColombianNumber,
 } from './participations.domain.js'
 import type { z }   from 'zod'
 import type {
@@ -151,6 +151,98 @@ function parsePurchasesReport(rows: string[][]): PurchaseRow[] {
     const oc  = String(r[iOc] ?? '').trim().toUpperCase()
     if (!doc && !oc) continue
     out.push({ document: doc, value: toNum(r[iVal]), oc })
+  }
+  return out
+}
+
+// ── Reporte consolidado (un solo archivo) ────────────────────────────────────
+
+/** Índice de columna por nombre exacto (sin acentos/mayúsculas); si no hay
+ *  coincidencia exacta, cae a "contiene". Evita que "Factura Venta" empareje con
+ *  "Fecha Factura Venta" o "Valor Factura Venta". */
+function findColExact(header: string[], name: string): number {
+  const target = stripAccents(name).trim()
+  const exact = header.findIndex(h => stripAccents(String(h)).trim() === target)
+  return exact >= 0 ? exact : header.findIndex(h => stripAccents(String(h)).includes(target))
+}
+
+/** Normaliza una celda de fecha a ISO (yyyy-mm-dd). Acepta texto ISO, dd/mm/yyyy
+ *  y el serial de Excel que produce el lector al abrir el archivo. */
+function toISODate(v: unknown): string {
+  if (typeof v === 'number' && Number.isFinite(v)) return excelSerialToISO(v) ?? ''
+  const s = String(v ?? '').trim()
+  if (!s) return ''
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10)
+  if (/^\d{5}(\.\d+)?$/.test(s)) return excelSerialToISO(Number(s)) ?? ''
+  return parseSiigoDate(s)?.iso ?? ''
+}
+
+/** Una línea del reporte consolidado: (FV × RC × aplicación de pago al tercero) */
+type ConsolidatedLine = {
+  clientNit: string; clientName: string
+  fvDate: string; fv: string; fvValue: number
+  terceroExpected: string; terceroNit: string
+  base: number            // participación causada (Base Servicio del Tercero)
+  rc: string; rcApplied: number; attributable: number
+  payDoc: string; payType: string; payDate: string; payApplied: number
+}
+
+/**
+ * Parsea el "INFORME_PARTICIPACIONES" consolidado. Ubica las columnas por
+ * nombre (tolera orden y columnas extra) y usa el parser de moneda colombiano.
+ * Solo devuelve líneas con FV; ignora encabezado y filas de pagos sin asignar.
+ */
+export function parseConsolidatedReport(rows: string[][]): ConsolidatedLine[] {
+  if (!rows.length) return []
+  const hIdx = rows.findIndex(r => {
+    const h = (r as any[]).map(String)
+    return findColExact(h, 'factura venta') >= 0
+      && colIndex(h, 'tercero esperado') >= 0
+      && colIndex(h, 'base servicio del tercero') >= 0
+  })
+  if (hIdx < 0) return []
+  const header = rows[hIdx]!.map(String)
+
+  const c = {
+    clientNit:   findColExact(header, 'id cliente'),
+    clientName:  findColExact(header, 'cliente'),
+    fvDate:      findColExact(header, 'fecha factura venta'),
+    fv:          findColExact(header, 'factura venta'),
+    fvValue:     findColExact(header, 'valor factura venta'),
+    terceroExp:  findColExact(header, 'tercero esperado'),
+    base:        findColExact(header, 'base servicio del tercero en factura'),
+    rc:          findColExact(header, 'recibo caja'),
+    rcApplied:   findColExact(header, 'valor aplicado rc'),
+    attributable:findColExact(header, 'valor recaudado atribuible al tercero'),
+    terceroNit:  findColExact(header, 'id tercero pagado'),
+    payType:     colIndex(header, 'tipo pago tercero'),
+    payDate:     colIndex(header, 'fecha pago tercero'),
+    payDoc:      colIndex(header, 'documento pago tercero'),
+    payApplied:  findColExact(header, 'valor pago tercero aplicado a este rc'),
+  }
+
+  const cell = (r: string[], i: number) => (i >= 0 ? String(r[i] ?? '').trim() : '')
+  const out: ConsolidatedLine[] = []
+  for (const r of rows.slice(hIdx + 1)) {
+    const fv = normalizeSiigoInvoice(cell(r, c.fv))
+    if (!fv) continue   // filas sin FV (p.ej. pagos de tercero sin asignar)
+    out.push({
+      clientNit:  cell(r, c.clientNit),
+      clientName: cell(r, c.clientName),
+      fvDate:     toISODate(c.fvDate >= 0 ? r[c.fvDate] : ''),
+      fv,
+      fvValue:    parseColombianNumber(r[c.fvValue]),
+      terceroExpected: cell(r, c.terceroExp),
+      terceroNit: cell(r, c.terceroNit),
+      base:       parseColombianNumber(r[c.base]),
+      rc:         cell(r, c.rc),
+      rcApplied:  parseColombianNumber(r[c.rcApplied]),
+      attributable: parseColombianNumber(r[c.attributable]),
+      payDoc:     cell(r, c.payDoc),
+      payType:    cell(r, c.payType),
+      payDate:    toISODate(c.payDate >= 0 ? r[c.payDate] : ''),
+      payApplied: parseColombianNumber(r[c.payApplied]),
+    })
   }
   return out
 }
@@ -866,6 +958,241 @@ export class ParticipationsService {
     }
   }
 
+  /**
+   * Importa el reporte consolidado (un solo archivo "INFORME_PARTICIPACIONES"):
+   * ventas, recaudo atribuible al tercero y pagos (RP/CC) ya conciliados. Cada
+   * (FV × tercero) se enlaza a su participación configurada y se escribe una fila
+   * en invoice_participations con los montos del reporte (se confía en el archivo).
+   * Idempotente por FV; con apply=false solo previsualiza.
+   *
+   * Reemplaza la necesidad de subir varios archivos (ventas + recibos + compras
+   * + egresos): este reporte ya trae todo cruzado.
+   */
+  static async importConsolidated(rows: string[][], apply: boolean) {
+    const lines = parseConsolidatedReport(rows)
+    if (!lines.length)
+      throw Object.assign(new Error('El reporte no tiene las columnas esperadas (Factura Venta, Tercero Esperado, Base Servicio del Tercero)'), { statusCode: 400 })
+
+    // Configuraciones activas con tercero → enlazan cada FV a su participación
+    const { data: configs, error } = await supabase
+      .from('service_participations')
+      .select('id, participation_type, percentage, fixed_value, start_date, end_date, active, has_third_party, company_service:company_services(service_value, companies(id, name, nit)), third_party:third_parties(identification, name)')
+      .eq('has_third_party', true)
+      .eq('active', true)
+    if (error) throw error
+
+    const one = (v: any) => Array.isArray(v) ? v[0] : v
+    const cfgList = (configs ?? []).map((cf: any) => {
+      const cs = one(cf.company_service); const co = one(cs?.companies); const tp = one(cf.third_party)
+      return {
+        id:            cf.id as string,
+        type:          (cf.participation_type ?? 'percentage') as 'percentage' | 'fixed',
+        percentage:    Number(cf.percentage),
+        fixed_value:   cf.fixed_value != null ? Number(cf.fixed_value) : null,
+        start_date:    cf.start_date as string | null,
+        end_date:      cf.end_date as string | null,
+        service_value: Number(cs?.service_value ?? 0),
+        company_id:    co?.id ?? null,
+        company_name:  co?.name ?? '—',
+        nit:           co?.nit ?? '',
+        tercero_nit:   String(tp?.identification ?? ''),
+        tercero_name:  stripAccents(String(tp?.name ?? '')),
+      }
+    })
+
+    // Agrupar por (FV + tercero): una FV puede repartirse entre varios terceros.
+    // Recaudo/atribuible se deduplican por RC; el pago suma cada aplicación.
+    type Group = {
+      fv: string; fvDate: string; fvValue: number
+      clientNit: string; clientName: string
+      terceroExpected: string; terceroNit: string
+      base: number
+      rcs: Map<string, { applied: number; attributable: number }>
+      payDocs: Set<string>; paid: number; payDates: string[]
+    }
+    const groups = new Map<string, Group>()
+    for (const l of lines) {
+      const terceroKey = normalizeNit(l.terceroNit) || stripAccents(l.terceroExpected)
+      if (!terceroKey) continue   // FV sin participación (código de servicio sin tercero)
+      const gk = `${normalizeInvoiceNumber(l.fv)}::${terceroKey}`
+      const g: Group = groups.get(gk) ?? {
+        fv: l.fv, fvDate: l.fvDate, fvValue: l.fvValue,
+        clientNit: l.clientNit, clientName: l.clientName,
+        terceroExpected: l.terceroExpected, terceroNit: l.terceroNit,
+        base: l.base, rcs: new Map(), payDocs: new Set(), paid: 0, payDates: [],
+      }
+      if (!g.base && l.base) g.base = l.base
+      if (!g.terceroNit && l.terceroNit) g.terceroNit = l.terceroNit
+      if (l.rc && !g.rcs.has(l.rc)) g.rcs.set(l.rc, { applied: l.rcApplied, attributable: l.attributable })
+      if (l.payApplied) g.paid += l.payApplied
+      if (l.payDoc) { g.payDocs.add(l.payDoc); if (l.payDate) g.payDates.push(l.payDate) }
+      groups.set(gk, g)
+    }
+
+    type Res = {
+      fv: string; client: string; tercero: string
+      outcome: 'matched' | 'no_config' | 'ambiguous' | 'multi_tercero'
+      participation_value?: number; collected?: number; available?: number; paid?: number
+      status?: string; note?: string
+    }
+    const results: Res[] = []
+    const toWrite: any[] = []
+    const claimedFv = new Set<string>()   // unique(finto_invoice): una FV → una fila
+
+    for (const g of groups.values()) {
+      const collected = money([...g.rcs.values()].reduce((a, r) => a + r.applied, 0))
+      const available = money([...g.rcs.values()].reduce((a, r) => a + r.attributable, 0))
+      const paid      = money(g.paid)
+
+      const inWindow = (cf: typeof cfgList[number]) =>
+        (!cf.start_date || !g.fvDate || cf.start_date <= g.fvDate) &&
+        (!cf.end_date   || !g.fvDate || cf.end_date   >= g.fvDate)
+      const terceroMatch = (cf: typeof cfgList[number]) =>
+        (!!g.terceroNit && nitMatch(cf.tercero_nit, g.terceroNit)) ||
+        (!!cf.tercero_name && cf.tercero_name === stripAccents(g.terceroExpected))
+      const candidates = cfgList.filter(cf => nitMatch(cf.nit, g.clientNit) && inWindow(cf) && terceroMatch(cf))
+
+      let cfg: typeof cfgList[number] | null = null
+      let outcome: Res['outcome'] = 'no_config'
+      let note: string | undefined
+      if (candidates.length === 1) { cfg = candidates[0]! ; outcome = 'matched' }
+      else if (candidates.length > 1) {
+        // Desempata por valor: la participación causada más cercana a la base
+        const exact = candidates.filter(cf =>
+          Math.abs(calcParticipation(cf.service_value, cf.percentage, { type: cf.type, fixedValue: cf.fixed_value }) - g.base) < 1)
+        if (exact.length === 1) { cfg = exact[0]! ; outcome = 'matched' }
+        else { outcome = 'ambiguous'; note = `${candidates.length} configuraciones del cliente para el tercero` }
+      }
+
+      const fvKey = normalizeInvoiceNumber(g.fv)
+      if (cfg && claimedFv.has(fvKey)) {
+        cfg = null; outcome = 'multi_tercero'
+        note = 'la FV tiene varios terceros; el modelo soporta uno por factura'
+      }
+
+      const res: Res = {
+        fv: g.fv, client: g.clientName || cfg?.company_name || '—',
+        tercero: g.terceroExpected || cfg?.tercero_name || '—', outcome, note,
+      }
+
+      if (cfg) {
+        claimedFv.add(fvKey)
+        const egress = g.payDocs.size ? [...g.payDocs].join(', ') : null
+        const status = deriveInvoiceStatus({
+          finto_invoice: g.fv, finto_invoice_value: g.fvValue, collected,
+          available_for_payment: available, participation_value: g.base,
+          egress_voucher: egress, egress_voucher_value: paid, payment_order: null,
+        })
+        res.participation_value = g.base
+        res.collected = collected
+        res.available = available
+        res.paid = paid
+        res.status = status
+        toWrite.push({
+          participation_id:      cfg.id,
+          company_id:            cfg.company_id,
+          finto_invoice:         g.fv,
+          finto_invoice_date:    g.fvDate || null,
+          finto_invoice_value:   g.fvValue,
+          participation_type:    cfg.type,
+          percentage:            cfg.type === 'fixed' ? 0 : cfg.percentage,
+          fixed_value:           cfg.type === 'fixed' ? cfg.fixed_value : null,
+          participation_value:   g.base,
+          collected,
+          cash_receipts:         [...g.rcs.keys()].join(', ') || null,
+          available_for_payment: available,
+          egress_voucher:        egress,
+          egress_voucher_value:  paid || null,
+          egress_voucher_date:   g.payDates.length ? [...g.payDates].sort().at(-1)! : null,
+          status,
+          _period:               g.fvDate ? g.fvDate.slice(0, 7) : null,
+        })
+      }
+      results.push(res)
+    }
+
+    let created = 0, updated = 0, attached = 0
+    if (apply && toWrite.length) {
+      // Secuencia de OC por periodo (solo para FV nuevas)
+      const seqByPeriod = new Map<string, number>()
+      const nextOc = async (period: string | null): Promise<string> => {
+        const compact = (period ?? '000000').replace('-', '')
+        if (!seqByPeriod.has(compact)) {
+          const { count } = await supabase
+            .from('invoice_participations')
+            .select('id', { count: 'exact', head: true })
+            .ilike('purchase_order', `OC-${compact}-%`)
+          seqByPeriod.set(compact, count ?? 0)
+        }
+        const seq = seqByPeriod.get(compact)! + 1
+        seqByPeriod.set(compact, seq)
+        const [y, m] = (period ?? '2026-01').split('-')
+        return formatPurchaseOrder(Number(y), Number(m), seq)
+      }
+
+      for (const w of toWrite) {
+        const period = (w._period ?? null) as string | null
+        delete w._period
+        w.period = period
+        w.updated_at = new Date().toISOString()
+
+        // 1. La FV ya existe → actualiza y conserva su OC
+        const { data: byFv } = await supabase
+          .from('invoice_participations')
+          .select('id')
+          .eq('finto_invoice', w.finto_invoice)
+          .maybeSingle()
+        if (byFv) {
+          const { error: upErr } = await supabase.from('invoice_participations').update(w).eq('id', byFv.id)
+          if (upErr) throw upErr
+          updated++
+          continue
+        }
+
+        // 2. Hay una OC mensual pendiente (sin FV) del mismo servicio y periodo →
+        //    la asocia (la OC del cron se genera antes de importar el informe)
+        let placeholder: { id: string; purchase_order: string } | null = null
+        if (period) {
+          const { data } = await supabase
+            .from('invoice_participations')
+            .select('id, purchase_order')
+            .eq('participation_id', w.participation_id)
+            .eq('period', period)
+            .is('finto_invoice', null)
+            .limit(1)
+            .maybeSingle()
+          placeholder = data as any
+        }
+        if (placeholder) {
+          w.purchase_order = placeholder.purchase_order
+          const { error: upErr } = await supabase.from('invoice_participations').update(w).eq('id', placeholder.id)
+          if (upErr) throw upErr
+          attached++
+          continue
+        }
+
+        // 3. Sin OC previa → nueva OC para la FV
+        w.purchase_order = await nextOc(period)
+        const { error: insErr } = await supabase.from('invoice_participations').insert(w)
+        if (insErr) throw insErr
+        created++
+      }
+    } else {
+      for (const w of toWrite) delete w._period
+    }
+
+    const summary = {
+      lines:         lines.length,
+      invoices:      groups.size,
+      matched:       results.filter(r => r.outcome === 'matched').length,
+      no_config:     results.filter(r => r.outcome === 'no_config').length,
+      ambiguous:     results.filter(r => r.outcome === 'ambiguous').length,
+      multi_tercero: results.filter(r => r.outcome === 'multi_tercero').length,
+      created, updated, attached,   // attached: FV pegada a una OC mensual pendiente
+    }
+    return { summary, results, applied: apply }
+  }
+
   /** Recalcula el estado de una participación por factura desde sus datos */
   static async recomputeStatus(id: string) {
     const { data: ip, error } = await supabase
@@ -965,7 +1292,7 @@ export class ParticipationsService {
   static async balances(filters: { period?: string; company_id?: string; year?: string; from?: string; to?: string }) {
     let q = supabase
       .from('invoice_participations')
-      .select('finto_invoice, finto_invoice_value, collected, participation_value, available_for_payment, egress_voucher, egress_voucher_value, company_id, companies(name), participation:service_participations(third_party:third_parties(name, identification))')
+      .select('purchase_order, period, finto_invoice, finto_invoice_value, collected, cash_receipts, participation_value, available_for_payment, egress_voucher, egress_voucher_value, company_id, companies(name), participation:service_participations(third_party:third_parties(name, identification))')
     if (filters.period)     q = q.eq('period', filters.period)
     else if (filters.year)  q = q.like('period', `${filters.year}-%`)
     if (filters.company_id) q = q.eq('company_id', filters.company_id)
@@ -974,9 +1301,14 @@ export class ParticipationsService {
     const { data, error } = await q
     if (error) throw error
     const one = (v: any) => Array.isArray(v) ? v[0] : v
+    const r2 = (n: number) => money(n)
 
-    const cxc = new Map<string, { client: string; invoiced: number; collected: number; outstanding: number; count: number }>()
-    const cxp = new Map<string, { third_party: string; nit: string; owed: number; paid: number; count: number }>()
+    type CxcItem = { purchase_order: string; period: string; finto_invoice: string; invoiced: number; collected: number; outstanding: number }
+    type CxpItem = { purchase_order: string; period: string; client: string; finto_invoice: string | null; participation_value: number; available: number; paid: number; owed: number }
+    type CxcEntry = { client: string; invoiced: number; collected: number; outstanding: number; count: number; items: CxcItem[] }
+    type CxpEntry = { third_party: string; nit: string; owed: number; paid: number; count: number; items: CxpItem[] }
+    const cxc = new Map<string, CxcEntry>()
+    const cxp = new Map<string, CxpEntry>()
     let receivable = 0, payable = 0, participationTotal = 0, availableTotal = 0, paidTotal = 0
 
     for (const r of data ?? []) {
@@ -985,6 +1317,7 @@ export class ParticipationsService {
       const part      = Number((r as any).participation_value ?? 0)
       const avail     = Number((r as any).available_for_payment ?? 0)
       const paid      = Number((r as any).egress_voucher_value ?? 0)
+      const co        = one((r as any).companies)
       participationTotal += part
       availableTotal     += avail
       paidTotal          += paid
@@ -993,10 +1326,14 @@ export class ParticipationsService {
       if ((r as any).finto_invoice) {
         const outstanding = Math.max(0, inv - collected)
         receivable += outstanding
-        const co = one((r as any).companies)
         const key = String((r as any).company_id ?? co?.name ?? '—')
-        const e = cxc.get(key) ?? { client: co?.name ?? '—', invoiced: 0, collected: 0, outstanding: 0, count: 0 }
+        const e: CxcEntry = cxc.get(key) ?? { client: co?.name ?? '—', invoiced: 0, collected: 0, outstanding: 0, count: 0, items: [] }
         e.invoiced += inv; e.collected += collected; e.outstanding += outstanding; e.count++
+        e.items.push({
+          purchase_order: (r as any).purchase_order, period: (r as any).period,
+          finto_invoice: (r as any).finto_invoice,
+          invoiced: r2(inv), collected: r2(collected), outstanding: r2(outstanding),
+        })
         cxc.set(key, e)
       }
 
@@ -1005,14 +1342,23 @@ export class ParticipationsService {
       payable += owed
       const tp = one(one((r as any).participation)?.third_party)
       const tkey = String(tp?.identification || tp?.name || '—')
-      const te = cxp.get(tkey) ?? { third_party: tp?.name ?? '—', nit: tp?.identification ?? '', owed: 0, paid: 0, count: 0 }
+      const te: CxpEntry = cxp.get(tkey) ?? { third_party: tp?.name ?? '—', nit: tp?.identification ?? '', owed: 0, paid: 0, count: 0, items: [] }
       te.owed += owed; te.paid += paid; te.count++
+      te.items.push({
+        purchase_order: (r as any).purchase_order, period: (r as any).period,
+        client: co?.name ?? '—', finto_invoice: (r as any).finto_invoice ?? null,
+        participation_value: r2(part), available: r2(avail), paid: r2(paid), owed: r2(owed),
+      })
       cxp.set(tkey, te)
     }
 
-    const r2 = (n: number) => money(n)
+    // Ordena los ítems: primero los que tienen saldo pendiente, luego por periodo
+    const byPending = (k: 'outstanding' | 'owed') => (a: any, b: any) =>
+      (b[k] > 0 ? 1 : 0) - (a[k] > 0 ? 1 : 0) || String(a.period).localeCompare(String(b.period))
+
     return {
       summary: {
+        count:               (data ?? []).length,   // # de OC/participaciones en el alcance
         participation_total: r2(participationTotal),
         available_total:     r2(availableTotal),
         paid_total:          r2(paidTotal),
@@ -1020,11 +1366,11 @@ export class ParticipationsService {
         payable_total:       r2(payable),      // lo que debemos (terceros)
       },
       receivable: [...cxc.values()]
-        .map(e => ({ ...e, invoiced: r2(e.invoiced), collected: r2(e.collected), outstanding: r2(e.outstanding) }))
+        .map(e => ({ ...e, invoiced: r2(e.invoiced), collected: r2(e.collected), outstanding: r2(e.outstanding), items: e.items.sort(byPending('outstanding')) }))
         .filter(e => e.outstanding > 0)
         .sort((a, b) => b.outstanding - a.outstanding),
       payable: [...cxp.values()]
-        .map(e => ({ ...e, owed: r2(e.owed), paid: r2(e.paid) }))
+        .map(e => ({ ...e, owed: r2(e.owed), paid: r2(e.paid), items: e.items.sort(byPending('owed')) }))
         .filter(e => e.owed > 0)
         .sort((a, b) => b.owed - a.owed),
     }

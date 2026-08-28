@@ -2,7 +2,7 @@ import { Hono }       from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import { authMiddleware } from '../../middleware/auth.js'
 import { requireModule }  from '../../middleware/requireRole.js'
-import { requireRole }    from '../../middleware/requireRole.js'
+import { requireRole, requirePermission } from '../../middleware/requireRole.js'
 import { RequestsService } from './requests.service.js'
 import {
   createRequestSchema,
@@ -41,6 +41,7 @@ app.get('/:id', async (c) => {
 
 // POST /api/requests — cualquier rol autenticado con acceso al módulo
 app.post('/',
+  requirePermission('operational_requests', 'create'),
   zValidator('json', createRequestSchema),
   async (c) => {
     const { id, companyId, role } = c.get('user')
@@ -54,6 +55,7 @@ app.post('/',
 // PATCH /api/requests/:id — solo roles internos asignan/resuelven
 app.patch('/:id',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('operational_requests', 'update'),
   zValidator('json', updateRequestSchema),
   async (c) => {
     const data = await RequestsService.update(c.req.param('id')!, c.req.valid('json'))
@@ -64,6 +66,7 @@ app.patch('/:id',
 // DELETE /api/requests/:id — solo roles internos
 app.delete('/:id',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('operational_requests', 'delete'),
   async (c) => {
     const { supabase } = await import('../../lib/supabase.js')
     const { error } = await supabase.from('operational_requests').delete().eq('id', c.req.param('id')!)

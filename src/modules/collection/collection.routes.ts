@@ -2,7 +2,7 @@ import { Hono }       from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import { authMiddleware } from '../../middleware/auth.js'
 import { requireModule }  from '../../middleware/requireRole.js'
-import { requireRole }    from '../../middleware/requireRole.js'
+import { requireRole, requirePermission } from '../../middleware/requireRole.js'
 import { supabase } from '../../lib/supabase.js'
 import { CollectionService } from './collection.service.js'
 import {
@@ -110,6 +110,7 @@ app.get('/debtors/:id', async (c) => {
 
 app.patch('/debtors/:id',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('collection', 'update'),
   zValidator('json', updateDebtorSchema),
   async (c) => {
     const data = await CollectionService.updateDebtor(c.req.param('id')!, c.req.valid('json'))
@@ -148,6 +149,7 @@ app.get('/actions',
 
 app.post('/actions',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('collection', 'create'),
   zValidator('json', createActionSchema),
   async (c) => {
     const { id, companyId: sessionCompanyId } = c.get('user')
@@ -174,6 +176,7 @@ app.get('/debtors/:id/agreements', async (c) => {
 
 app.post('/agreements',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('collection', 'create'),
   zValidator('json', createAgreementSchema),
   async (c) => {
     const { id, companyId: sessionCompanyId } = c.get('user')
@@ -209,6 +212,7 @@ app.get('/campaigns', async (c) => {
 
 app.post('/campaigns',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('collection', 'create'),
   zValidator('json', createCampaignSchema),
   async (c) => {
     const { id, companyId: sessionCompanyId } = c.get('user')
@@ -231,6 +235,7 @@ app.post('/campaigns',
 // POST /api/collection/campaigns/:id/send — disparo masivo
 app.post('/campaigns/:id/send',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('collection', 'update'),
   async (c) => {
     const data = await CollectionService.sendCampaign(c.req.param('id')!)
     return c.json(data)
@@ -431,6 +436,7 @@ function mapSiigoRow(raw: Record<string, string>): Record<string, string> {
 
 app.post('/debtors/import',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('collection', 'create'),
   async (c) => {
     const { id: createdBy, companyId: userCompanyId } = c.get('user')
     const accept = c.req.header('accept') ?? ''
@@ -520,6 +526,7 @@ app.post('/debtors/import',
 
 app.post('/contacts/import',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('collection', 'update'),
   async (c) => {
     const contentType = c.req.header('content-type') ?? ''
     if (!contentType.includes('multipart/form-data')) {
@@ -612,6 +619,7 @@ app.post('/contacts/import',
 
 app.post('/debtors',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('collection', 'create'),
   zValidator('json', createDebtorSchema),
   async (c) => {
     const { companyId } = c.get('user')
@@ -624,6 +632,7 @@ app.post('/debtors',
 // POST /api/collection/debtors/:id/debts — agregar deuda a un deudor
 app.post('/debtors/:id/debts',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('collection', 'create'),
   zValidator('json', createDebtSchema),
   async (c) => {
     const { companyId } = c.get('user')
@@ -680,8 +689,29 @@ app.get('/templates', async (c) => {
   return c.json([...localTemplates, ...zavuTemplates])
 })
 
+// POST /api/collection/templates/upload-image — sube la imagen de una plantilla
+app.post('/templates/upload-image',
+  requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('collection', 'create'),
+  async (c) => {
+    const { companyId } = c.get('user')
+    const body = await c.req.parseBody()
+    const file = body['file']
+
+    if (!(file instanceof File)) return c.json({ error: 'Se requiere un archivo en el campo "file"' }, 400)
+
+    const MAX_SIZE = 5 * 1024 * 1024  // 5 MB
+    if (file.size > MAX_SIZE) return c.json({ error: 'La imagen supera el límite de 5 MB' }, 413)
+
+    const bodyCompany = (body['company_id'] as string) || null
+    const data = await CollectionService.uploadTemplateImage(file, bodyCompany ?? companyId ?? null)
+    return c.json(data, 201)
+  },
+)
+
 app.post('/templates',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('collection', 'create'),
   zValidator('json', createTemplateSchema),
   async (c) => {
     const { companyId } = c.get('user')
@@ -695,6 +725,7 @@ app.post('/templates',
 
 app.patch('/templates/:id',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('collection', 'update'),
   zValidator('json', createTemplateSchema.partial()),
   async (c) => {
     const data = await CollectionService.updateTemplate(c.req.param('id')!, c.req.valid('json'))
@@ -704,6 +735,7 @@ app.patch('/templates/:id',
 
 app.delete('/templates/:id',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('collection', 'delete'),
   async (c) => {
     const data = await CollectionService.deleteTemplate(c.req.param('id')!)
     return c.json(data)
@@ -728,6 +760,7 @@ app.get('/tasks',
 
 app.post('/tasks',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('collection', 'create'),
   zValidator('json', createCollectionTaskSchema),
   async (c) => {
     const { companyId: sessionCompanyId } = c.get('user')
@@ -747,6 +780,7 @@ app.post('/tasks',
 
 app.patch('/tasks/:id',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('collection', 'update'),
   zValidator('json', updateCollectionTaskSchema),
   async (c) => {
     const data = await CollectionService.updateCollectionTask(c.req.param('id')!, c.req.valid('json'))
@@ -767,6 +801,7 @@ app.get('/messages',
 
 app.patch('/messages/:id/read',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('collection', 'update'),
   async (c) => {
     const data = await CollectionService.markMessageRead(c.req.param('id')!)
     return c.json(data)

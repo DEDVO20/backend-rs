@@ -3,7 +3,7 @@ import { zValidator }   from '@hono/zod-validator'
 import { z }            from 'zod'
 import { authMiddleware }     from '../../middleware/auth.js'
 import { requireModule }      from '../../middleware/requireRole.js'
-import { requireRole }        from '../../middleware/requireRole.js'
+import { requireRole, requirePermission } from '../../middleware/requireRole.js'
 import { requireOwnCompany }  from '../../middleware/requireRole.js'
 import { CompaniesService }   from './companies.service.js'
 import {
@@ -29,6 +29,7 @@ app.get('/',
 // POST /api/companies — crear empresa (admin/rs_admin)
 app.post('/',
   requireRole('admin', 'rs_admin'),
+  requirePermission('companies', 'create'),
   zValidator('json', createCompanySchema),
   async (c) => {
     const data = await CompaniesService.create(c.req.valid('json'))
@@ -54,6 +55,7 @@ app.get('/:id', async (c) => {
 
 // PATCH /api/companies/:id — rs_admin, admin o client_owner de su empresa
 app.patch('/:id',
+  requirePermission('companies', 'update'),
   zValidator('json', updateCompanySchema),
   async (c) => {
     const { role, companyId } = c.get('user')
@@ -104,6 +106,7 @@ app.post('/:id/invite',
 // DELETE /api/companies/:id/members/:userId — desactivar miembro
 app.delete('/:id/members/:userId',
   requireOwnCompany('id'),
+  requirePermission('companies', 'delete'),
   async (c) => {
     const data = await CompaniesService.deactivateMember(
       c.req.param('id')!,

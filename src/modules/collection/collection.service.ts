@@ -436,6 +436,8 @@ export class CollectionService {
     const debtorIds: string[] = campaign.debtor_ids ?? []
     const messageTemplate: string = campaign.message_template ?? ''
     const channel = (campaign.channel ?? 'whatsapp') as 'sms' | 'whatsapp' | 'email'
+    // Imagen adjunta (heredada de la plantilla) — solo se incrusta en email
+    const imageUrl: string | null = channel === 'email' ? (campaign.image_url ?? null) : null
 
     if (!debtorIds.length) {
       await supabase.from('collection_campaigns')
@@ -564,7 +566,7 @@ export class CollectionService {
           channel: channel as any,
           to: c.to,
           template: useTemplate ? 'wa-template' : 'raw-text',
-          data: { text: c.text },
+          data: { text: c.text, ...(imageUrl && { imageUrl }) },
           companyId: campaign.company_id,
           metadata: { campaignId, debtorId: c.debtorId },
           ...(useTemplate && {
@@ -691,6 +693,35 @@ export class CollectionService {
 
     if (error) throw error
     return data
+  }
+
+  // Sube la imagen de una plantilla a Storage y devuelve su URL pública.
+  static async uploadTemplateImage(file: File, companyId: string | null): Promise<{ url: string }> {
+    const ALLOWED = ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
+    if (file.type && !ALLOWED.includes(file.type)) {
+      const e = new Error('Formato no permitido. Usa JPG, PNG, WEBP o GIF.') as any
+      e.statusCode = 422
+      throw e
+    }
+
+    const ext    = (file.name.split('.').pop() ?? 'png').toLowerCase()
+    const folder = companyId ?? 'global'
+    const path   = `collection-templates/${folder}/${Date.now()}-${crypto.randomUUID()}.${ext}`
+
+    const buffer = await file.arrayBuffer()
+
+    const { error: storageError } = await supabase.storage
+      .from('documents')
+      .upload(path, buffer, {
+        contentType:  file.type || 'image/png',
+        cacheControl: '3600',
+        upsert:       false,
+      })
+
+    if (storageError) throw storageError
+
+    const { data } = await supabase.storage.from('documents').getPublicUrl(path)
+    return { url: data.publicUrl }
   }
 
   // ── Collection Tasks ──────────────────────────────────────────────────────

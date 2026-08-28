@@ -2,7 +2,7 @@ import { Hono }          from 'hono'
 import { zValidator }    from '@hono/zod-validator'
 import { authMiddleware }    from '../../middleware/auth.js'
 import { requireModule }     from '../../middleware/requireRole.js'
-import { requireRole }       from '../../middleware/requireRole.js'
+import { requireRole, requirePermission } from '../../middleware/requireRole.js'
 import { OnboardingService } from './onboarding.service.js'
 import { DocumentsService }  from '../documents/documents.service.js'
 import { supabase }          from '../../lib/supabase.js'
@@ -125,6 +125,7 @@ app.post('/:id/kyc/documents', async (c) => {
 app.patch('/:id/kyc/documents/:docId',
   authMiddleware,
   requireRole('rs_admin', 'admin'),
+  requirePermission('onboarding', 'update'),
   zValidator('json', reviewKycDocSchema),
   async (c) => {
     const { id: userId } = c.get('user')
@@ -171,6 +172,7 @@ app.post('/:id/submit', async (c) => {
 // POST /api/onboarding/:id/approve — solo rs_admin y admin
 app.post('/:id/approve',
   requireRole('rs_admin', 'admin'),
+  requirePermission('onboarding', 'update'),
   async (c) => {
     const { id: userId } = c.get('user')
     const data = await OnboardingService.approve(c.req.param('id')!, userId)
@@ -181,6 +183,7 @@ app.post('/:id/approve',
 // POST /api/onboarding/:id/reject — solo rs_admin y admin
 app.post('/:id/reject',
   requireRole('rs_admin', 'admin'),
+  requirePermission('onboarding', 'update'),
   zValidator('json', rejectOnboardingSchema),
   async (c) => {
     const { id: userId } = c.get('user')
@@ -192,6 +195,7 @@ app.post('/:id/reject',
 // POST /api/onboarding/:id/request-correction — solo rs_admin y admin
 app.post('/:id/request-correction',
   requireRole('rs_admin', 'admin'),
+  requirePermission('onboarding', 'update'),
   async (c) => {
     const { id: userId } = c.get('user')
     const { notes } = await c.req.json<{ notes: string }>()
@@ -204,6 +208,7 @@ app.post('/:id/request-correction',
 app.post('/:id/resend-invitation',
   authMiddleware,
   requireRole('rs_admin', 'admin'),
+  requirePermission('onboarding', 'update'),
   async (c) => {
     const onboardingId = c.req.param('id')!
 

@@ -1,6 +1,6 @@
 import type { Context, Next } from 'hono'
-import type { Role, Module } from '../lib/permissions.js'
-import { canAccess } from '../lib/permissions.js'
+import type { Role, Module, Action } from '../lib/permissions.js'
+import { canAccess, can } from '../lib/permissions.js'
 
 /**
  * Restringe una ruta a uno o más roles específicos.
@@ -19,7 +19,7 @@ export function requireRole(...roles: Role[]) {
 }
 
 /**
- * Restringe una ruta según la tabla MODULE_PERMISSIONS.
+ * Restringe una ruta según los permisos del rol (acción 'view').
  * Usar en el nivel del router para proteger módulos completos.
  *
  * @example
@@ -28,8 +28,27 @@ export function requireRole(...roles: Role[]) {
 export function requireModule(module: Module) {
   return async (c: Context, next: Next) => {
     const { role } = c.get('user')
-    if (!canAccess(role, module)) {
+    if (!(await canAccess(role, module))) {
       return c.json({ error: `Módulo '${module}' no disponible para tu rol` }, 403)
+    }
+    await next()
+  }
+}
+
+/**
+ * Restringe una ruta a una acción concreta (crear/editar/eliminar) sobre un módulo.
+ * Usar en rutas de escritura para respetar los permisos por acción del rol.
+ *
+ * @example
+ * app.post('/', requirePermission('collection', 'create'), handler)
+ * app.patch('/:id', requirePermission('collection', 'update'), handler)
+ * app.delete('/:id', requirePermission('collection', 'delete'), handler)
+ */
+export function requirePermission(module: Module, action: Action) {
+  return async (c: Context, next: Next) => {
+    const { role } = c.get('user')
+    if (!(await can(role, module, action))) {
+      return c.json({ error: `Acción '${action}' no permitida en '${module}' para tu rol` }, 403)
     }
     await next()
   }

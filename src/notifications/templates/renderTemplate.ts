@@ -168,11 +168,18 @@ const templates: Record<string, Builder> = {
   }),
 
   // ── Texto libre (campañas masivas) ───────────────────────────────────────
-  'raw-text': (d) => ({
-    subject: str(d.subject ?? 'Mensaje'),
-    html: layout('Mensaje', `<p>${str(d.text).replace(/\n/g, '<br>')}</p>`),
-    text: str(d.text),
-  }),
+  'raw-text': (d) => {
+    const imageUrl = str(d.imageUrl)
+    const imageBlock = imageUrl
+      ? `<img src="${imageUrl}" alt="" style="max-width:100%;height:auto;border-radius:8px;margin:16px 0;display:block" />`
+      : ''
+    return {
+      subject: str(d.subject ?? 'Mensaje'),
+      html: layout('Mensaje', `<p>${str(d.text).replace(/\n/g, '<br>')}</p>${imageBlock}`),
+      // El plain-text no soporta imágenes: se añade el enlace como respaldo
+      text: imageUrl ? `${str(d.text)}\n\n${imageUrl}` : str(d.text),
+    }
+  },
 
   // ── Webhooks / mensajes entrantes ─────────────────────────────────────────
   'inbound-message': (d) => ({

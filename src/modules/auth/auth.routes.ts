@@ -3,7 +3,7 @@ import { zValidator }   from '@hono/zod-validator'
 import { z }            from 'zod'
 import { supabasePublic, supabase } from '../../lib/supabase.js'
 import { authMiddleware }           from '../../middleware/auth.js'
-import { getModulesForRole }        from '../../lib/permissions.js'
+import { getModulesForRole, getPermissionsForRole } from '../../lib/permissions.js'
 import { auditAsync }               from '../../lib/audit.js'
 import { rateLimiter }              from '../../middleware/rateLimiter.js'
 import { logger }                   from '../../lib/logger.js'
@@ -211,8 +211,11 @@ app.post('/reset-password',
 // GET /auth/me
 app.get('/me', authMiddleware, async (c) => {
   const { id, role, companyId } = c.get('user')
-  const modules = getModulesForRole(role)
-  return c.json({ id, role, companyId, modules })
+  const [modules, permissions] = await Promise.all([
+    getModulesForRole(role),
+    getPermissionsForRole(role),
+  ])
+  return c.json({ id, role, companyId, modules, permissions })
 })
 
 export const authRoutes = app

@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { zValidator } from '@hono/zod-validator'
 import { authMiddleware } from '../../middleware/auth.js'
 import { requireModule } from '../../middleware/requireRole.js'
-import { requireRole } from '../../middleware/requireRole.js'
+import { requireRole, requirePermission } from '../../middleware/requireRole.js'
 import { TasksService } from './tasks.service.js'
 import {
   listTasksQuerySchema,
@@ -72,6 +72,7 @@ app.get('/templates',
 
 app.post('/templates',
   requireRole('admin', 'rs_admin'),
+  requirePermission('tasks', 'create'),
   zValidator('json', templateSchema),
   async (c) => {
     const { data, error } = await supabase
@@ -86,6 +87,7 @@ app.post('/templates',
 
 app.patch('/templates/:id',
   requireRole('admin', 'rs_admin'),
+  requirePermission('tasks', 'update'),
   zValidator('json', templateSchema.partial()),
   async (c) => {
     const { data, error } = await supabase
@@ -101,6 +103,7 @@ app.patch('/templates/:id',
 
 app.delete('/templates/:id',
   requireRole('admin', 'rs_admin'),
+  requirePermission('tasks', 'delete'),
   async (c) => {
     const { error } = await supabase
       .from('task_templates')
@@ -134,6 +137,7 @@ app.get('/:id', async (c) => {
 // POST /api/tasks — solo roles internos
 app.post('/',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('tasks', 'create'),
   zValidator('json', createTaskSchema),
   async (c) => {
     const data = await TasksService.create(c.req.valid('json'))
@@ -143,6 +147,7 @@ app.post('/',
 
 // PATCH /api/tasks/:id — estado y documento adjunto
 app.patch('/:id',
+  requirePermission('tasks', 'update'),
   zValidator('json', updateTaskSchema),
   async (c) => {
     const { role } = c.get('user')
@@ -174,6 +179,7 @@ app.patch('/:id',
 // owner_type y documento requerido, con motivo obligatorio y audit log
 app.post('/:id/close',
   requireRole('admin', 'rs_admin'),
+  requirePermission('tasks', 'update'),
   zValidator('json', closeTaskSchema),
   async (c) => {
     const user = c.get('user')
@@ -196,6 +202,7 @@ app.post('/:id/close',
 // DELETE /api/tasks/:id — solo roles internos
 app.delete('/:id',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('tasks', 'delete'),
   async (c) => {
     const { supabase } = await import('../../lib/supabase.js')
     const { error } = await supabase.from('tasks').delete().eq('id', c.req.param('id')!)

@@ -1,7 +1,7 @@
 import { Hono }       from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import { authMiddleware } from '../../middleware/auth.js'
-import { requireModule, requireRole } from '../../middleware/requireRole.js'
+import { requireModule, requireRole, requirePermission } from '../../middleware/requireRole.js'
 import { auditAsync } from '../../lib/audit.js'
 import { ParticipationsService } from './participations.service.js'
 import {
@@ -23,6 +23,7 @@ app.get('/third-parties', async (c) => {
 })
 
 app.post('/third-parties',
+  requirePermission('participations', 'create'),
   zValidator('json', thirdPartySchema),
   async (c) => {
     const user = c.get('user')
@@ -33,6 +34,7 @@ app.post('/third-parties',
 )
 
 app.patch('/third-parties/:id',
+  requirePermission('participations', 'update'),
   zValidator('json', updateThirdPartySchema),
   async (c) => {
     const data = await ParticipationsService.updateThirdParty(c.req.param('id')!, c.req.valid('json'))
@@ -48,6 +50,7 @@ app.get('/company/:companyId', async (c) => {
 })
 
 app.put('/config',
+  requirePermission('participations', 'update'),
   zValidator('json', upsertParticipationSchema),
   async (c) => {
     const user = c.get('user')
@@ -152,6 +155,7 @@ app.get('/conciliation/export', async (c) => {
 // PATCH /api/participations/invoices/:id/third-party — factura del tercero (+OP)
 app.patch('/invoices/:id/third-party',
   requireRole('admin', 'rs_admin', 'contador'),
+  requirePermission('participations', 'update'),
   zValidator('json', thirdPartyInvoiceSchema),
   async (c) => {
     const user = c.get('user')
@@ -164,6 +168,7 @@ app.patch('/invoices/:id/third-party',
 // PATCH /api/participations/invoices/:id/egress — comprobante de egreso (pago)
 app.patch('/invoices/:id/egress',
   requireRole('admin', 'rs_admin', 'contador'),
+  requirePermission('participations', 'update'),
   zValidator('json', egressSchema),
   async (c) => {
     const user = c.get('user')
@@ -177,6 +182,7 @@ app.patch('/invoices/:id/egress',
 // aplica el recaudo. multipart: file_sales, file_receipts, apply
 app.post('/process-siigo',
   requireRole('admin', 'rs_admin'),
+  requirePermission('participations', 'create'),
   async (c) => {
     const ct = c.req.header('content-type') ?? ''
     if (!ct.includes('multipart/form-data'))
@@ -215,6 +221,7 @@ app.post('/process-siigo',
 // "Movimiento por cuenta contable". multipart: file, apply
 app.post('/import-egresos',
   requireRole('admin', 'rs_admin', 'contador'),
+  requirePermission('participations', 'update'),
   async (c) => {
     const ct = c.req.header('content-type') ?? ''
     if (!ct.includes('multipart/form-data'))
@@ -245,6 +252,7 @@ app.post('/import-egresos',
 // tercero) y las concilia por OC (+OP). multipart: file, apply
 app.post('/import-purchases',
   requireRole('admin', 'rs_admin', 'contador'),
+  requirePermission('participations', 'update'),
   async (c) => {
     const ct = c.req.header('content-type') ?? ''
     if (!ct.includes('multipart/form-data'))
@@ -271,10 +279,47 @@ app.post('/import-purchases',
   },
 )
 
+// POST /api/participations/import-consolidado — importa el reporte consolidado
+// (un solo archivo): ventas + recaudo + pagos al tercero ya cruzados. Reemplaza
+// la necesidad de subir varios archivos. multipart: file, apply
+app.post('/import-consolidado',
+  requireRole('admin', 'rs_admin', 'contador'),
+  requirePermission('participations', 'update'),
+  async (c) => {
+    const ct = c.req.header('content-type') ?? ''
+    if (!ct.includes('multipart/form-data'))
+      return c.json({ error: 'Se requiere multipart/form-data con el campo "file"' }, 400)
+    const form  = await c.req.formData()
+    const file  = form.get('file')
+    const apply = String(form.get('apply') ?? '') === 'true'
+    if (!(file instanceof File)) return c.json({ error: 'Falta el archivo' }, 400)
+
+    const { read, utils } = await import('xlsx')
+    let rows: string[][]
+    try {
+      const isCsv = (file.name ?? '').toLowerCase().endsWith('.csv')
+      // raw:true en CSV conserva el texto original (fechas ISO y montos en formato
+      // colombiano "$1.234,56"); si no, el lector coacciona algunas celdas y rompe
+      // el parseo. En xlsx los valores ya vienen tipados (parseColombianNumber y
+      // toISODate manejan number/serial).
+      const wb = isCsv ? read(await file.text(), { type: 'string', raw: true }) : read(await file.arrayBuffer(), { type: 'array' })
+      rows = utils.sheet_to_json<string[]>(wb.Sheets[wb.SheetNames[0]!]!, { header: 1, defval: '' })
+    } catch {
+      return c.json({ error: 'No se pudo leer el archivo' }, 400)
+    }
+
+    const user = c.get('user')
+    const result = await ParticipationsService.importConsolidated(rows, apply)
+    if (apply) auditAsync({ action: 'update', resource: 'invoice_participations', metadata: { source: 'siigo-consolidado', ...result.summary }, user, c })
+    return c.json(result)
+  },
+)
+
 // POST /api/participations/generate-monthly — genera la OC del mes para cada
 // servicio contratado con tercero. Body opcional: { period: "YYYY-MM" }.
 app.post('/generate-monthly',
   requireRole('admin', 'rs_admin'),
+  requirePermission('participations', 'create'),
   async (c) => {
     let period: string | undefined
     try {

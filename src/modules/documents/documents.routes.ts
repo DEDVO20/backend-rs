@@ -2,7 +2,7 @@ import { Hono }       from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import { authMiddleware } from '../../middleware/auth.js'
 import { requireModule }  from '../../middleware/requireRole.js'
-import { requireRole }    from '../../middleware/requireRole.js'
+import { requireRole, requirePermission } from '../../middleware/requireRole.js'
 import { DocumentsService } from './documents.service.js'
 import {
   listDocumentsQuerySchema,
@@ -76,7 +76,7 @@ app.get('/:id/download', async (c) => {
 })
 
 // POST /api/documents/upload-url — genera URL firmada para upload directo
-app.post('/upload-url', async (c) => {
+app.post('/upload-url', requirePermission('documents', 'create'), async (c) => {
   const { companyId } = c.get('user')
   if (!companyId) return c.json({ error: 'Sin empresa asignada' }, 400)
 
@@ -102,7 +102,7 @@ app.post('/upload-url', async (c) => {
 })
 
 // POST /api/documents/confirm-upload — registra el documento después del upload directo
-app.post('/confirm-upload', async (c) => {
+app.post('/confirm-upload', requirePermission('documents', 'create'), async (c) => {
   const { id: uploadedBy, companyId } = c.get('user')
   if (!companyId) return c.json({ error: 'Sin empresa asignada' }, 400)
 
@@ -134,6 +134,7 @@ app.post('/confirm-upload', async (c) => {
 
 // POST /api/documents/upload — sube archivo a Storage
 app.post('/upload',
+  requirePermission('documents', 'create'),
   async (c) => {
     const { id, companyId: userCompanyId, role } = c.get('user')
     const isStaff = ['admin', 'rs_admin', 'rs_staff'].includes(role)
@@ -169,6 +170,7 @@ app.post('/upload',
 // POST /api/documents — crear registro con metadata (cuando el archivo ya está en Storage)
 app.post('/',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('documents', 'create'),
   zValidator('json', createDocumentSchema),
   async (c) => {
     const { id, companyId } = c.get('user')
@@ -181,6 +183,7 @@ app.post('/',
 // PATCH /api/documents/:id
 app.patch('/:id',
   requireRole('admin', 'rs_admin', 'rs_staff'),
+  requirePermission('documents', 'update'),
   zValidator('json', updateDocumentSchema),
   async (c) => {
     const data = await DocumentsService.update(c.req.param('id')!, c.req.valid('json'))
@@ -191,6 +194,7 @@ app.patch('/:id',
 // DELETE /api/documents/:id — elimina registro y archivo de Storage
 app.delete('/:id',
   requireRole('admin', 'rs_admin'),
+  requirePermission('documents', 'delete'),
   async (c) => {
     await DocumentsService.deleteWithFile(c.req.param('id')!)
     return c.json({ ok: true })

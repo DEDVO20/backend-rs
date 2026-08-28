@@ -176,6 +176,24 @@ export function extractInvoiceRef(text: string): string | null {
   return m ? m[0] : null
 }
 
+/**
+ * Parsea un número en formato colombiano a `number`: el punto es separador de
+ * miles y la coma el decimal ("$33.823.175,51" → 33823175.51). Ignora símbolos
+ * de moneda y espacios. Devuelve 0 si no es numérico.
+ * Nota: pensado para el reporte consolidado (todos los montos con coma decimal);
+ * un valor sin coma se toma como entero ("11200501" → 11200501).
+ */
+export function parseColombianNumber(v: unknown): number {
+  // Si el lector (xlsx) ya lo interpretó como número, se usa tal cual: aplicar el
+  // parseo colombiano a "758539.56" quitaría el punto y daría 75853956.
+  if (typeof v === 'number') return Number.isFinite(v) ? money(v) : 0
+  const s = String(v ?? '').replace(/[^\d.,-]/g, '').trim()
+  if (!s) return 0
+  const norm = s.replace(/\./g, '').replace(',', '.')
+  const n = Number(norm)
+  return Number.isFinite(n) ? money(n) : 0
+}
+
 /** Convierte una fecha SIIGO "dd/mm/yyyy" a { iso, year, month } */
 export function parseSiigoDate(s: string): { iso: string; year: number; month: number } | null {
   const raw = String(s ?? '').trim()

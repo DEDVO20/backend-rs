@@ -30,6 +30,7 @@ import { accountingRoutes } from './modules/accounting/accounting.routes.js'
 import { participationsRoutes } from './modules/participations/participations.routes.js'
 import { documentsRoutes }  from './modules/documents/documents.routes.js'
 import { auditRoutes }      from './modules/audit/audit.routes.js'
+import { rolesRoutes }      from './modules/roles/roles.routes.js'
 
 const app = new Hono()
 
@@ -110,6 +111,7 @@ app.route('/api/accounting',  accountingRoutes)
 app.route('/api/participations', participationsRoutes)
 app.route('/api/documents',   documentsRoutes)
 app.route('/api/audit',       auditRoutes)
+app.route('/api/roles',       rolesRoutes)
 
 // ── 404 catch-all ─────────────────────────────────────────────────────────────
 app.notFound((c) => c.json({ error: 'Ruta no encontrada' }, 404))
