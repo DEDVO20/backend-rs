@@ -16,6 +16,9 @@ export const upsertParticipationSchema = z.object({
   service_value:      z.number().nonnegative(),          // valor mensual antes de IVA
   has_third_party:    z.boolean(),                       // "Tiene tercero"
   third_party_id:     z.string().uuid().nullable().optional(),
+  // "Tipo" de contrato: servicio (comisión) o mandato (porción del mandante desde
+  // la cuenta 28150601 en SIIGO). Ver participations.domain.ContractType.
+  contract_type:      z.enum(['servicio', 'mandato']).default('servicio'),
   participation_type: z.enum(['percentage', 'fixed']).default('percentage'),
   percentage:         z.number().min(0).max(100).optional(),
   fixed_value:        z.number().nonnegative().nullable().optional(),
@@ -28,26 +31,26 @@ export const upsertParticipationSchema = z.object({
 ).refine(
   v => {
     if (!v.has_third_party) return true
+    // Mandato: el monto lo aporta SIIGO (cuenta 28150601); el % es la comisión de
+    // la firma, informativa, y no se exige.
+    if (v.contract_type === 'mandato') return true
     if (v.participation_type === 'fixed') return (v.fixed_value ?? 0) > 0
     return v.percentage !== undefined
   },
   { message: 'Indica el porcentaje, o el valor fijo si el tipo es fijo' },
 )
 
-// Fase 3: factura del tercero y comprobante de egreso
-export const thirdPartyInvoiceSchema = z.object({
-  third_party_invoice:       z.string().min(1).max(60),
-  third_party_invoice_date:  z.string().date().nullable().optional(),
-  third_party_invoice_value: z.number().nonnegative(),
-})
-
-export const egressSchema = z.object({
-  egress_voucher:       z.string().min(1).max(60),
-  egress_voucher_date:  z.string().date().nullable().optional(),
-  egress_voucher_value: z.number().nonnegative(),
-})
-
 export const generateParticipationsSchema = z.object({
   year:  z.coerce.number().int().min(2020).max(2100).optional(),
   month: z.coerce.number().int().min(1).max(12).optional(),
+})
+
+// Cuentas contables del import (prefijos; admite varios separados por "|")
+const acct = z.string().trim().min(1).max(120).regex(/^[0-9|]+$/, 'Solo dígitos y "|"')
+export const accountSettingsSchema = z.object({
+  income_account:        acct,
+  mandate_account:       acct,
+  receivable_account:    acct,
+  third_invoice_account: acct,
+  payment_account:       acct,
 })

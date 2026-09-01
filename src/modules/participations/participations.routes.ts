@@ -6,8 +6,7 @@ import { auditAsync } from '../../lib/audit.js'
 import { ParticipationsService } from './participations.service.js'
 import {
   thirdPartySchema, updateThirdPartySchema,
-  upsertParticipationSchema,
-  thirdPartyInvoiceSchema, egressSchema,
+  upsertParticipationSchema, accountSettingsSchema,
 } from './participations.schema.js'
 
 const app = new Hono()
@@ -128,12 +127,12 @@ app.get('/conciliation/export', async (c) => {
   })
 
   const header = [
-    'Mes', 'Cliente', 'NIT cliente', 'Venta', 'OC', 'Tercero', 'NIT tercero', 'Participación',
+    'Mes', 'Cliente', 'NIT cliente', 'Venta', 'Nota crédito', 'Nota débito', 'Neto', 'OC', 'Tercero', 'NIT tercero', 'Participación',
     '# F venta', '$ F venta', 'RC', '$ Recaudo',
     '# F compra', '$ F compra', 'RP', '$ Pago', 'Estado',
   ]
   const aoa: (string | number)[][] = [header, ...rows.map((r: any) => [
-    r.mes ?? '', r.cliente ?? '', r.nit_cliente ?? '', r.venta ?? 0, r.oc ?? '', r.tercero ?? '', r.nit_tercero ?? '', r.participacion ?? 0,
+    r.mes ?? '', r.cliente ?? '', r.nit_cliente ?? '', r.venta ?? 0, r.nota_credito ?? 0, r.nota_debito ?? 0, r.neto ?? 0, r.oc ?? '', r.tercero ?? '', r.nit_tercero ?? '', r.participacion ?? 0,
     r.f_venta ?? '', r.f_venta_valor ?? 0, r.rc ?? '', r.recaudo ?? 0,
     r.f_compra ?? '', r.f_compra_valor ?? 0, r.rp ?? '', r.pago ?? 0, r.estado ?? '',
   ])]
@@ -152,74 +151,11 @@ app.get('/conciliation/export', async (c) => {
   })
 })
 
-// PATCH /api/participations/invoices/:id/third-party — factura del tercero (+OP)
-app.patch('/invoices/:id/third-party',
-  requireRole('admin', 'rs_admin', 'contador'),
-  requirePermission('participations', 'update'),
-  zValidator('json', thirdPartyInvoiceSchema),
-  async (c) => {
-    const user = c.get('user')
-    const result = await ParticipationsService.registerThirdPartyInvoice(c.req.param('id')!, c.req.valid('json'))
-    auditAsync({ action: 'update', resource: 'invoice_participations', resource_id: c.req.param('id')!, metadata: { third_party_invoice: c.req.valid('json').third_party_invoice, payment_order: result.payment_order }, user, c })
-    return c.json(result)
-  },
-)
-
-// PATCH /api/participations/invoices/:id/egress — comprobante de egreso (pago)
-app.patch('/invoices/:id/egress',
-  requireRole('admin', 'rs_admin', 'contador'),
-  requirePermission('participations', 'update'),
-  zValidator('json', egressSchema),
-  async (c) => {
-    const user = c.get('user')
-    const result = await ParticipationsService.registerEgress(c.req.param('id')!, c.req.valid('json'))
-    auditAsync({ action: 'update', resource: 'invoice_participations', resource_id: c.req.param('id')!, metadata: { egress_voucher: c.req.valid('json').egress_voucher }, user, c })
-    return c.json(result)
-  },
-)
-
-// POST /api/participations/process-siigo — crea participaciones por factura y
-// aplica el recaudo. multipart: file_sales, file_receipts, apply
-app.post('/process-siigo',
-  requireRole('admin', 'rs_admin'),
-  requirePermission('participations', 'create'),
-  async (c) => {
-    const ct = c.req.header('content-type') ?? ''
-    if (!ct.includes('multipart/form-data'))
-      return c.json({ error: 'Se requiere multipart/form-data con file_sales y file_receipts' }, 400)
-
-    const form  = await c.req.formData()
-    const sales = form.get('file_sales')
-    const rcs   = form.get('file_receipts')
-    const apply = String(form.get('apply') ?? '') === 'true'
-    if (!(sales instanceof File) || !(rcs instanceof File))
-      return c.json({ error: 'Faltan los archivos file_sales y file_receipts' }, 400)
-
-    const { read, utils } = await import('xlsx')
-    const readRows = async (f: File): Promise<string[][]> => {
-      const isCsv = (f.name ?? '').toLowerCase().endsWith('.csv')
-      const wb = isCsv ? read(await f.text(), { type: 'string' }) : read(await f.arrayBuffer(), { type: 'array' })
-      return utils.sheet_to_json<string[]>(wb.Sheets[wb.SheetNames[0]!]!, { header: 1, defval: '' })
-    }
-
-    let salesRows: string[][], receiptRows: string[][]
-    try {
-      salesRows   = await readRows(sales)
-      receiptRows = await readRows(rcs)
-    } catch {
-      return c.json({ error: 'No se pudieron leer los archivos' }, 400)
-    }
-
-    const user = c.get('user')
-    const result = await ParticipationsService.processSiigo({ salesRows, receiptRows, apply })
-    if (apply) auditAsync({ action: 'update', resource: 'invoice_participations', metadata: { source: 'siigo', ...result.summary }, user, c })
-    return c.json(result)
-  },
-)
-
-// POST /api/participations/import-egresos — importa pagos (RP) desde el reporte
-// "Movimiento por cuenta contable". multipart: file, apply
-app.post('/import-egresos',
+// POST /api/participations/import-movimiento — fuente única del ciclo de
+// participaciones. Importa el reporte "Movimiento por cuenta contable" y, según
+// la cuenta + comprobante, arma ventas (participación servicio/mandato), recaudo,
+// factura del tercero y pago. multipart: file, apply
+app.post('/import-movimiento',
   requireRole('admin', 'rs_admin', 'contador'),
   requirePermission('participations', 'update'),
   async (c) => {
@@ -235,73 +171,6 @@ app.post('/import-egresos',
     let rows: string[][]
     try {
       const isCsv = (file.name ?? '').toLowerCase().endsWith('.csv')
-      const wb = isCsv ? read(await file.text(), { type: 'string' }) : read(await file.arrayBuffer(), { type: 'array' })
-      rows = utils.sheet_to_json<string[]>(wb.Sheets[wb.SheetNames[0]!]!, { header: 1, defval: '' })
-    } catch {
-      return c.json({ error: 'No se pudo leer el archivo' }, 400)
-    }
-
-    const user = c.get('user')
-    const result = await ParticipationsService.importEgresos(rows, apply)
-    if (apply) auditAsync({ action: 'update', resource: 'invoice_participations', metadata: { source: 'siigo-egresos', ...result.summary }, user, c })
-    return c.json(result)
-  },
-)
-
-// POST /api/participations/import-purchases — importa facturas de compra (del
-// tercero) y las concilia por OC (+OP). multipart: file, apply
-app.post('/import-purchases',
-  requireRole('admin', 'rs_admin', 'contador'),
-  requirePermission('participations', 'update'),
-  async (c) => {
-    const ct = c.req.header('content-type') ?? ''
-    if (!ct.includes('multipart/form-data'))
-      return c.json({ error: 'Se requiere multipart/form-data con el campo "file"' }, 400)
-    const form  = await c.req.formData()
-    const file  = form.get('file')
-    const apply = String(form.get('apply') ?? '') === 'true'
-    if (!(file instanceof File)) return c.json({ error: 'Falta el archivo' }, 400)
-
-    const { read, utils } = await import('xlsx')
-    let rows: string[][]
-    try {
-      const isCsv = (file.name ?? '').toLowerCase().endsWith('.csv')
-      const wb = isCsv ? read(await file.text(), { type: 'string' }) : read(await file.arrayBuffer(), { type: 'array' })
-      rows = utils.sheet_to_json<string[]>(wb.Sheets[wb.SheetNames[0]!]!, { header: 1, defval: '' })
-    } catch {
-      return c.json({ error: 'No se pudo leer el archivo' }, 400)
-    }
-
-    const user = c.get('user')
-    const result = await ParticipationsService.importPurchases(rows, apply)
-    if (apply) auditAsync({ action: 'update', resource: 'invoice_participations', metadata: { source: 'siigo-compras', ...result.summary }, user, c })
-    return c.json(result)
-  },
-)
-
-// POST /api/participations/import-consolidado — importa el reporte consolidado
-// (un solo archivo): ventas + recaudo + pagos al tercero ya cruzados. Reemplaza
-// la necesidad de subir varios archivos. multipart: file, apply
-app.post('/import-consolidado',
-  requireRole('admin', 'rs_admin', 'contador'),
-  requirePermission('participations', 'update'),
-  async (c) => {
-    const ct = c.req.header('content-type') ?? ''
-    if (!ct.includes('multipart/form-data'))
-      return c.json({ error: 'Se requiere multipart/form-data con el campo "file"' }, 400)
-    const form  = await c.req.formData()
-    const file  = form.get('file')
-    const apply = String(form.get('apply') ?? '') === 'true'
-    if (!(file instanceof File)) return c.json({ error: 'Falta el archivo' }, 400)
-
-    const { read, utils } = await import('xlsx')
-    let rows: string[][]
-    try {
-      const isCsv = (file.name ?? '').toLowerCase().endsWith('.csv')
-      // raw:true en CSV conserva el texto original (fechas ISO y montos en formato
-      // colombiano "$1.234,56"); si no, el lector coacciona algunas celdas y rompe
-      // el parseo. En xlsx los valores ya vienen tipados (parseColombianNumber y
-      // toISODate manejan number/serial).
       const wb = isCsv ? read(await file.text(), { type: 'string', raw: true }) : read(await file.arrayBuffer(), { type: 'array' })
       rows = utils.sheet_to_json<string[]>(wb.Sheets[wb.SheetNames[0]!]!, { header: 1, defval: '' })
     } catch {
@@ -309,9 +178,28 @@ app.post('/import-consolidado',
     }
 
     const user = c.get('user')
-    const result = await ParticipationsService.importConsolidated(rows, apply)
-    if (apply) auditAsync({ action: 'update', resource: 'invoice_participations', metadata: { source: 'siigo-consolidado', ...result.summary }, user, c })
+    const result = await ParticipationsService.importMovimiento(rows, apply)
+    if (apply) auditAsync({ action: 'update', resource: 'invoice_participations', metadata: { source: 'siigo-movimiento', ...result.summary }, user, c })
     return c.json(result)
+  },
+)
+
+// GET /api/participations/settings/accounts — cuentas contables del import
+app.get('/settings/accounts', async (c) => {
+  const data = await ParticipationsService.getAccountSettings()
+  return c.json(data)
+})
+
+// PUT /api/participations/settings/accounts — actualiza el mapeo de cuentas
+app.put('/settings/accounts',
+  requireRole('admin', 'rs_admin'),
+  requirePermission('participations', 'update'),
+  zValidator('json', accountSettingsSchema),
+  async (c) => {
+    const user = c.get('user')
+    const data = await ParticipationsService.updateAccountSettings(c.req.valid('json'))
+    auditAsync({ action: 'update', resource: 'participation_account_settings', metadata: { ...c.req.valid('json') }, user, c })
+    return c.json(data)
   },
 )
 
