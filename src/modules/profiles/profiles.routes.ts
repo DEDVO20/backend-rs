@@ -16,7 +16,8 @@ const updateProfileSchema = z.object({
 })
 
 const updateProfileAdminSchema = updateProfileSchema.extend({
-  role: z.enum(['admin', 'rs_admin', 'rs_staff', 'contador', 'client_owner', 'client_user']).optional(),
+  // El rol se valida contra la tabla `roles` en el handler (soporta roles custom).
+  role: z.string().optional(),
   active: z.boolean().optional(),
   company_id: z.string().uuid().nullable().optional(),
 })
@@ -83,6 +84,26 @@ app.get('/',
   },
 )
 
+// GET /api/profiles/assignable-roles — roles que se pueden asignar a un usuario
+// (para poblar el selector al invitar/editar). Opcional ?scope=internal|client.
+app.get('/assignable-roles',
+  requireRole('admin', 'rs_admin'),
+  async (c) => {
+    const scope = c.req.query('scope')
+    let q = supabase
+      .from('roles')
+      .select('key, name, description, scope')
+      .order('is_system', { ascending: false })
+      .order('name')
+
+    if (scope === 'internal' || scope === 'client') q = q.eq('scope', scope)
+
+    const { data, error } = await q
+    if (error) throw error
+    return c.json(data ?? [])
+  },
+)
+
 // GET /api/profiles/:id
 app.get('/:id',
   requireRole('admin', 'rs_admin', 'rs_staff'),
@@ -103,9 +124,18 @@ app.patch('/:id',
   requireRole('admin', 'rs_admin'),
   zValidator('json', updateProfileAdminSchema),
   async (c) => {
+    const body = c.req.valid('json')
+
+    // El rol debe existir en la tabla `roles` (incluye roles custom).
+    if (body.role) {
+      const { data: role } = await supabase
+        .from('roles').select('key').eq('key', body.role).single()
+      if (!role) return c.json({ error: 'Rol no encontrado' }, 400)
+    }
+
     const { data, error } = await supabase
       .from('profiles')
-      .update(c.req.valid('json'))
+      .update(body)
       .eq('id', c.req.param('id')!)
       .select()
       .single()
@@ -131,7 +161,8 @@ app.get('/company/:companyId/team', async (c) => {
 const inviteAdminSchema = z.object({
   full_name: z.string().min(2),
   email: z.string().email(),
-  role: z.enum(['admin', 'rs_admin', 'rs_staff', 'contador']),
+  // El rol se valida contra `roles` en el handler; debe ser un rol interno.
+  role: z.string(),
 })
 
 app.post('/invite',
@@ -139,6 +170,14 @@ app.post('/invite',
   zValidator('json', inviteAdminSchema),
   async (c) => {
     const { full_name, email, role: targetRole } = c.req.valid('json')
+
+    // El rol debe existir y ser interno: solo se invita personal administrativo.
+    const { data: role } = await supabase
+      .from('roles').select('key, scope').eq('key', targetRole).single()
+    if (!role) return c.json({ error: 'Rol no encontrado' }, 400)
+    if (role.scope !== 'internal') {
+      return c.json({ error: 'Solo se puede invitar personal administrativo con roles internos' }, 400)
+    }
 
     // Create invitation record
     const token = crypto.randomUUID()
