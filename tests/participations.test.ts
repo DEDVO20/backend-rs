@@ -13,6 +13,7 @@ import {
   nitMatch,
   parseSiigoDate,
   parseColombianNumber,
+  parseAccountingMovement,
 } from '../src/modules/participations/participations.domain.js'
 
 describe('calcParticipation', () => {
@@ -90,27 +91,24 @@ describe('parseColombianNumber (reporte consolidado)', () => {
   })
 })
 
-describe('deriveInvoiceStatus', () => {
-  it('OC del mes sin FV → Pendiente de factura', () => {
+describe('deriveInvoiceStatus (estados del spec)', () => {
+  it('OC del mes sin FV → pendiente de factura', () => {
     expect(deriveInvoiceStatus({ finto_invoice: null, finto_invoice_value: 500_000, collected: 0 })).toBe('pending_invoice')
   })
-  it('FV presente sin recaudo → Facturada (no pendiente)', () => {
-    expect(deriveInvoiceStatus({ finto_invoice: 'FV-4-1', finto_invoice_value: 500_000, collected: 0 })).toBe('invoiced')
+  it('FV con participación, sin factura del tercero → pendiente factura tercero', () => {
+    expect(deriveInvoiceStatus({ finto_invoice: 'FV-4-1', participation_value: 150_000, collected: 500_000 })).toBe('pending_third_invoice')
   })
-  it('sin recaudo → Facturada', () => {
-    expect(deriveInvoiceStatus({ finto_invoice_value: 500_000, collected: 0 })).toBe('invoiced')
+  it('el recaudo NO cambia el estado (sigue pendiente factura tercero)', () => {
+    expect(deriveInvoiceStatus({ finto_invoice: 'FV-4-1', participation_value: 150_000, collected: 0 })).toBe('pending_third_invoice')
   })
-  it('recaudo parcial', () => {
-    expect(deriveInvoiceStatus({ finto_invoice_value: 500_000, collected: 200_000 })).toBe('partial_collection')
+  it('FC del tercero con valor distinto al causado → diferencia de valor', () => {
+    expect(deriveInvoiceStatus({ finto_invoice: 'FV-4-1', participation_value: 150_000, third_party_invoice: 'FC-1', third_party_invoice_value: 170_000 })).toBe('value_difference')
   })
-  it('recaudo total → Disponible para pago', () => {
-    expect(deriveInvoiceStatus({ finto_invoice_value: 500_000, collected: 500_000 })).toBe('available')
+  it('FC coincide, sin egreso → pendiente de pago', () => {
+    expect(deriveInvoiceStatus({ finto_invoice: 'FV-4-1', participation_value: 150_000, third_party_invoice: 'FC-1', third_party_invoice_value: 150_000 })).toBe('pending_payment')
   })
-  it('con orden de pago → Pago en proceso', () => {
-    expect(deriveInvoiceStatus({ finto_invoice_value: 500_000, collected: 500_000, payment_order: 'OP-1' })).toBe('payment_in_process')
-  })
-  it('egreso completo → Cerrada', () => {
-    expect(deriveInvoiceStatus({ finto_invoice_value: 500_000, collected: 500_000, available_for_payment: 100_000, egress_voucher: 'CE-1', egress_voucher_value: 100_000 })).toBe('closed')
+  it('FC coincide y con egreso → completa', () => {
+    expect(deriveInvoiceStatus({ finto_invoice: 'FV-4-1', participation_value: 150_000, third_party_invoice: 'FC-1', third_party_invoice_value: 150_000, egress_voucher: 'RP-1' })).toBe('complete')
   })
 })
 
@@ -175,5 +173,103 @@ describe('conciliación SIIGO', () => {
     expect(parseSiigoDate('46235')).toEqual({ iso: '2026-08-01', year: 2026, month: 8 })
     expect(parseSiigoDate('46218')).toEqual({ iso: '2026-07-15', year: 2026, month: 7 })
     expect(parseSiigoDate('123')).toBeNull()   // fuera de rango de fecha
+  })
+})
+
+describe('parseAccountingMovement (reporte Movimiento por cuenta contable)', () => {
+  // Layout con columnas nuevas: Crédito antes de Descripción, + Valor base y Nombre tercero
+  const header = ['Código cuentas contables', 'Identificación tercero', 'Comprobante', 'Fecha elaboración', 'Crédito', 'Descripción', 'Valor base', 'Nombre tercero', 'Fecha vencimiento']
+  const rows: string[][] = [
+    ['RC Finto'], ['RAD SERVICES SAS'], ['901954048'], ['De julio 01 2026 a julio 31 2026'],
+    header,
+    // Venta servicio (cuenta 41, FV) — Sukot
+    ['41800101', '901178069', 'FV-2-77', '7/6/26', '2,500,000.00', 'Acompañamiento SGSST', '', 'Sukot Roofing SAS', ''],
+    ['13050501', '901178069', 'FV-2-77', '7/6/26', '', 'Clientes nacionales', '', 'Sukot Roofing SAS', '7/15/26'],
+    // Venta mandato (cuenta 41 ingreso + 28150601 porción del mandante) — mismo FV
+    ['41555005', '900139876', 'FV-4-4864', '7/1/26', '1,561,700.00', 'Honorarios', '', 'Colcharter', ''],
+    ['28150601', '900139876', 'FV-4-4864', '7/1/26', '1,154,300.00', 'Contrato mandato Eugenia', '', 'Colcharter', ''],
+    // Recaudo (cuenta 13050501, RC) con FV en descripción
+    ['13050501', '901178069', 'RC-1-53', '7/3/26', '2,678,350.00', 'FV-2-70 Cuota: 1  Fecha: 17/06/2026', '', 'Sukot Roofing SAS', ''],
+    // Nota crédito (cuenta 13050501, NC)
+    ['13050501', '901163686', 'NC-2-7', '7/15/26', '5,125,848.75', '', '', 'RAD Estrategias', ''],
+    // Nota crédito con FV en la descripción → liga a esa factura
+    ['13050501', '901178069', 'NC-1-15', '7/10/26', '250,000.00', 'Ajuste FV-2-77', '', 'Sukot Roofing SAS', ''],
+    // Factura del tercero (cuenta 2335, FC)
+    ['23359501', '901390501', 'FC-1-40', '7/28/26', '1,339,175.00', 'Otros', '', 'SIG Consultoria', ''],
+    // Pago al tercero (banco 1120, RP)
+    ['11200501', '901390501', 'RP-1-114', '7/14/26', '1,339,175.00', 'Pago SIGC-22 SIG Consultoria', '', 'SIG Consultoria', ''],
+    // Nómina (banco 1120, RP) — otro tercero; el servicio filtra por config
+    ['11200501', '5328174', 'RP-1-99', '7/3/26', '970,000.00', 'Pago Nomina', '', 'X', ''],
+  ]
+
+  it('venta servicio: ingreso de la cuenta 41, base de la participación', () => {
+    const m = parseAccountingMovement(rows)
+    const sukot = m.sales.find(s => s.fv === 'FV-2-77')!
+    expect(sukot.income).toBe(2_500_000)
+    expect(sukot.mandate).toBe(0)
+    expect(sukot.clientNit).toBe('901178069')
+    expect(sukot.clientName).toBe('Sukot Roofing SAS')
+  })
+
+  it('venta mandato: separa ingreso (41) y porción del mandante (28150601)', () => {
+    const m = parseAccountingMovement(rows)
+    const man = m.sales.find(s => s.fv === 'FV-4-4864')!
+    expect(man.income).toBe(1_561_700)
+    expect(man.mandate).toBe(1_154_300)
+    expect(man.base).toBe(2_716_000)
+  })
+
+  it('recaudo: RC de la cuenta 13050501, por FV', () => {
+    const m = parseAccountingMovement(rows)
+    expect(m.collections).toEqual([{ fv: 'FV-2-70', collected: 2_678_350, receipts: ['RC-1-53'], iso: '2026-07-03' }])
+  })
+
+  it('nota crédito: NC de la cuenta 13050501, con FV si viene en la descripción', () => {
+    const m = parseAccountingMovement(rows)
+    expect(m.creditNotes).toHaveLength(2)
+    expect(m.creditNotes.find(n => n.comprobante === 'NC-2-7')!).toMatchObject({ clientNit: '901163686', amount: 5_125_848.75, fvRef: null })
+    expect(m.creditNotes.find(n => n.comprobante === 'NC-1-15')!).toMatchObject({ amount: 250_000, fvRef: 'FV-2-77' })
+  })
+
+  it('factura del tercero (FC/2335) y pago (RP/banco)', () => {
+    const m = parseAccountingMovement(rows)
+    expect(m.thirdInvoices).toEqual([{ terceroNit: '901390501', terceroName: 'SIG Consultoria', doc: 'FC-1-40', iso: '2026-07-28', amount: 1_339_175, fvRef: null }])
+    expect(m.payments.map(p => p.rp)).toEqual(['RP-1-114', 'RP-1-99'])
+    expect(m.payments.find(p => p.rp === 'RP-1-114')!.amount).toBe(1_339_175)
+  })
+
+  it('devuelve estructura vacía si no hay encabezado', () => {
+    expect(parseAccountingMovement([['foo', 'bar']])).toEqual({ sales: [], creditNotes: [], debitNotes: [], collections: [], thirdInvoices: [], payments: [] })
+  })
+
+  it('base = Valor base del IVA (no la de retención); mandato desde 28051001', () => {
+    // FV-2-80 real: servicio en 41 + IVA, y honorarios de mandato (Freddy) en 28051001.
+    // El IVA reporta Valor base 1.125.452 (servicio); la retención 2.525.452 (total).
+    const split: string[][] = [
+      header,
+      ['41800101', '901769961', 'FV-2-80', '7/6/26', '875,452.50', 'Gestión comercial', '', 'WIP COLOMBIA', ''],
+      ['41800101', '901769961', 'FV-2-80', '7/6/26', '250,000.00', 'Tesorería', '', 'WIP COLOMBIA', ''],
+      ['28051001', '901769961', 'FV-2-80', '7/6/26', '1,400,000.00', 'Contrato de Mandato Freddy Leon', '', 'WIP COLOMBIA', ''],
+      ['24080601', '901769961', 'FV-2-80', '7/6/26', '213,835.98', 'IVA 19%', '1,125,452.50', 'WIP COLOMBIA', ''],
+      ['13551509', '901769961', 'FV-2-80', '7/6/26', '', 'Retefuente 11%', '2,525,452.50', 'WIP COLOMBIA', ''],
+    ]
+    const s = parseAccountingMovement(split).sales[0]!
+    expect(s.fv).toBe('FV-2-80')
+    expect(s.income).toBe(1_125_452.5)    // cuenta 41 (Gestión + Tesorería)
+    expect(s.taxBase).toBe(1_125_452.5)   // base del IVA (NO la de retención 2.525.452)
+    expect(s.mandate).toBe(1_400_000)     // porción de mandato (cuenta 28051001)
+  })
+
+  it('respeta cuentas configurables (override de prefijos)', () => {
+    const custom: string[][] = [
+      header,
+      ['70010101', '901', 'FV-9-1', '7/1/26', '1,000,000.00', 'Venta', '', 'Cliente X', ''],
+    ]
+    // Con income por defecto (41) no reconoce la venta en 7001…
+    expect(parseAccountingMovement(custom).sales).toHaveLength(0)
+    // Con override income='7001' sí
+    const m = parseAccountingMovement(custom, { income: '7001' })
+    expect(m.sales).toHaveLength(1)
+    expect(m.sales[0]!.income).toBe(1_000_000)
   })
 })
