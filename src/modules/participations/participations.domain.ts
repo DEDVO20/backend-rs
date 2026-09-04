@@ -132,8 +132,9 @@ export const INVOICE_STATUS_LABEL: Record<InvoiceStatus, string> = {
 /**
  * Estado de la participación derivado de los datos (spec §15):
  *   sin FV → pendiente de factura · con FV sin FC → pendiente factura tercero ·
- *   FC ≠ causado → diferencia de valor · FC = causado sin egreso → pendiente de
- *   pago · FC = causado con egreso → completa.
+ *   FC parcial (< causado) → pendiente factura tercero · FC > causado →
+ *   diferencia de valor · FC = causado con pago < participación → pendiente de
+ *   pago · FC = causado con pago acumulado ≥ participación → completa.
  * El recaudo NO cambia el estado; determina cuánto se puede pagar
  * (`available_for_payment`).
  */
@@ -157,9 +158,16 @@ export function deriveInvoiceStatus(ip: {
 
   const part = Number(ip.participation_value ?? 0)
   const tpiVal = Number(ip.third_party_invoice_value ?? 0)
-  if (Math.abs(tpiVal - part) >= 0.01) return 'value_difference'
+  // FC del tercero por debajo de lo causado → cobertura parcial (una FC del
+  // tercero puede repartirse entre varias participaciones): sigue pendiente.
+  if (part - tpiVal >= 0.01) return 'pending_third_invoice'
+  // FC por encima de lo causado → diferencia de valor (revisión manual).
+  if (tpiVal - part >= 0.01) return 'value_difference'
 
-  return ip.egress_voucher ? 'complete' : 'pending_payment'
+  // Completa solo cuando el pago acumulado cubre la participación. Un pago
+  // parcial (egress_voucher_value < participación) sigue pendiente de pago.
+  const paid = Number(ip.egress_voucher_value ?? 0)
+  return ip.egress_voucher && paid + 0.01 >= part ? 'complete' : 'pending_payment'
 }
 
 // ── Conciliación con reportes de SIIGO ───────────────────────────────────────

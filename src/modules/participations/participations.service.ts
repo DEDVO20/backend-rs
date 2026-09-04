@@ -20,9 +20,6 @@ type ParticipationInput = z.infer<typeof upsertParticipationSchema>
 
 const toDateStr = (d: Date) => d.toISOString().split('T')[0]!
 
-const fmtCOP = (n: number) =>
-  new Intl.NumberFormat('es-CO', { style: 'currency', currency: 'COP', maximumFractionDigits: 0 }).format(n)
-
 // ── Parseo de reportes de SIIGO ──────────────────────────────────────────────
 
 const stripAccents = (s: string) => s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
@@ -292,112 +289,6 @@ export class ParticipationsService {
   // ── Fase 3: factura del tercero → Orden de Pago → egreso ─────────────────────
 
   /**
-   * Registra la factura del tercero y concilia contra lo causado.
-   * Si coincide, genera la Orden de Pago (OP). Nunca bloquea: si no coincide,
-   * queda pendiente de revisión sin OP.
-   */
-  static async registerThirdPartyInvoice(id: string, input: {
-    third_party_invoice: string; third_party_invoice_date?: string | null; third_party_invoice_value: number
-  }) {
-    const { data: ip, error } = await supabase
-      .from('invoice_participations')
-      .select('id, participation_value, available_for_payment, finto_invoice_date, payment_order')
-      .eq('id', id)
-      .single()
-    if (error) throw error
-
-    const check = validateThirdPartyInvoice(Number(ip.participation_value), {
-      number: input.third_party_invoice, value: input.third_party_invoice_value,
-    })
-
-    // Validación: factura del tercero ya registrada en otra participación
-    const warnings: string[] = []
-    const dupTarget = normalizeInvoiceNumber(input.third_party_invoice)
-    const { data: others } = await supabase
-      .from('invoice_participations')
-      .select('third_party_invoice, purchase_order')
-      .not('third_party_invoice', 'is', null)
-      .neq('id', id)
-      .limit(1000)
-    const dup = (others ?? []).find((o: any) => normalizeInvoiceNumber(String(o.third_party_invoice ?? '')) === dupTarget)
-    if (dup) warnings.push(`La factura del tercero "${input.third_party_invoice}" ya está registrada en ${dup.purchase_order}`)
-
-    let paymentOrder: string | null = ip.payment_order ?? null
-    // Genera OP solo si concilia y aún no tiene
-    if (check.ok && !paymentOrder) {
-      const period = (ip.finto_invoice_date ?? new Date().toISOString()).slice(0, 7)
-      const [y, m] = period.split('-')
-      const { count } = await supabase
-        .from('invoice_participations')
-        .select('id', { count: 'exact', head: true })
-        .ilike('payment_order', `OP-${y}${m}-%`)
-      paymentOrder = formatPaymentOrder(Number(y), Number(m), (count ?? 0) + 1)
-    }
-
-    const { error: upErr } = await supabase
-      .from('invoice_participations')
-      .update({
-        third_party_invoice:       input.third_party_invoice,
-        third_party_invoice_date:  input.third_party_invoice_date ?? null,
-        third_party_invoice_value: input.third_party_invoice_value,
-        payment_order:             paymentOrder,
-        updated_at:                new Date().toISOString(),
-      })
-      .eq('id', id)
-    if (upErr) throw upErr
-
-    // El estado se deriva de los datos completos
-    const updated = await ParticipationsService.recomputeStatus(id)
-    return { invoice: updated, ok: check.ok, reasons: check.reasons, payment_order: paymentOrder, warnings }
-  }
-
-  /** Registra el Comprobante de Egreso (pago al tercero) */
-  static async registerEgress(id: string, input: {
-    egress_voucher: string; egress_voucher_date?: string | null; egress_voucher_value: number
-  }) {
-    const { data: ip, error } = await supabase
-      .from('invoice_participations')
-      .select('available_for_payment, egress_voucher')
-      .eq('id', id)
-      .single()
-    if (error) throw error
-
-    const available = Number(ip.available_for_payment ?? 0)
-    const warnings: string[] = []
-    if (input.egress_voucher_value > available + 0.01)
-      warnings.push(`El pago (${fmtCOP(input.egress_voucher_value)}) supera lo disponible (${fmtCOP(available)})`)
-    if (ip.egress_voucher)
-      warnings.push('Esta participación ya tenía un egreso registrado — se reemplaza')
-
-    // Comprobante de egreso ya usado en otra participación
-    const dupCe = normalizeInvoiceNumber(input.egress_voucher)
-    const { data: otherCe } = await supabase
-      .from('invoice_participations')
-      .select('egress_voucher, purchase_order')
-      .not('egress_voucher', 'is', null)
-      .neq('id', id)
-      .limit(1000)
-    const hitCe = (otherCe ?? []).find((o: any) => normalizeInvoiceNumber(String(o.egress_voucher ?? '')) === dupCe)
-    if (hitCe) warnings.push(`El comprobante de egreso "${input.egress_voucher}" ya está registrado en ${hitCe.purchase_order}`)
-
-    const { error: upErr } = await supabase
-      .from('invoice_participations')
-      .update({
-        egress_voucher:       input.egress_voucher,
-        egress_voucher_date:  input.egress_voucher_date ?? null,
-        egress_voucher_value: input.egress_voucher_value,
-        updated_at:           new Date().toISOString(),
-      })
-      .eq('id', id)
-    if (upErr) throw upErr
-
-    const updated = await ParticipationsService.recomputeStatus(id)
-    return { invoice: updated, warnings }
-  }
-
-  /**
-
-  /**
    * Importa el reporte "Movimiento por cuenta contable" — la fuente única del
    * ciclo de participaciones. Clasifica cada fila por cuenta + comprobante
    * (parseAccountingMovement) y arma, según la configuración del cliente:
@@ -639,61 +530,181 @@ export class ParticipationsService {
         }
       }
 
-      // ── Factura del tercero (FC): concilia por NIT + (FV o monto) y genera OP ──
+      // ── Factura del tercero (FC): una FC puede cubrir varias participaciones
+      //    del mismo tercero (mismo NIT). Se reparte FIFO (facturas más antiguas
+      //    primero) entre sus participaciones aún sin conciliar; permite
+      //    cobertura parcial (acumula en `third_party_invoice_value`) y guarda la
+      //    lista de FC en `third_party_invoice`. Cuando una participación queda
+      //    conciliada (FC acumulada ≈ participación) genera su Orden de Pago (OP).
+      //    Idempotente: una FC ya registrada no se resuma. Si la FC trae el FV en
+      //    su descripción, esa factura se atiende primero. ──
       if (mov.thirdInvoices.length) {
         const { data: openFc } = await supabase
           .from('invoice_participations')
-          .select('id, finto_invoice, participation_value, participation:service_participations(third_party:third_parties(identification))')
-          .is('third_party_invoice', null)
-        const usedFc = new Set<string>()
+          .select('id, finto_invoice, finto_invoice_date, period, participation_value, third_party_invoice, third_party_invoice_value, payment_order, participation:service_participations(third_party:third_parties(identification))')
+          .gt('participation_value', 0)
+        const nitOf = (ip: any) => normalizeNit(String(one(one(ip.participation)?.third_party)?.identification ?? ''))
+        const hasFc = (doc: string | null, fc: string) =>
+          String(doc ?? '').split(',').some(s => normalizeInvoiceNumber(s) === normalizeInvoiceNumber(fc))
+        // Estado local de conciliación por participación (acumula varias FC)
+        const fcState = new Map<string, { billed: number; docs: string[]; order: string | null }>()
+        const stateOf = (ip: any) => {
+          let st = fcState.get(ip.id)
+          if (!st) {
+            st = {
+              billed: Number(ip.third_party_invoice_value ?? 0),
+              docs:   String(ip.third_party_invoice ?? '').split(',').map(s => s.trim()).filter(Boolean),
+              order:  ip.payment_order ?? null,
+            }
+            fcState.set(ip.id, st)
+          }
+          return st
+        }
+        // Secuencia de OP por periodo (evita colisiones al generar varias en un import)
+        const opSeqByPeriod = new Map<string, number>()
+        const nextOp = async (period: string | null): Promise<string> => {
+          const [y, m] = (period ?? '2026-01').split('-')
+          const key = `${y}${m}`
+          if (!opSeqByPeriod.has(key)) {
+            const { count } = await supabase
+              .from('invoice_participations')
+              .select('id', { count: 'exact', head: true })
+              .ilike('payment_order', `OP-${key}-%`)
+            opSeqByPeriod.set(key, count ?? 0)
+          }
+          const seq = opSeqByPeriod.get(key)! + 1
+          opSeqByPeriod.set(key, seq)
+          return formatPaymentOrder(Number(y), Number(m), seq)
+        }
+
         for (const fc of mov.thirdInvoices) {
           if (!normalizeNit(fc.terceroNit)) continue
-          const cands = (openFc ?? []).filter((ip: any) => {
-            const nit = normalizeNit(String(one(one(ip.participation)?.third_party)?.identification ?? ''))
-            return nit && nitMatch(nit, fc.terceroNit) && !usedFc.has(ip.id)
+          const mine = (openFc ?? []).filter((ip: any) => {
+            const nit = nitOf(ip)
+            return nit && nitMatch(nit, fc.terceroNit)
           })
-          let match: any = null
-          if (fc.fvRef) match = cands.find((ip: any) => normalizeInvoiceNumber(ip.finto_invoice) === normalizeInvoiceNumber(fc.fvRef!))
-          if (!match) {
-            const byAmt = cands.filter((ip: any) => Math.abs(Number(ip.participation_value) - fc.amount) < 1)
-            if (byAmt.length === 1) match = byAmt[0]
+          if (!mine.length) continue
+          // Idempotencia: si esta FC ya figura en alguna participación del tercero
+          // ya se repartió → no volver a sumarla.
+          if (mine.some((ip: any) => hasFc(ip.third_party_invoice, fc.doc))) continue
+
+          // FIFO: factura más antigua primero (fecha de venta, luego periodo).
+          const ordered = [...mine].sort((a: any, b: any) =>
+            String(a.finto_invoice_date ?? a.period ?? '').localeCompare(String(b.finto_invoice_date ?? b.period ?? '')))
+          // El FV indicado en la FC se atiende primero.
+          if (fc.fvRef) {
+            const i = ordered.findIndex((ip: any) => normalizeInvoiceNumber(ip.finto_invoice ?? '') === normalizeInvoiceNumber(fc.fvRef!))
+            if (i > 0) ordered.unshift(ordered.splice(i, 1)[0]!)
           }
-          if (!match) continue
-          usedFc.add(match.id)
-          await ParticipationsService.registerThirdPartyInvoice(match.id, {
-            third_party_invoice: fc.doc, third_party_invoice_value: fc.amount, third_party_invoice_date: fc.iso || null,
-          })
-          third_invoice_matched++
+
+          let remaining = fc.amount
+          let appliedAny = false
+          for (const ip of ordered) {
+            if (remaining <= 0.01) break
+            const st = stateOf(ip)
+            const owed = money(Number(ip.participation_value ?? 0) - st.billed)
+            if (owed <= 0.01) continue
+            const applied = money(Math.min(remaining, owed))
+            st.billed = money(st.billed + applied)
+            st.docs.push(fc.doc)
+            remaining = money(remaining - applied)
+            appliedAny = true
+            // Concilia (FC acumulada ≈ participación) → genera OP si aún no tiene.
+            const conciliated = validateThirdPartyInvoice(Number(ip.participation_value), {
+              number: st.docs.join(', '), value: st.billed,
+            }).ok
+            if (conciliated && !st.order)
+              st.order = await nextOp(ip.period ?? (ip.finto_invoice_date ? String(ip.finto_invoice_date).slice(0, 7) : null))
+            const { error: upErr } = await supabase
+              .from('invoice_participations')
+              .update({
+                third_party_invoice:       st.docs.join(', '),
+                third_party_invoice_date:  fc.iso || null,
+                third_party_invoice_value: st.billed,
+                payment_order:             st.order,
+                updated_at:                new Date().toISOString(),
+              })
+              .eq('id', ip.id)
+            if (upErr) throw upErr
+            await ParticipationsService.recomputeStatus(ip.id)
+          }
+          if (appliedAny) third_invoice_matched++
         }
       }
 
-      // ── Pago al tercero (RP): concilia contra participaciones disponibles y sin
-      //    egreso del mismo tercero (por FV o por monto ≈ disponible) → egreso ──
+      // ── Pago al tercero (RP): un RP puede cubrir varias participaciones del
+      //    mismo tercero. Se reparte FIFO (facturas más antiguas primero) entre
+      //    sus participaciones con disponible sin pagar; permite pago parcial
+      //    (acumula en `egress_voucher_value`) y guarda la lista de RP aplicados
+      //    en `egress_voucher`. Idempotente: un RP ya registrado no se resuma.
+      //    Si el RP trae el FV en su descripción, esa factura se atiende primero. ──
       if (mov.payments.length) {
         const { data: openRp } = await supabase
           .from('invoice_participations')
-          .select('id, finto_invoice, available_for_payment, participation:service_participations(third_party:third_parties(identification))')
-          .is('egress_voucher', null)
+          .select('id, finto_invoice, finto_invoice_date, period, available_for_payment, egress_voucher, egress_voucher_value, participation:service_participations(third_party:third_parties(identification))')
           .gt('available_for_payment', 0)
-        const usedRp = new Set<string>()
+        const nitOf = (ip: any) => normalizeNit(String(one(one(ip.participation)?.third_party)?.identification ?? ''))
+        const hasRp = (voucher: string | null, rp: string) =>
+          String(voucher ?? '').split(',').some(s => normalizeInvoiceNumber(s) === normalizeInvoiceNumber(rp))
+        // Estado local de pago por participación (se acumula al repartir varios RP)
+        const paidState = new Map<string, { paid: number; vouchers: string[] }>()
+        const stateOf = (ip: any) => {
+          let st = paidState.get(ip.id)
+          if (!st) {
+            st = {
+              paid:     Number(ip.egress_voucher_value ?? 0),
+              vouchers: String(ip.egress_voucher ?? '').split(',').map(s => s.trim()).filter(Boolean),
+            }
+            paidState.set(ip.id, st)
+          }
+          return st
+        }
+
         for (const p of mov.payments) {
           if (!normalizeNit(p.terceroNit)) continue
-          const cands = (openRp ?? []).filter((ip: any) => {
-            const nit = normalizeNit(String(one(one(ip.participation)?.third_party)?.identification ?? ''))
-            return nit && nitMatch(nit, p.terceroNit) && !usedRp.has(ip.id)
+          const mine = (openRp ?? []).filter((ip: any) => {
+            const nit = nitOf(ip)
+            return nit && nitMatch(nit, p.terceroNit)
           })
-          let match: any = null
-          if (p.fvRef) match = cands.find((ip: any) => normalizeInvoiceNumber(ip.finto_invoice) === normalizeInvoiceNumber(p.fvRef!))
-          if (!match) {
-            const byAmt = cands.filter((ip: any) => Math.abs(Number(ip.available_for_payment) - p.amount) < 1)
-            if (byAmt.length === 1) match = byAmt[0]
+          if (!mine.length) continue
+          // Idempotencia: si este RP ya figura en alguna participación del tercero
+          // el pago ya se repartió → no volver a sumarlo.
+          if (mine.some((ip: any) => hasRp(ip.egress_voucher, p.rp))) continue
+
+          // FIFO: factura más antigua primero (fecha de venta, luego periodo).
+          const ordered = [...mine].sort((a: any, b: any) =>
+            String(a.finto_invoice_date ?? a.period ?? '').localeCompare(String(b.finto_invoice_date ?? b.period ?? '')))
+          // El FV indicado en el RP se atiende primero
+          if (p.fvRef) {
+            const i = ordered.findIndex((ip: any) => normalizeInvoiceNumber(ip.finto_invoice ?? '') === normalizeInvoiceNumber(p.fvRef!))
+            if (i > 0) ordered.unshift(ordered.splice(i, 1)[0]!)
           }
-          if (!match) continue
-          usedRp.add(match.id)
-          await ParticipationsService.registerEgress(match.id, {
-            egress_voucher: p.rp, egress_voucher_date: p.iso || null, egress_voucher_value: p.amount,
-          })
-          paid_matched++
+
+          let remaining = p.amount
+          let appliedAny = false
+          for (const ip of ordered) {
+            if (remaining <= 0.01) break
+            const st = stateOf(ip)
+            const owed = money(Number(ip.available_for_payment ?? 0) - st.paid)
+            if (owed <= 0.01) continue
+            const applied = money(Math.min(remaining, owed))
+            st.paid = money(st.paid + applied)
+            st.vouchers.push(p.rp)
+            remaining = money(remaining - applied)
+            appliedAny = true
+            const { error: upErr } = await supabase
+              .from('invoice_participations')
+              .update({
+                egress_voucher:       st.vouchers.join(', '),
+                egress_voucher_date:  p.iso || null,
+                egress_voucher_value: st.paid,
+                updated_at:           new Date().toISOString(),
+              })
+              .eq('id', ip.id)
+            if (upErr) throw upErr
+            await ParticipationsService.recomputeStatus(ip.id)
+          }
+          if (appliedAny) paid_matched++
         }
       }
     } else {
