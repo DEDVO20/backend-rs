@@ -101,14 +101,20 @@ describe('deriveInvoiceStatus (estados del spec)', () => {
   it('el recaudo NO cambia el estado (sigue pendiente factura tercero)', () => {
     expect(deriveInvoiceStatus({ finto_invoice: 'FV-4-1', participation_value: 150_000, collected: 0 })).toBe('pending_third_invoice')
   })
-  it('FC del tercero con valor distinto al causado → diferencia de valor', () => {
+  it('FC del tercero por encima de lo causado → diferencia de valor', () => {
     expect(deriveInvoiceStatus({ finto_invoice: 'FV-4-1', participation_value: 150_000, third_party_invoice: 'FC-1', third_party_invoice_value: 170_000 })).toBe('value_difference')
+  })
+  it('FC del tercero cubre solo parte de lo causado → sigue pendiente factura tercero', () => {
+    expect(deriveInvoiceStatus({ finto_invoice: 'FV-4-1', participation_value: 150_000, third_party_invoice: 'FC-1', third_party_invoice_value: 90_000 })).toBe('pending_third_invoice')
   })
   it('FC coincide, sin egreso → pendiente de pago', () => {
     expect(deriveInvoiceStatus({ finto_invoice: 'FV-4-1', participation_value: 150_000, third_party_invoice: 'FC-1', third_party_invoice_value: 150_000 })).toBe('pending_payment')
   })
-  it('FC coincide y con egreso → completa', () => {
-    expect(deriveInvoiceStatus({ finto_invoice: 'FV-4-1', participation_value: 150_000, third_party_invoice: 'FC-1', third_party_invoice_value: 150_000, egress_voucher: 'RP-1' })).toBe('complete')
+  it('FC coincide con pago parcial (< participación) → sigue pendiente de pago', () => {
+    expect(deriveInvoiceStatus({ finto_invoice: 'FV-4-1', participation_value: 150_000, third_party_invoice: 'FC-1', third_party_invoice_value: 150_000, egress_voucher: 'RP-1', egress_voucher_value: 90_000 })).toBe('pending_payment')
+  })
+  it('FC coincide y pago acumulado ≥ participación → completa', () => {
+    expect(deriveInvoiceStatus({ finto_invoice: 'FV-4-1', participation_value: 150_000, third_party_invoice: 'FC-1', third_party_invoice_value: 150_000, egress_voucher: 'RP-1, RP-2', egress_voucher_value: 150_000 })).toBe('complete')
   })
 })
 

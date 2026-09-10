@@ -4,6 +4,9 @@ import { z } from 'zod'
 export const thirdPartySchema = z.object({
   name:           z.string().min(2, 'El nombre debe tener al menos 2 caracteres').max(200),
   identification: z.string().max(50).optional(),
+  // Identidad y perfil tributario del tercero (módulo tax)
+  person_type:    z.enum(['NATURAL', 'JURIDICA']).default('NATURAL'),
+  tax_profile_id: z.string().uuid().nullable().optional(),
   active:         z.boolean().default(true),
 })
 
