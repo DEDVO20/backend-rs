@@ -243,3 +243,33 @@ export function computeOperation(input: OperationInput): OperationResult {
     finalTotal,
   }
 }
+
+/**
+ * Partición de una factura de venta en los tres montos de negocio de Finto,
+ * prorrateados por el recaudo del cliente (igual criterio que
+ * `availableParticipation`: solo se paga y se gana margen a medida que el
+ * cliente paga). El motor (`result`) se calcula con base = participación del
+ * tercero; el recaudo se mide contra el valor total de la factura de venta.
+ */
+export interface InvoicePartition {
+  collectionRatio: number   // recaudado / venta (0..1)
+  payThirdParty:   number   // lo que hay que pagar al tercero (giro neto, prorrateado)
+  staysInFinto:    number   // lo que queda en Finto (comisión neta, prorrateada)
+  owedToUs:        number   // lo que nos deben (cartera pendiente del cliente)
+}
+
+export function partitionInvoice(input: {
+  result:    OperationResult
+  saleValue: number   // valor total de la factura de venta (finto_invoice_value)
+  collected: number   // recaudado del cliente
+}): InvoicePartition {
+  const sale      = money(input.saleValue)
+  const collected = money(input.collected)
+  const ratio = sale <= 0 ? 0 : Math.min(1, Math.max(0, collected / sale))
+  return {
+    collectionRatio: ratio,
+    payThirdParty:   money(input.result.finalTotal   * ratio),
+    staysInFinto:    money(input.result.commissionNet * ratio),
+    owedToUs:        money(Math.max(0, sale - collected)),
+  }
+}

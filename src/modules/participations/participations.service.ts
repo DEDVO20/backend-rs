@@ -8,6 +8,8 @@ import {
   parseAccountingMovement, PARTICIPATION_ACCOUNTS,
 } from './participations.domain.js'
 import type { ParticipationAccounts } from './participations.domain.js'
+import { computeOperation, partitionInvoice } from '../tax/tax.domain.js'
+import { rowToProfile, rowToSettings, type TaxProfileRow, type SettingsRow } from '../tax/tax.service.js'
 import type { z }   from 'zod'
 import type {
   thirdPartySchema, updateThirdPartySchema,
@@ -272,7 +274,10 @@ export class ParticipationsService {
     const offset = (f.page - 1) * f.limit
     let q = supabase
       .from('invoice_participations')
-      .select('*, participation:service_participations(third_party:third_parties(name), company_service:company_services(services(name))), companies(name)', { count: 'exact' })
+      .select(
+        '*, participation:service_participations(third_party:third_parties(name, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name)',
+        { count: 'exact' },
+      )
       .order('finto_invoice_date', { ascending: false })
       .range(offset, offset + f.limit - 1)
     if (f.status)               q = q.eq('status', f.status)
@@ -283,7 +288,57 @@ export class ParticipationsService {
     if (f.to)                   q = q.lte('finto_invoice_date', f.to)
     const { data, error, count } = await q
     if (error) throw error
-    return { data, total: count ?? 0, page: f.page, limit: f.limit }
+
+    // Partición tributaria por factura: pagar al tercero / nos deben / queda en Finto.
+    const settings = await ParticipationsService.loadTaxSettings()
+    const withPartition = (data ?? []).map((row: any) => {
+      const profileRow = row?.participation?.third_party?.tax_profile as TaxProfileRow | null | undefined
+      const partition = ParticipationsService.computePartition(row, profileRow ?? null, settings)
+      return { ...row, tax_partition: partition }
+    })
+
+    return { data: withPartition, total: count ?? 0, page: f.page, limit: f.limit }
+  }
+
+  /** Parámetros de la operación tributaria (singleton). Fallbacks si no existe la fila. */
+  static async loadTaxSettings(): Promise<SettingsRow> {
+    const { data } = await supabase.from('tax_operation_settings').select('*').eq('id', 1).single()
+    return (data as SettingsRow) ?? {
+      id: 1, iva_rate: 0.19, income_withholding_rate: 0.11, ica_withholding_rate: 0.00866,
+      iva_withholding_rate: 0.15, commission_rate: 0.20, commission_iva_rate: 0.19, default_invoice_value: 0,
+    }
+  }
+
+  /**
+   * Calcula la partición de una factura con el motor tributario, usando el perfil
+   * del tercero como base = participación causada. Sin perfil asignado, se asume
+   * neutro (sin IVA ni retenciones) pero igual se aplica la comisión de la firma.
+   */
+  static computePartition(
+    row: { participation_value?: number | null; finto_invoice_value?: number | null; collected?: number | null },
+    profileRow: TaxProfileRow | null,
+    settings: SettingsRow,
+  ) {
+    const participation = Number(row.participation_value ?? 0)
+    const emitter = profileRow ? rowToProfile(profileRow) : {
+      personType: 'JURIDICA' as const, taxRegime: 'ORDINARY' as const,
+      ivaResponsible: false, grandTaxpayer: false,
+      incomeWithholding: { subject: false }, icaWithholding: { subject: false }, ivaWithholding: { subject: false },
+      agentIncomeWithholding: false, agentIcaWithholding: false,
+    }
+    // El receptor (Finto) actúa como agente de todas las retenciones.
+    const result = computeOperation({
+      invoiceValue: participation,
+      emitter,
+      receiver: { incomeWithholdingAgent: true, icaWithholdingAgent: true, ivaWithholdingAgent: true },
+      settings: rowToSettings(settings),
+    })
+    const partition = partitionInvoice({
+      result,
+      saleValue: Number(row.finto_invoice_value ?? 0),
+      collected: Number(row.collected ?? 0),
+    })
+    return { has_profile: !!profileRow, ...partition, breakdown: result }
   }
 
   // ── Fase 3: factura del tercero → Orden de Pago → egreso ─────────────────────

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
-  computeOperation, type TaxProfile, type WithholdingAgent, type OperationSettings,
+  computeOperation, partitionInvoice,
+  type TaxProfile, type WithholdingAgent, type OperationSettings,
 } from '../src/modules/tax/tax.domain.js'
 
 // Escenario de ejemplo de la matriz (spec §3). Parametrizado, no hardcodeado.
@@ -155,5 +156,39 @@ describe('computeOperation — motor tributario', () => {
     const r = computeOperation({ invoiceValue: BASE, emitter, receiver: FULL_AGENT, settings: SETTINGS })
     expect(r.incomeWithholding.rate).toBe(0.04)
     expect(r.incomeWithholding.amount).toBe(24_000)   // 600.000 × 4%
+  })
+})
+
+describe('partitionInvoice — pagar / nos deben / queda en Finto', () => {
+  const freddy: TaxProfile = {
+    personType: 'NATURAL', taxRegime: 'ORDINARY', ivaResponsible: false, grandTaxpayer: false,
+    incomeWithholding: { subject: true }, icaWithholding: { subject: true }, ivaWithholding: { subject: false },
+    agentIncomeWithholding: false, agentIcaWithholding: false,
+  }
+
+  it('recaudo total ⇒ paga el giro, sin cartera', () => {
+    const result = computeOperation({ invoiceValue: BASE, emitter: freddy, receiver: FULL_AGENT, settings: SETTINGS })
+    const p = partitionInvoice({ result, saleValue: 600_000, collected: 600_000 })
+    expect(p.collectionRatio).toBe(1)
+    expect(p.payThirdParty).toBe(386_004)   // giro final
+    expect(p.staysInFinto).toBe(142_800)    // comisión neta
+    expect(p.owedToUs).toBe(0)
+  })
+
+  it('recaudo parcial ⇒ prorratea pago y margen; el resto es cartera', () => {
+    const result = computeOperation({ invoiceValue: BASE, emitter: freddy, receiver: FULL_AGENT, settings: SETTINGS })
+    const p = partitionInvoice({ result, saleValue: 600_000, collected: 300_000 })
+    expect(p.collectionRatio).toBe(0.5)
+    expect(p.payThirdParty).toBe(193_002)   // 386.004 × 0,5
+    expect(p.staysInFinto).toBe(71_400)     // 142.800 × 0,5
+    expect(p.owedToUs).toBe(300_000)        // 600.000 − 300.000
+  })
+
+  it('sin recaudo ⇒ nada que pagar, todo es cartera', () => {
+    const result = computeOperation({ invoiceValue: BASE, emitter: freddy, receiver: FULL_AGENT, settings: SETTINGS })
+    const p = partitionInvoice({ result, saleValue: 600_000, collected: 0 })
+    expect(p.payThirdParty).toBe(0)
+    expect(p.staysInFinto).toBe(0)
+    expect(p.owedToUs).toBe(600_000)
   })
 })

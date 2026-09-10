@@ -14,7 +14,7 @@ type SettingsUpdate     = z.infer<typeof updateSettingsSchema>
 type ComputeInput       = z.infer<typeof computeSchema>
 
 // Fila del catálogo de perfiles tributarios (snake_case desde la BD).
-interface TaxProfileRow {
+export interface TaxProfileRow {
   id: string
   name: string
   description: string | null
@@ -35,7 +35,7 @@ interface TaxProfileRow {
   active: boolean
 }
 
-interface SettingsRow {
+export interface SettingsRow {
   id: number
   iva_rate: number
   income_withholding_rate: number
@@ -47,7 +47,7 @@ interface SettingsRow {
 }
 
 /** Mapea la fila del catálogo al perfil que consume el motor puro (spec §2). */
-function rowToProfile(row: TaxProfileRow): TaxProfile {
+export function rowToProfile(row: TaxProfileRow): TaxProfile {
   return {
     personType:     'JURIDICA',   // el tipo de persona es del tercero, no del perfil
     taxRegime:      row.tax_regime,
@@ -63,7 +63,7 @@ function rowToProfile(row: TaxProfileRow): TaxProfile {
   }
 }
 
-function rowToSettings(row: SettingsRow): OperationSettings {
+export function rowToSettings(row: SettingsRow): OperationSettings {
   return {
     ivaRate:               row.iva_rate,
     incomeWithholdingRate: row.income_withholding_rate,
