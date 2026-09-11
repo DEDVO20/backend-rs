@@ -837,6 +837,66 @@ export class ParticipationsService {
   }
 
   /**
+   * Vista inversa: agrupa las facturas por comprobante de pago. Un solo pago
+   * puede cubrir varias facturas (reparto FIFO), así que aquí se ve, dado un
+   * comprobante, qué facturas quedaron vinculadas a él.
+   *  - kind 'RC': recaudo del cliente (pago que le hacen a Finto) → facturas cobradas.
+   *  - kind 'RP': pago de Finto al tercero → facturas pagadas.
+   * Nota: el monto aplicado por comprobante a cada factura no se persiste; se
+   * muestran los totales de la factura (collected / egress_voucher_value).
+   */
+  static async paymentsGrouped(f: { company_id?: string; period?: string; year?: string; from?: string; to?: string } = {}) {
+    let q = supabase.from('invoice_participations')
+      .select('finto_invoice, finto_invoice_date, finto_invoice_value, participation_value, collected, available_for_payment, cash_receipts, egress_voucher, egress_voucher_value, egress_voucher_date, companies(name), participation:service_participations(third_party:third_parties(name, identification))')
+    if (f.company_id) q = q.eq('company_id', f.company_id)
+    if (f.period)     q = q.eq('period', f.period)
+    else if (f.year)  q = q.like('period', `${f.year}-%`)
+    if (f.from)       q = q.gte('finto_invoice_date', f.from)
+    if (f.to)         q = q.lte('finto_invoice_date', f.to)
+    const { data, error } = await q
+    if (error) throw error
+
+    type Grp = { voucher: string; kind: 'RC' | 'RP'; date: string | null; invoices: any[] }
+    const groups = new Map<string, Grp>()
+    const push = (raw: string, kind: 'RC' | 'RP', date: string | null, invoice: any) => {
+      const voucher = String(raw ?? '').trim()
+      if (!voucher) return
+      const key = `${kind}:${normalizeInvoiceNumber(voucher)}`
+      let g = groups.get(key)
+      if (!g) { g = { voucher, kind, date, invoices: [] }; groups.set(key, g) }
+      if (date && (!g.date || date > g.date)) g.date = date
+      g.invoices.push(invoice)
+    }
+
+    for (const r of data ?? []) {
+      const one = (x: any) => Array.isArray(x) ? x[0] : x
+      const tp = one(one((r as any).participation)?.third_party)
+      const invoice = {
+        finto_invoice:      (r as any).finto_invoice,
+        finto_invoice_value: Number((r as any).finto_invoice_value ?? 0),
+        participation_value: Number((r as any).participation_value ?? 0),
+        collected:          Number((r as any).collected ?? 0),
+        available_for_payment: Number((r as any).available_for_payment ?? 0),
+        egress_voucher_value: Number((r as any).egress_voucher_value ?? 0),
+        company:            one((r as any).companies)?.name ?? null,
+        third_party:        tp?.name ?? null,
+      }
+      for (const rc of String((r as any).cash_receipts ?? '').split(',')) push(rc, 'RC', (r as any).finto_invoice_date ?? null, invoice)
+      for (const rp of String((r as any).egress_voucher ?? '').split(',')) push(rp, 'RP', (r as any).egress_voucher_date ?? null, invoice)
+    }
+
+    const list = [...groups.values()].map(g => ({
+      ...g,
+      count: g.invoices.length,
+      collected_total: money(g.invoices.reduce((a, i) => a + i.collected, 0)),
+      paid_total:      money(g.invoices.reduce((a, i) => a + i.egress_voucher_value, 0)),
+    }))
+    // Solo comprobantes que cubren varias facturas primero, luego por fecha desc.
+    list.sort((a, b) => (b.count - a.count) || String(b.date ?? '').localeCompare(String(a.date ?? '')))
+    return { payments: list }
+  }
+
+  /**
    * Vista maestra de conciliación (hoja "Conciliación" del spec): una fila por
    * OC con las 5 etapas — generación (FINTO), venta, compra del tercero, pago
    * (RP) y recaudo (RC). Aplana los joins a cliente y tercero.

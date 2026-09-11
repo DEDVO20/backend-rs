@@ -89,6 +89,19 @@ app.get('/invoice-stats', async (c) => {
   return c.json(data)
 })
 
+// GET /api/participations/payments — vista inversa: por comprobante de pago,
+// qué facturas quedaron vinculadas (un pago puede cubrir varias facturas).
+app.get('/payments', async (c) => {
+  const data = await ParticipationsService.paymentsGrouped({
+    company_id: c.req.query('company_id') || undefined,
+    period:     c.req.query('period') || undefined,
+    year:       c.req.query('year') || undefined,
+    from:       c.req.query('from') || undefined,
+    to:         c.req.query('to') || undefined,
+  })
+  return c.json(data)
+})
+
 // GET /api/participations/balances — panel de saldos: CxC (nos deben) y CxP
 // (debemos, por tercero). Filtros opcionales: ?period=YYYY-MM&company_id=
 app.get('/balances', async (c) => {
