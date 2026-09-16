@@ -5,7 +5,7 @@ import {
   formatPurchaseOrder, formatPaymentOrder, validateThirdPartyInvoice, money,
   normalizeInvoiceNumber,
   normalizeSiigoInvoice, nitMatch, normalizeNit,
-  parseAccountingMovement, PARTICIPATION_ACCOUNTS,
+  parseAccountingMovement, PARTICIPATION_ACCOUNTS, billedPeriods,
 } from './participations.domain.js'
 import type { ParticipationAccounts } from './participations.domain.js'
 import { computeOperation, partitionInvoice } from '../tax/tax.domain.js'
@@ -124,6 +124,8 @@ export class ParticipationsService {
         fixed_value:        input.participation_type === 'fixed' && !isMandate ? input.fixed_value! : null,
         start_date:         input.start_date!,
         end_date:           input.end_date ?? null,
+        billing_day:        input.billing_day,
+        billing_mode:       input.billing_mode,
         has_third_party:    true,
         active:             input.active,
         updated_at:         new Date().toISOString(),
@@ -131,7 +133,15 @@ export class ParticipationsService {
       .select('*, third_parties(id, name, identification)')
       .single()
     if (error) throw error
-    return { service_value: input.service_value, participation: data }
+
+    // Backfill: al configurar el servicio se generan las OC de los meses que
+    // falten desde la fecha de inicio (aunque sea de varios meses atrás).
+    let backfill: Awaited<ReturnType<typeof ParticipationsService.generateMonthlyOCs>> | null = null
+    if (input.active && data?.id) {
+      try { backfill = await ParticipationsService.generateMonthlyOCs({ participationId: data.id }) }
+      catch (e) { logger.error({ e }, 'backfill OC tras upsertParticipation falló') }
+    }
+    return { service_value: input.service_value, participation: data, oc_backfill: backfill }
   }
 
   // ── Cuentas contables del import (configurables) ─────────────────────────────
@@ -179,24 +189,26 @@ export class ParticipationsService {
 
 
   /**
-   * Genera la OC del mes para cada participación activa con tercero (servicio
-   * contratado). Crea una fila "pendiente de factura" (sin FV) por servicio y
-   * periodo; la FV se asocia luego al importar las ventas. Idempotente: no
-   * duplica si ya existe una OC (con o sin FV) para ese servicio y mes.
+   * Genera las OC que falten (backfill) para cada participación activa con tercero
+   * — servicio Y mandato. Desde la fecha de inicio del tercero hasta el último
+   * periodo facturable (mes actual si es anticipado, mes anterior si es vencido).
+   * El primer mes se prorratea (día 1 → 100%, día 15 → 50%). El mandato sale como
+   * placeholder ($0) y el import le pega la porción real. Idempotente por
+   * (participación, periodo): no reexpide OC de meses ya expedidos aunque cambie
+   * el % o el tipo. `participationId` limita a una sola participación (backfill al
+   * configurar el servicio).
    */
-  static async generateMonthlyOCs(period?: string) {
-    const p = period ?? new Date().toISOString().slice(0, 7)   // 'YYYY-MM'
-    if (!/^\d{4}-\d{2}$/.test(p)) throw new Error('Periodo inválido (se espera YYYY-MM)')
-    const [y, m] = p.split('-').map(Number) as [number, number]
-    const firstDay = `${p}-01`
-    const lastDay  = `${p}-${String(new Date(y, m, 0).getDate()).padStart(2, '0')}`
+  static async generateMonthlyOCs(opts?: { period?: string; participationId?: string }) {
+    const target = opts?.period ?? new Date().toISOString().slice(0, 7)   // 'YYYY-MM'
+    if (!/^\d{4}-\d{2}$/.test(target)) throw new Error('Periodo inválido (se espera YYYY-MM)')
 
-    const { data: configs, error } = await supabase
+    let q = supabase
       .from('service_participations')
-      .select('id, participation_type, percentage, fixed_value, start_date, end_date, active, has_third_party, company_service:company_services(service_value, companies(id, name, nit))')
+      .select('id, contract_type, participation_type, percentage, fixed_value, start_date, end_date, billing_day, billing_mode, active, has_third_party, company_service:company_services(service_value, companies(id, name, nit))')
       .eq('has_third_party', true)
       .eq('active', true)
-      .eq('contract_type', 'servicio')   // los mandatos se importan aparte (cuenta 28150601)
+    if (opts?.participationId) q = q.eq('id', opts.participationId)
+    const { data: configs, error } = await q
     if (error) throw error
 
     const one = (v: any) => Array.isArray(v) ? v[0] : v
@@ -205,60 +217,87 @@ export class ParticipationsService {
       const co = one(cs?.companies)
       return {
         id:            c.id as string,
+        contract_type: (c.contract_type ?? 'servicio') as 'servicio' | 'mandato',
         type:          (c.participation_type ?? 'percentage') as 'percentage' | 'fixed',
         percentage:    Number(c.percentage),
         fixed_value:   c.fixed_value != null ? Number(c.fixed_value) : null,
         start_date:    c.start_date as string | null,
         end_date:      c.end_date as string | null,
+        billing_day:   Number(c.billing_day ?? 1),
+        billing_mode:  (c.billing_mode ?? 'vencido') as 'vencido' | 'anticipado',
         service_value: Number(cs?.service_value ?? 0),
         company_id:    co?.id ?? null,
         company_name:  co?.name ?? '—',
       }
-    }).filter(c =>
-      (!c.start_date || c.start_date <= lastDay) &&
-      (!c.end_date   || c.end_date   >= firstDay))
+    })
 
-    if (!cfgList.length) return { period: p, created: 0, skipped: 0, results: [] as any[] }
+    // Plan de (config × periodo) facturable, con su prorrateo
+    type Plan = { cfg: typeof cfgList[number]; period: string; proration: number }
+    const plans: Plan[] = []
+    for (const c of cfgList) {
+      if (!c.start_date) continue
+      for (const bp of billedPeriods({ startDate: c.start_date, billingDay: c.billing_day, billingMode: c.billing_mode, targetMonth: target, endDate: c.end_date }))
+        plans.push({ cfg: c, period: bp.period, proration: bp.proration })
+    }
+    if (!plans.length) return { target, created: 0, skipped: 0, results: [] as any[] }
 
-    // Servicios que ya tienen OC (con o sin FV) en el periodo → no duplicar
+    // (participación, periodo) que ya tienen OC → no reexpedir
+    const partIds = [...new Set(plans.map(p => p.cfg.id))]
     const { data: existing } = await supabase
       .from('invoice_participations')
-      .select('participation_id')
-      .eq('period', p)
-      .in('participation_id', cfgList.map(c => c.id))
-    const already = new Set((existing ?? []).map((e: any) => e.participation_id))
+      .select('participation_id, period')
+      .in('participation_id', partIds)
+    const has = new Set((existing ?? []).map((e: any) => `${e.participation_id}::${e.period}`))
 
-    // Secuencia de OC del periodo
-    const compact = p.replace('-', '')
-    const { count } = await supabase
-      .from('invoice_participations')
-      .select('id', { count: 'exact', head: true })
-      .ilike('purchase_order', `OC-${compact}-%`)
-    let seq = count ?? 0
+    // Secuencia de OC por periodo
+    const seqByPeriod = new Map<string, number>()
+    const nextOc = async (period: string): Promise<string> => {
+      const compact = period.replace('-', '')
+      if (!seqByPeriod.has(compact)) {
+        const { count } = await supabase
+          .from('invoice_participations')
+          .select('id', { count: 'exact', head: true })
+          .ilike('purchase_order', `OC-${compact}-%`)
+        seqByPeriod.set(compact, count ?? 0)
+      }
+      const seq = seqByPeriod.get(compact)! + 1
+      seqByPeriod.set(compact, seq)
+      const [yy, mm] = period.split('-').map(Number) as [number, number]
+      return formatPurchaseOrder(yy, mm, seq)
+    }
 
     const rows: any[] = []
-    const results: { company: string; purchase_order: string; participation_value: number }[] = []
-    for (const c of cfgList) {
-      if (already.has(c.id)) continue
-      const partValue = calcParticipation(c.service_value, c.percentage, { type: c.type, fixedValue: c.fixed_value })
-      const oc = formatPurchaseOrder(y, m, ++seq)
+    const results: any[] = []
+    let skipped = 0
+    plans.sort((a, b) => a.period.localeCompare(b.period))   // numeración coherente
+    for (const pl of plans) {
+      const key = `${pl.cfg.id}::${pl.period}`
+      if (has.has(key)) { skipped++; continue }
+      has.add(key)
+      const c = pl.cfg
+      const isMandate = c.contract_type === 'mandato'
+      const base = money(c.service_value * pl.proration)
+      const partValue = isMandate ? 0 : money(calcParticipation(c.service_value, c.percentage, { type: c.type, fixedValue: c.fixed_value }) * pl.proration)
+      const oc = await nextOc(pl.period)
       rows.push({
         participation_id:      c.id,
         company_id:            c.company_id,
         finto_invoice:         null,
         finto_invoice_date:    null,
-        finto_invoice_value:   c.service_value,
+        finto_invoice_value:   isMandate ? 0 : base,
+        contract_type:         c.contract_type,
         participation_type:    c.type,
         percentage:            c.type === 'fixed' ? 0 : c.percentage,
-        fixed_value:           c.type === 'fixed' ? c.fixed_value : null,
+        fixed_value:           c.type === 'fixed' && !isMandate ? c.fixed_value : null,
         participation_value:   partValue,
+        proration:             pl.proration,
         purchase_order:        oc,
-        period:                p,
+        period:                pl.period,
         collected:             0,
         available_for_payment: 0,
         status:                'pending_invoice',
       })
-      results.push({ company: c.company_name, purchase_order: oc, participation_value: partValue })
+      results.push({ company: c.company_name, contract: c.contract_type, period: pl.period, purchase_order: oc, participation_value: partValue, proration: pl.proration })
     }
 
     if (rows.length) {
@@ -266,7 +305,7 @@ export class ParticipationsService {
       if (insErr) throw insErr
     }
 
-    return { period: p, created: rows.length, skipped: cfgList.length - rows.length, results }
+    return { target, created: rows.length, skipped, results }
   }
 
   /** Listado de participaciones por factura (paginado, con filtros) */
@@ -497,6 +536,8 @@ export class ParticipationsService {
     }
 
     let created = 0, updated = 0, recaudo_updated = 0, third_invoice_matched = 0, paid_matched = 0
+    // Documentos para Cruce/Pagos (se persisten al final del apply)
+    const docs: any[] = []
     if (apply) {
       const seqByPeriod = new Map<string, number>()
       const nextOc = async (period: string | null): Promise<string> => {
@@ -632,15 +673,21 @@ export class ParticipationsService {
           return formatPaymentOrder(Number(y), Number(m), seq)
         }
 
+        const fcDoc = (fc: any, applied: number, matched: boolean, note?: string) => docs.push({
+          doc_type: 'FC', comprobante: fc.doc, fv_ref: fc.fvRef ?? '',
+          tercero_nit: fc.terceroNit || null, tercero_name: fc.terceroName || null,
+          period: fc.iso ? fc.iso.slice(0, 7) : null, doc_date: fc.iso || null,
+          amount: fc.amount, applied, matched, note: note ?? null,
+        })
         for (const fc of mov.thirdInvoices) {
-          if (!normalizeNit(fc.terceroNit)) continue
+          if (!normalizeNit(fc.terceroNit)) { fcDoc(fc, 0, false, 'FC sin NIT de tercero'); continue }
           const mine = (openFc ?? []).filter((ip: any) => {
             const nit = nitOf(ip)
             return nit && nitMatch(nit, fc.terceroNit)
           })
-          if (!mine.length) continue
+          if (!mine.length) { fcDoc(fc, 0, false, 'sin participación del tercero'); continue }
           // Idempotencia: si esta FC ya figura en alguna participación del tercero
-          // ya se repartió → no volver a sumarla.
+          // ya se repartió → no volver a sumarla (no se re-registra el documento).
           if (mine.some((ip: any) => hasFc(ip.third_party_invoice, fc.doc))) continue
 
           // FIFO: factura más antigua primero (fecha de venta, luego periodo).
@@ -684,6 +731,7 @@ export class ParticipationsService {
             await ParticipationsService.recomputeStatus(ip.id)
           }
           if (appliedAny) third_invoice_matched++
+          fcDoc(fc, money(fc.amount - remaining), appliedAny, remaining > 0.01 ? 'saldo sin conciliar' : undefined)
         }
       }
 
@@ -715,15 +763,21 @@ export class ParticipationsService {
           return st
         }
 
+        const rpDoc = (p: any, applied: number, matched: boolean, note?: string) => docs.push({
+          doc_type: 'RP', comprobante: p.rp, fv_ref: p.fvRef ?? '',
+          tercero_nit: p.terceroNit || null, tercero_name: null,
+          period: p.iso ? p.iso.slice(0, 7) : null, doc_date: p.iso || null,
+          amount: p.amount, applied, matched, note: note ?? null,
+        })
         for (const p of mov.payments) {
-          if (!normalizeNit(p.terceroNit)) continue
+          if (!normalizeNit(p.terceroNit)) { rpDoc(p, 0, false, 'RP sin NIT de tercero'); continue }
           const mine = (openRp ?? []).filter((ip: any) => {
             const nit = nitOf(ip)
             return nit && nitMatch(nit, p.terceroNit)
           })
-          if (!mine.length) continue
+          if (!mine.length) { rpDoc(p, 0, false, 'sin participación del tercero'); continue }
           // Idempotencia: si este RP ya figura en alguna participación del tercero
-          // el pago ya se repartió → no volver a sumarlo.
+          // el pago ya se repartió → no volver a sumarlo (no se re-registra).
           if (mine.some((ip: any) => hasRp(ip.egress_voucher, p.rp))) continue
 
           // FIFO: factura más antigua primero (fecha de venta, luego periodo).
@@ -760,7 +814,63 @@ export class ParticipationsService {
             await ParticipationsService.recomputeStatus(ip.id)
           }
           if (appliedAny) paid_matched++
+          rpDoc(p, money(p.amount - remaining), appliedAny, remaining > 0.01 ? 'saldo sin aplicar' : undefined)
         }
+      }
+
+      // ── Documentos FV / RC / NC / ND para Cruce y Pagos ──────────────────────
+      const salesByFv = new Map(mov.sales.map(s => [normalizeInvoiceNumber(s.fv), s]))
+      for (const r of results) {
+        const s = salesByFv.get(normalizeInvoiceNumber(r.fv))
+        const matched = r.outcome === 'matched'
+        docs.push({
+          doc_type: 'FV', comprobante: r.fv, fv_ref: '',
+          tercero_nit: s?.clientNit || null, tercero_name: r.client || s?.clientName || null,
+          period: s?.iso ? s.iso.slice(0, 7) : null, doc_date: s?.iso || null,
+          amount: r.base ?? s?.base ?? 0, applied: matched ? (r.base ?? s?.base ?? 0) : 0,
+          matched, note: matched ? null : (r.note ?? r.outcome),
+        })
+      }
+      // RC: cruzado si su FV tiene participación (creada esta corrida o existente)
+      const collFvs = mov.collections.map(c => c.fv)
+      const knownFv = new Set(causadasFv)
+      if (collFvs.length) {
+        const { data: exist } = await supabase
+          .from('invoice_participations').select('finto_invoice').in('finto_invoice', collFvs)
+        for (const e of exist ?? []) knownFv.add(normalizeInvoiceNumber((e as any).finto_invoice))
+      }
+      for (const c of mov.collections) {
+        const ok = knownFv.has(normalizeInvoiceNumber(c.fv))
+        docs.push({
+          doc_type: 'RC', comprobante: c.receipts.join(', '), fv_ref: c.fv,
+          tercero_nit: c.clientNit || null, tercero_name: c.clientName || null,
+          period: c.iso ? c.iso.slice(0, 7) : null, doc_date: c.iso || null,
+          amount: c.collected, applied: ok ? c.collected : 0, matched: ok,
+          note: ok ? null : 'FV no configurada',
+        })
+      }
+      for (const n of mov.creditNotes) docs.push({
+        doc_type: 'NC', comprobante: n.comprobante, fv_ref: n.fvRef ?? '',
+        tercero_nit: n.clientNit || null, tercero_name: n.clientName || null,
+        period: n.iso ? n.iso.slice(0, 7) : null, doc_date: n.iso || null,
+        amount: n.amount, applied: n.fvRef ? n.amount : 0, matched: !!n.fvRef,
+        note: n.fvRef ? null : 'sin FV en la descripción',
+      })
+      for (const n of mov.debitNotes) docs.push({
+        doc_type: 'ND', comprobante: n.comprobante, fv_ref: n.fvRef ?? '',
+        tercero_nit: n.clientNit || null, tercero_name: n.clientName || null,
+        period: n.iso ? n.iso.slice(0, 7) : null, doc_date: n.iso || null,
+        amount: n.amount, applied: n.fvRef ? n.amount : 0, matched: !!n.fvRef,
+        note: n.fvRef ? null : 'sin FV en la descripción',
+      })
+
+      // Persistir documentos (upsert por tipo+comprobante+FV)
+      if (docs.length) {
+        const rows = docs.map(d => ({ ...d, updated_at: new Date().toISOString() }))
+        const { error: docErr } = await supabase
+          .from('siigo_documents')
+          .upsert(rows, { onConflict: 'doc_type,comprobante,fv_ref' })
+        if (docErr) throw docErr
       }
     } else {
       for (const w of toWrite) delete w._period
@@ -789,6 +899,56 @@ export class ParticipationsService {
     const creditNotes = mov.creditNotes.map(mapNote)
     const debitNotes  = mov.debitNotes.map(mapNote)
     return { summary, results, creditNotes, debitNotes, applied: apply }
+  }
+
+  // ── Cruce y Pagos (sobre siigo_documents) ────────────────────────────────────
+
+  /**
+   * Cruce: documentos NO cruzados del último import (alertas). Nunca genera OC.
+   * Filtros: tipo (FV/RC/NC/ND/FC/RP), periodo (yyyy-mm), NIT (cliente o tercero).
+   */
+  static async crossingAlerts(f: { doc_type?: string; period?: string; nit?: string } = {}) {
+    let q = supabase
+      .from('siigo_documents')
+      .select('*')
+      .eq('matched', false)
+      .order('doc_date', { ascending: false })
+      .limit(1000)
+    if (f.doc_type) q = q.eq('doc_type', f.doc_type)
+    if (f.period)   q = q.eq('period', f.period)
+    if (f.nit)      q = q.eq('tercero_nit', f.nit)
+    const { data, error } = await q
+    if (error) throw error
+    const rows = data ?? []
+    const summary = {
+      total:  rows.length,
+      by_type: rows.reduce((a: Record<string, number>, r: any) => { a[r.doc_type] = (a[r.doc_type] ?? 0) + 1; return a }, {}),
+    }
+    return { summary, alerts: rows }
+  }
+
+  /**
+   * Pagos: RC y RP con saldo sin cruzar (parcial o total). Filtros por NIT
+   * (tercero para RP, cliente para RC), periodo y tipo.
+   */
+  static async paymentBalances(f: { doc_type?: 'RC' | 'RP'; period?: string; nit?: string } = {}) {
+    let q = supabase
+      .from('siigo_documents')
+      .select('*')
+      .in('doc_type', f.doc_type ? [f.doc_type] : ['RC', 'RP'])
+      .gt('saldo', 0)
+      .order('doc_date', { ascending: false })
+      .limit(1000)
+    if (f.period) q = q.eq('period', f.period)
+    if (f.nit)    q = q.eq('tercero_nit', f.nit)
+    const { data, error } = await q
+    if (error) throw error
+    const rows = data ?? []
+    const sum = (t: string) => money(rows.filter((r: any) => r.doc_type === t).reduce((a: number, r: any) => a + Number(r.saldo ?? 0), 0))
+    return {
+      summary: { count: rows.length, rc_saldo: sum('RC'), rp_saldo: sum('RP') },
+      items: rows,
+    }
   }
 
   /** Recalcula el estado de una participación por factura desde sus datos */

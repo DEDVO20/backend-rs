@@ -27,6 +27,10 @@ export const upsertParticipationSchema = z.object({
   fixed_value:        z.number().nonnegative().nullable().optional(),
   start_date:         z.string().date().optional(),
   end_date:           z.string().date().nullable().optional(),
+  // Facturación: día de inicio (1 o 15) y modo (vencido = mes anterior /
+  // anticipado = mes actual). Ver participations.domain.billedPeriods.
+  billing_day:        z.union([z.literal(1), z.literal(15)]).default(1),
+  billing_mode:       z.enum(['vencido', 'anticipado']).default('vencido'),
   active:             z.boolean().default(true),
 }).refine(
   v => !v.has_third_party || (!!v.third_party_id && !!v.start_date),

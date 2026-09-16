@@ -87,6 +87,50 @@ export function formatPaymentOrder(year: number, month: number, seq: number): st
   return `OP-${year}${String(month).padStart(2, '0')}-${String(seq).padStart(6, '0')}`
 }
 
+// ── Periodos facturables para la generación de OC ────────────────────────────
+
+export type BillingMode = 'vencido' | 'anticipado'
+
+/** Suma n meses a un periodo 'YYYY-MM' (n puede ser negativo). */
+export function addMonths(period: string, n: number): string {
+  const [y, m] = period.split('-').map(Number) as [number, number]
+  const total = y * 12 + (m - 1) + n
+  const ny = Math.floor(total / 12)
+  const nm = ((total % 12) + 12) % 12
+  return `${ny}-${String(nm + 1).padStart(2, '0')}`
+}
+
+/**
+ * Periodos que deben tener OC para una participación, dado el mes de generación.
+ * Backfill: desde el mes de inicio del tercero hasta el último periodo facturable.
+ *  - anticipado → último periodo = mes de generación.
+ *  - vencido    → último periodo = mes anterior al de generación.
+ * El primer mes se prorratea: día 1 → 1.0, día 15 → 0.5; los demás → 1.0.
+ * Respeta end_date (no genera periodos posteriores a su mes).
+ */
+export function billedPeriods(input: {
+  startDate: string
+  billingDay: number
+  billingMode: BillingMode
+  targetMonth: string           // 'YYYY-MM' del mes de generación
+  endDate?: string | null
+}): { period: string; proration: number }[] {
+  const { startDate, billingDay, billingMode, targetMonth, endDate } = input
+  if (!startDate || !/^\d{4}-\d{2}/.test(startDate) || !/^\d{4}-\d{2}$/.test(targetMonth)) return []
+  const startMonth = startDate.slice(0, 7)
+  let last = billingMode === 'anticipado' ? targetMonth : addMonths(targetMonth, -1)
+  if (endDate && /^\d{4}-\d{2}/.test(endDate)) {
+    const endMonth = endDate.slice(0, 7)
+    if (endMonth < last) last = endMonth
+  }
+  const out: { period: string; proration: number }[] = []
+  let p = startMonth
+  for (let i = 0; i < 600 && p <= last; i++, p = addMonths(p, 1)) {
+    out.push({ period: p, proration: p === startMonth && billingDay === 15 ? 0.5 : 1 })
+  }
+  return out
+}
+
 /**
  * Concilia la factura del tercero contra lo causado (la participación).
  * Si el valor coincide, se puede generar la Orden de Pago; si no, queda
@@ -362,7 +406,7 @@ export type MovSale = {
 /** Nota crédito (NC) sobre la cartera 13050501 — anula/rebaja una factura. */
 export type MovCreditNote = { comprobante: string; clientNit: string; clientName: string; iso: string; amount: number; fvRef: string | null }
 /** Recaudo (RC) sobre la cartera 13050501 — lo que paga el cliente, por FV. */
-export type MovCollection = { fv: string; collected: number; receipts: string[]; iso: string }
+export type MovCollection = { fv: string; collected: number; receipts: string[]; iso: string; clientNit: string; clientName: string }
 /** Factura de compra que envía el tercero (FC) sobre la cuenta 2335. */
 export type MovThirdInvoice = { terceroNit: string; terceroName: string; doc: string; iso: string; amount: number; fvRef: string | null }
 /** Pago al tercero (RP) por la cuenta de banco 11200504. */
@@ -449,9 +493,11 @@ export function parseAccountingMovement(rows: string[][], accounts?: Participati
       const key = `${normalizeInvoiceNumber(comp)}::${normalizeInvoiceNumber(fvRefOk)}`
       if (seenRc.has(key)) continue
       seenRc.add(key)
-      const g = collections.get(fvRefOk) ?? { fv: fvRefOk, collected: 0, receipts: [], iso: '' }
+      const g = collections.get(fvRefOk) ?? { fv: fvRefOk, collected: 0, receipts: [], iso: '', clientNit: nit, clientName: name }
       g.collected = money(g.collected + value)
       g.receipts.push(comp)
+      if (!g.clientNit && nit) g.clientNit = nit
+      if (!g.clientName && name) g.clientName = name
       if (d?.iso && d.iso > g.iso) g.iso = d.iso
       collections.set(fvRefOk, g)
       continue

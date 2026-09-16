@@ -115,6 +115,29 @@ app.get('/balances', async (c) => {
   return c.json(data)
 })
 
+// GET /api/participations/cruce — alertas de documentos no cruzados (FV/RC/NC/ND/FC/RP).
+// Nunca genera OC. Filtros: ?doc_type=RC&period=YYYY-MM&nit=
+app.get('/cruce', async (c) => {
+  const data = await ParticipationsService.crossingAlerts({
+    doc_type: c.req.query('doc_type') || undefined,
+    period:   c.req.query('period') || undefined,
+    nit:      c.req.query('nit') || undefined,
+  })
+  return c.json(data)
+})
+
+// GET /api/participations/pagos — saldos de RC y RP no cruzados.
+// Filtros: ?doc_type=RC|RP&period=YYYY-MM&nit=
+app.get('/pagos', async (c) => {
+  const dt = c.req.query('doc_type')
+  const data = await ParticipationsService.paymentBalances({
+    doc_type: dt === 'RC' || dt === 'RP' ? dt : undefined,
+    period:   c.req.query('period') || undefined,
+    nit:      c.req.query('nit') || undefined,
+  })
+  return c.json(data)
+})
+
 // GET /api/participations/conciliation — vista maestra (una fila por OC con las
 // 5 etapas). Filtros opcionales: ?period=YYYY-MM&company_id=
 app.get('/conciliation', async (c) => {
@@ -228,8 +251,8 @@ app.post('/generate-monthly',
       period = body?.period
     } catch { /* sin body → periodo actual */ }
     const user = c.get('user')
-    const result = await ParticipationsService.generateMonthlyOCs(period)
-    auditAsync({ action: 'create', resource: 'invoice_participations', metadata: { source: 'monthly-oc', period: result.period, created: result.created }, user, c })
+    const result = await ParticipationsService.generateMonthlyOCs({ period })
+    auditAsync({ action: 'create', resource: 'invoice_participations', metadata: { source: 'monthly-oc', period: result.target, created: result.created }, user, c })
     return c.json(result)
   },
 )

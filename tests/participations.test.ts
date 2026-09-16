@@ -14,6 +14,8 @@ import {
   parseSiigoDate,
   parseColombianNumber,
   parseAccountingMovement,
+  addMonths,
+  billedPeriods,
 } from '../src/modules/participations/participations.domain.js'
 
 describe('calcParticipation', () => {
@@ -37,6 +39,51 @@ describe('calcParticipation', () => {
 describe('formatPaymentOrder', () => {
   it('formatea OP-YYYYMM-NNNNNN', () => {
     expect(formatPaymentOrder(2026, 8, 3)).toBe('OP-202608-000003')
+  })
+})
+
+describe('addMonths', () => {
+  it('suma y resta meses cruzando el año', () => {
+    expect(addMonths('2026-03', 1)).toBe('2026-04')
+    expect(addMonths('2026-01', -1)).toBe('2025-12')
+    expect(addMonths('2026-12', 1)).toBe('2027-01')
+    expect(addMonths('2026-05', -5)).toBe('2025-12')
+  })
+})
+
+describe('billedPeriods (backfill de OC)', () => {
+  it('anticipado: incluye el mes actual; vencido: hasta el mes anterior', () => {
+    expect(billedPeriods({ startDate: '2026-03-01', billingDay: 1, billingMode: 'anticipado', targetMonth: '2026-03' }))
+      .toEqual([{ period: '2026-03', proration: 1 }])
+    // vencido, generando en marzo: aún no hay periodo (se factura el mes siguiente)
+    expect(billedPeriods({ startDate: '2026-03-01', billingDay: 1, billingMode: 'vencido', targetMonth: '2026-03' }))
+      .toEqual([])
+    // vencido, generando en mayo: marzo y abril
+    expect(billedPeriods({ startDate: '2026-03-01', billingDay: 1, billingMode: 'vencido', targetMonth: '2026-05' }))
+      .toEqual([{ period: '2026-03', proration: 1 }, { period: '2026-04', proration: 1 }])
+  })
+
+  it('prorratea SOLO el primer mes cuando inicia el 15', () => {
+    expect(billedPeriods({ startDate: '2026-03-15', billingDay: 15, billingMode: 'anticipado', targetMonth: '2026-05' }))
+      .toEqual([
+        { period: '2026-03', proration: 0.5 },
+        { period: '2026-04', proration: 1 },
+        { period: '2026-05', proration: 1 },
+      ])
+  })
+
+  it('respeta end_date (no genera meses posteriores)', () => {
+    expect(billedPeriods({ startDate: '2026-01-01', billingDay: 1, billingMode: 'anticipado', targetMonth: '2026-06', endDate: '2026-03-31' }))
+      .toEqual([
+        { period: '2026-01', proration: 1 },
+        { period: '2026-02', proration: 1 },
+        { period: '2026-03', proration: 1 },
+      ])
+  })
+
+  it('backfill de varios meses atrás (fecha de inicio antigua)', () => {
+    const out = billedPeriods({ startDate: '2025-11-01', billingDay: 1, billingMode: 'anticipado', targetMonth: '2026-02' })
+    expect(out.map(p => p.period)).toEqual(['2025-11', '2025-12', '2026-01', '2026-02'])
   })
 })
 
@@ -227,7 +274,7 @@ describe('parseAccountingMovement (reporte Movimiento por cuenta contable)', () 
 
   it('recaudo: RC de la cuenta 13050501, por FV', () => {
     const m = parseAccountingMovement(rows)
-    expect(m.collections).toEqual([{ fv: 'FV-2-70', collected: 2_678_350, receipts: ['RC-1-53'], iso: '2026-07-03' }])
+    expect(m.collections).toEqual([{ fv: 'FV-2-70', collected: 2_678_350, receipts: ['RC-1-53'], iso: '2026-07-03', clientNit: '901178069', clientName: 'Sukot Roofing SAS' }])
   })
 
   it('nota crédito: NC de la cuenta 13050501, con FV si viene en la descripción', () => {

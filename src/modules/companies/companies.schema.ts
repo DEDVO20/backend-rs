@@ -16,6 +16,7 @@ export const updateCompanySchema = z.object({
   asesor:  z.string().optional(),
   notes:   z.string().optional(),
   max_users: z.number().int().positive().optional(),
+  fecha_vinculacion: z.string().date().nullable().optional(),
 })
 
 export const createCompanySchema = z.object({
@@ -34,6 +35,7 @@ export const createCompanySchema = z.object({
   asesor:  z.string().optional(),
   notes:   z.string().optional(),
   status:  z.string().optional(),
+  fecha_vinculacion: z.string().date().nullable().optional(),
 })
 
 export const listCompaniesQuerySchema = z.object({
