@@ -335,20 +335,26 @@ export class ParticipationsService {
     const rpDates = new Map<string, string>()
 
     if (fvs.length) {
-      const { data: siigoDocs } = await supabase
-        .from('siigo_documents')
-        .select('doc_type, comprobante, fv_ref, doc_date')
-        .in('doc_type', ['RC', 'RP'])
-        .in('fv_ref', fvs)
+      try {
+        const { data: siigoDocs } = await supabase
+          .from('siigo_documents')
+          .select('doc_type, comprobante, fv_ref, doc_date')
+          .in('doc_type', ['RC', 'RP'])
+          .in('fv_ref', fvs)
 
-      for (const d of siigoDocs ?? []) {
-        const fvKey = normalizeInvoiceNumber(d.fv_ref)
-        if (d.doc_type === 'RC' && d.doc_date && !rcDates.has(fvKey)) {
-          rcDates.set(fvKey, d.doc_date)
+        for (const d of siigoDocs ?? []) {
+          const fvKey = normalizeInvoiceNumber(d.fv_ref)
+          if (fvKey) {
+            if (d.doc_type === 'RC' && d.doc_date && !rcDates.has(fvKey)) {
+              rcDates.set(fvKey, d.doc_date)
+            }
+            if (d.doc_type === 'RP' && d.doc_date && !rpDates.has(fvKey)) {
+              rpDates.set(fvKey, d.doc_date)
+            }
+          }
         }
-        if (d.doc_type === 'RP' && d.doc_date && !rpDates.has(fvKey)) {
-          rpDates.set(fvKey, d.doc_date)
-        }
+      } catch (e) {
+        logger.warn({ err: (e as any)?.message }, 'Error al consultar siigo_documents para fechas de RC/RP')
       }
     }
 
@@ -357,11 +363,11 @@ export class ParticipationsService {
     const withPartition = rows.map((row: any) => {
       const profileRow = row?.participation?.third_party?.tax_profile as TaxProfileRow | null | undefined
       const partition = ParticipationsService.computePartition(row, profileRow ?? null, settings)
-      const fvKey = normalizeInvoiceNumber(row.finto_invoice)
+      const fvKey = row.finto_invoice ? normalizeInvoiceNumber(row.finto_invoice) : ''
       return {
         ...row,
-        cash_receipt_date: rcDates.get(fvKey) ?? null,
-        egress_voucher_date: row.egress_voucher_date ?? rpDates.get(fvKey) ?? null,
+        cash_receipt_date: fvKey ? (rcDates.get(fvKey) ?? null) : null,
+        egress_voucher_date: row.egress_voucher_date ?? (fvKey ? (rpDates.get(fvKey) ?? null) : null),
         tax_partition: partition,
       }
     })
@@ -1430,16 +1436,20 @@ export class ParticipationsService {
     const fvs = (data ?? []).map((r: any) => r.finto_invoice).filter(Boolean)
     const rcDates = new Map<string, string>()
     if (fvs.length) {
-      const { data: rcDocs } = await supabase
-        .from('siigo_documents')
-        .select('fv_ref, doc_date')
-        .eq('doc_type', 'RC')
-        .in('fv_ref', fvs)
-      for (const d of rcDocs ?? []) {
-        const k = normalizeInvoiceNumber(d.fv_ref)
-        if (d.doc_date && !rcDates.has(k)) {
-          rcDates.set(k, d.doc_date)
+      try {
+        const { data: rcDocs } = await supabase
+          .from('siigo_documents')
+          .select('fv_ref, doc_date')
+          .eq('doc_type', 'RC')
+          .in('fv_ref', fvs)
+        for (const d of rcDocs ?? []) {
+          const k = normalizeInvoiceNumber(d.fv_ref)
+          if (k && d.doc_date && !rcDates.has(k)) {
+            rcDates.set(k, d.doc_date)
+          }
         }
+      } catch (err) {
+        logger.warn({ err: (err as any)?.message }, 'Error al consultar siigo_documents para fechas de RC')
       }
     }
 
@@ -1452,7 +1462,8 @@ export class ParticipationsService {
 
       const profileRow = tp?.tax_profile as TaxProfileRow | null | undefined
       const partition = ParticipationsService.computePartition(row, profileRow ?? null, settings)
-      const rcDate = rcDates.get(normalizeInvoiceNumber((row as any).finto_invoice)) ?? null
+      const fv = (row as any).finto_invoice
+      const rcDate = fv ? (rcDates.get(normalizeInvoiceNumber(fv)) ?? null) : null
       const rowWithPartition = { ...row, cash_receipt_date: rcDate, tax_partition: partition }
 
       const tpId = tp?.id ?? 'sin-tercero'

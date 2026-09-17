@@ -148,8 +148,9 @@ export function validateThirdPartyInvoice(
 }
 
 /** Normaliza números de factura para comparar duplicados ("F-001" ≡ "f 001") */
-export function normalizeInvoiceNumber(n: string): string {
-  return n.replace(/[\s.\-_]/g, '').toUpperCase()
+export function normalizeInvoiceNumber(n?: string | null): string {
+  if (!n) return ''
+  return String(n).replace(/[\s.\-_]/g, '').toUpperCase()
 }
 
 // ── Estados de la relación (spec §15) ────────────────────────────────────────
