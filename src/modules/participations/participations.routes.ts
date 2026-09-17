@@ -115,6 +115,18 @@ app.get('/balances', async (c) => {
   return c.json(data)
 })
 
+// GET /api/participations/by-third-party — relación y desglose de facturas agrupadas por tercero
+app.get('/by-third-party', async (c) => {
+  const data = await ParticipationsService.thirdPartiesSummary({
+    period: c.req.query('period') || undefined,
+    year:   c.req.query('year') || undefined,
+    from:   c.req.query('from') || undefined,
+    to:     c.req.query('to') || undefined,
+    q:      c.req.query('q') || undefined,
+  })
+  return c.json(data)
+})
+
 // GET /api/participations/cruce — alertas de documentos no cruzados (FV/RC/NC/ND/FC/RP).
 // Nunca genera OC. Filtros: ?doc_type=RC&period=YYYY-MM&nit=
 app.get('/cruce', async (c) => {
@@ -127,13 +139,16 @@ app.get('/cruce', async (c) => {
 })
 
 // GET /api/participations/pagos — saldos de RC y RP no cruzados.
-// Filtros: ?doc_type=RC|RP&period=YYYY-MM&nit=
+// Filtros: ?doc_type=RC|RP&period=YYYY-MM&nit=&client=&third_party=&search=
 app.get('/pagos', async (c) => {
   const dt = c.req.query('doc_type')
   const data = await ParticipationsService.paymentBalances({
-    doc_type: dt === 'RC' || dt === 'RP' ? dt : undefined,
-    period:   c.req.query('period') || undefined,
-    nit:      c.req.query('nit') || undefined,
+    doc_type:    dt === 'RC' || dt === 'RP' ? dt : undefined,
+    period:      c.req.query('period') || undefined,
+    nit:         c.req.query('nit') || undefined,
+    client:      c.req.query('client') || undefined,
+    third_party: c.req.query('third_party') || undefined,
+    search:      c.req.query('search') || undefined,
   })
   return c.json(data)
 })

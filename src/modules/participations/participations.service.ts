@@ -68,7 +68,7 @@ export class ParticipationsService {
   static async listCompanyParticipations(companyId: string) {
     const { data, error } = await supabase
       .from('company_services')
-      .select('id, service_value, active, services(id, name), service_participations(*, third_parties(id, name, identification))')
+      .select('id, start_date, end_date, service_value, active, services(id, name), service_participations(*, third_parties(id, name, identification))')
       .eq('company_id', companyId)
       .eq('active', true)
       .order('created_at')
@@ -81,6 +81,8 @@ export class ParticipationsService {
         company_service_id: cs.id,
         service:            one(cs.services),
         service_value:      cs.service_value,
+        start_date:         cs.start_date,
+        end_date:           cs.end_date,
         // "Tiene tercero" es independiente del estado activo/suspendido
         has_third_party:    !!part && part.has_third_party,
         participation:      part ?? null,
@@ -204,7 +206,7 @@ export class ParticipationsService {
 
     let q = supabase
       .from('service_participations')
-      .select('id, contract_type, participation_type, percentage, fixed_value, start_date, end_date, billing_day, billing_mode, active, has_third_party, company_service:company_services(service_value, companies(id, name, nit))')
+      .select('id, contract_type, participation_type, percentage, fixed_value, start_date, end_date, billing_day, billing_mode, active, has_third_party, company_service:company_services(start_date, end_date, service_value, companies(id, name, nit))')
       .eq('has_third_party', true)
       .eq('active', true)
     if (opts?.participationId) q = q.eq('id', opts.participationId)
@@ -221,8 +223,8 @@ export class ParticipationsService {
         type:          (c.participation_type ?? 'percentage') as 'percentage' | 'fixed',
         percentage:    Number(c.percentage),
         fixed_value:   c.fixed_value != null ? Number(c.fixed_value) : null,
-        start_date:    c.start_date as string | null,
-        end_date:      c.end_date as string | null,
+        start_date:    (c.start_date || cs?.start_date) as string | null,
+        end_date:      (c.end_date || cs?.end_date) as string | null,
         billing_day:   Number(c.billing_day ?? 1),
         billing_mode:  (c.billing_mode ?? 'vencido') as 'vencido' | 'anticipado',
         service_value: Number(cs?.service_value ?? 0),
@@ -327,13 +329,41 @@ export class ParticipationsService {
     if (f.to)                   q = q.lte('finto_invoice_date', f.to)
     const { data, error, count } = await q
     if (error) throw error
+    const rows = data ?? []
+    const fvs = rows.map((r: any) => r.finto_invoice).filter(Boolean)
+    const rcDates = new Map<string, string>()
+    const rpDates = new Map<string, string>()
+
+    if (fvs.length) {
+      const { data: siigoDocs } = await supabase
+        .from('siigo_documents')
+        .select('doc_type, comprobante, fv_ref, doc_date')
+        .in('doc_type', ['RC', 'RP'])
+        .in('fv_ref', fvs)
+
+      for (const d of siigoDocs ?? []) {
+        const fvKey = normalizeInvoiceNumber(d.fv_ref)
+        if (d.doc_type === 'RC' && d.doc_date && !rcDates.has(fvKey)) {
+          rcDates.set(fvKey, d.doc_date)
+        }
+        if (d.doc_type === 'RP' && d.doc_date && !rpDates.has(fvKey)) {
+          rpDates.set(fvKey, d.doc_date)
+        }
+      }
+    }
 
     // Partición tributaria por factura: pagar al tercero / nos deben / queda en Finto.
     const settings = await ParticipationsService.loadTaxSettings()
-    const withPartition = (data ?? []).map((row: any) => {
+    const withPartition = rows.map((row: any) => {
       const profileRow = row?.participation?.third_party?.tax_profile as TaxProfileRow | null | undefined
       const partition = ParticipationsService.computePartition(row, profileRow ?? null, settings)
-      return { ...row, tax_partition: partition }
+      const fvKey = normalizeInvoiceNumber(row.finto_invoice)
+      return {
+        ...row,
+        cash_receipt_date: rcDates.get(fvKey) ?? null,
+        egress_voucher_date: row.egress_voucher_date ?? rpDates.get(fvKey) ?? null,
+        tax_partition: partition,
+      }
     })
 
     return { data: withPartition, total: count ?? 0, page: f.page, limit: f.limit }
@@ -928,26 +958,121 @@ export class ParticipationsService {
   }
 
   /**
-   * Pagos: RC y RP con saldo sin cruzar (parcial o total). Filtros por NIT
-   * (tercero para RP, cliente para RC), periodo y tipo.
+   * Pagos: RC y RP con saldo sin cruzar (parcial o total). Filtros por Tercero,
+   * Cliente, periodo (mes), NIT y búsqueda general.
    */
-  static async paymentBalances(f: { doc_type?: 'RC' | 'RP'; period?: string; nit?: string } = {}) {
+  static async paymentBalances(f: {
+    doc_type?: 'RC' | 'RP'
+    period?: string
+    nit?: string
+    client?: string
+    third_party?: string
+    search?: string
+  } = {}) {
     let q = supabase
       .from('siigo_documents')
       .select('*')
       .in('doc_type', f.doc_type ? [f.doc_type] : ['RC', 'RP'])
       .gt('saldo', 0)
       .order('doc_date', { ascending: false })
-      .limit(1000)
+      .limit(2000)
+
     if (f.period) q = q.eq('period', f.period)
     if (f.nit)    q = q.eq('tercero_nit', f.nit)
+
     const { data, error } = await q
     if (error) throw error
-    const rows = data ?? []
+    let rows = data ?? []
+
+    // Filtro por Cliente (aplica a RC donde tercero_nit o tercero_name es el cliente)
+    if (f.client) {
+      const c = f.client.trim().toLowerCase()
+      rows = rows.filter((r: any) => {
+        if (r.doc_type !== 'RC') return false
+        return (
+          (r.tercero_nit && String(r.tercero_nit).toLowerCase().includes(c)) ||
+          (r.tercero_name && String(r.tercero_name).toLowerCase().includes(c))
+        )
+      })
+    }
+
+    // Filtro por Tercero (aplica a RP donde tercero_nit o tercero_name es el mandante/proveedor)
+    if (f.third_party) {
+      const tp = f.third_party.trim().toLowerCase()
+      rows = rows.filter((r: any) => {
+        if (r.doc_type !== 'RP') return false
+        return (
+          (r.tercero_nit && String(r.tercero_nit).toLowerCase().includes(tp)) ||
+          (r.tercero_name && String(r.tercero_name).toLowerCase().includes(tp))
+        )
+      })
+    }
+
+    // Búsqueda de texto libre (comprobante, fv_ref, NIT, nombre)
+    if (f.search) {
+      const s = f.search.trim().toLowerCase()
+      rows = rows.filter((r: any) =>
+        (r.comprobante && String(r.comprobante).toLowerCase().includes(s)) ||
+        (r.fv_ref && String(r.fv_ref).toLowerCase().includes(s)) ||
+        (r.tercero_nit && String(r.tercero_nit).toLowerCase().includes(s)) ||
+        (r.tercero_name && String(r.tercero_name).toLowerCase().includes(s))
+      )
+    }
+
+    // Opciones de filtro para desplegables (extraídas de todos los siigo_documents con saldo)
+    const { data: allUncrossed } = await supabase
+      .from('siigo_documents')
+      .select('doc_type, tercero_nit, tercero_name, period')
+      .in('doc_type', ['RC', 'RP'])
+      .gt('saldo', 0)
+
+    const clientMap = new Map<string, string>()
+    const tpMap = new Map<string, string>()
+    const periodsSet = new Set<string>()
+
+    for (const r of allUncrossed ?? []) {
+      if (r.period) periodsSet.add(r.period)
+      const nit = (r.tercero_nit ?? '').trim()
+      const name = (r.tercero_name ?? '').trim()
+      const label = name ? `${name}${nit ? ` (${nit})` : ''}` : nit
+      if (r.doc_type === 'RC' && (nit || name)) {
+        clientMap.set(nit || name, label)
+      } else if (r.doc_type === 'RP' && (nit || name)) {
+        tpMap.set(nit || name, label)
+      }
+    }
+
+    const clients = Array.from(clientMap.entries())
+      .map(([value, label]) => ({ value, label }))
+      .sort((a, b) => a.label.localeCompare(b.label))
+
+    const third_parties = Array.from(tpMap.entries())
+      .map(([value, label]) => ({ value, label }))
+      .sort((a, b) => a.label.localeCompare(b.label))
+
+    const periods = Array.from(periodsSet).sort().reverse()
+
     const sum = (t: string) => money(rows.filter((r: any) => r.doc_type === t).reduce((a: number, r: any) => a + Number(r.saldo ?? 0), 0))
+    const rc_count = rows.filter((r: any) => r.doc_type === 'RC').length
+    const rp_count = rows.filter((r: any) => r.doc_type === 'RP').length
+    const rc_saldo = sum('RC')
+    const rp_saldo = sum('RP')
+
     return {
-      summary: { count: rows.length, rc_saldo: sum('RC'), rp_saldo: sum('RP') },
+      summary: {
+        count: rows.length,
+        rc_count,
+        rp_count,
+        rc_saldo,
+        rp_saldo,
+        total_saldo: money(rc_saldo + rp_saldo),
+      },
       items: rows,
+      filter_options: {
+        clients,
+        third_parties,
+        periods,
+      },
     }
   }
 
@@ -1196,6 +1321,272 @@ export class ParticipationsService {
         .map(e => ({ ...e, owed: r2(e.owed), paid: r2(e.paid), items: e.items.sort(byPending('owed')) }))
         .filter(e => e.owed > 0)
         .sort((a, b) => b.owed - a.owed),
+    }
+  }
+
+  /**
+   * Resumen y relación de facturas agrupadas por tercero.
+   * Agrupa todas las facturas de venta y compra vinculadas al tercero,
+   * calculando acumulados de participación, facturación, recaudos, pagos y saldos.
+   */
+  static async thirdPartiesSummary(filters: { period?: string; year?: string; from?: string; to?: string; q?: string }) {
+    let q = supabase
+      .from('invoice_participations')
+      .select(`
+        id,
+        purchase_order,
+        period,
+        contract_type,
+        finto_invoice,
+        finto_invoice_date,
+        finto_invoice_value,
+        credit_note_value,
+        debit_note_value,
+        participation_value,
+        collected,
+        cash_receipts,
+        available_for_payment,
+        third_party_invoice,
+        third_party_invoice_date,
+        third_party_invoice_value,
+        payment_order,
+        egress_voucher,
+        egress_voucher_date,
+        egress_voucher_value,
+        status,
+        company_id,
+        companies (id, name, nit),
+        participation:service_participations (
+          id,
+          third_party_id,
+          third_party:third_parties (id, name, identification, person_type, tax_profile:tax_profiles(*)),
+          company_service:company_services (services (name))
+        )
+      `)
+      .order('finto_invoice_date', { ascending: false })
+      .order('purchase_order', { ascending: false })
+
+    if (filters.period)     q = q.eq('period', filters.period)
+    else if (filters.year)  q = q.like('period', `${filters.year}-%`)
+    if (filters.from)       q = q.gte('finto_invoice_date', filters.from)
+    if (filters.to)         q = q.lte('finto_invoice_date', filters.to)
+
+    const { data, error } = await q
+    if (error) throw error
+
+    // Alertas de facturas de compra (FC) no cruzadas en siigo_documents
+    const { data: unmatchedFCs } = await supabase
+      .from('siigo_documents')
+      .select('tercero_nit, amount')
+      .eq('doc_type', 'FC')
+      .eq('matched', false)
+
+    const fcAlertsMap = new Map<string, { count: number; total: number }>()
+    for (const fc of (unmatchedFCs ?? [])) {
+      const nit = String(fc.tercero_nit ?? '').trim()
+      if (!nit) continue
+      const curr = fcAlertsMap.get(nit) ?? { count: 0, total: 0 }
+      curr.count += 1
+      curr.total = money(curr.total + Number(fc.amount ?? 0))
+      fcAlertsMap.set(nit, curr)
+    }
+
+    const settings = await ParticipationsService.loadTaxSettings()
+    const one = (v: any) => Array.isArray(v) ? v[0] : v
+    const r2 = (n: number) => money(n)
+
+    type ThirdPartyGroup = {
+      id: string
+      name: string
+      identification: string
+      person_type?: string
+      has_tax_profile: boolean
+      tax_profile_name: string | null
+      invoices_count: number
+      participation_total: number
+      finto_invoiced_total: number
+      collected_total: number
+      available_total: number
+      net_payable_total: number
+      third_party_invoiced_total: number
+      paid_total: number
+      balance_owed: number
+      net_balance_owed: number
+      unmatched_fc_count: number
+      unmatched_fc_total: number
+      invoices: any[]
+    }
+
+    const groups = new Map<string, ThirdPartyGroup>()
+    let globalPartTotal = 0
+    let globalFintoTotal = 0
+    let globalAvailTotal = 0
+    let globalNetPayTotal = 0
+    let globalThirdInvTotal = 0
+    let globalPaidTotal = 0
+    let globalOwedTotal = 0
+    let globalNetOwedTotal = 0
+
+    const fvs = (data ?? []).map((r: any) => r.finto_invoice).filter(Boolean)
+    const rcDates = new Map<string, string>()
+    if (fvs.length) {
+      const { data: rcDocs } = await supabase
+        .from('siigo_documents')
+        .select('fv_ref, doc_date')
+        .eq('doc_type', 'RC')
+        .in('fv_ref', fvs)
+      for (const d of rcDocs ?? []) {
+        const k = normalizeInvoiceNumber(d.fv_ref)
+        if (d.doc_date && !rcDates.has(k)) {
+          rcDates.set(k, d.doc_date)
+        }
+      }
+    }
+
+    for (const row of (data ?? [])) {
+      const partObj = one((row as any).participation)
+      const tp = one(partObj?.third_party)
+      const co = one((row as any).companies)
+      const cs = one(partObj?.company_service)
+      const svc = one(cs?.services)
+
+      const profileRow = tp?.tax_profile as TaxProfileRow | null | undefined
+      const partition = ParticipationsService.computePartition(row, profileRow ?? null, settings)
+      const rcDate = rcDates.get(normalizeInvoiceNumber((row as any).finto_invoice)) ?? null
+      const rowWithPartition = { ...row, cash_receipt_date: rcDate, tax_partition: partition }
+
+      const tpId = tp?.id ?? 'sin-tercero'
+      const tpName = tp?.name ?? 'Sin tercero asignado'
+      const tpNit = String(tp?.identification ?? '').trim()
+
+      const fintoVal = Number((row as any).finto_invoice_value ?? 0)
+      const partVal = Number((row as any).participation_value ?? 0)
+      const collVal = Number((row as any).collected ?? 0)
+      const availVal = Number((row as any).available_for_payment ?? 0)
+      const thirdInvVal = (row as any).third_party_invoice_value != null ? Number((row as any).third_party_invoice_value) : null
+      const paidVal = (row as any).egress_voucher_value != null ? Number((row as any).egress_voucher_value) : 0
+
+      // Saldo bruto y saldo neto tributario
+      const owedVal = Math.max(0, availVal - paidVal)
+      const netPayVal = Number(partition.payThirdParty ?? 0)
+      const netOwedVal = Math.max(0, netPayVal - paidVal)
+
+      globalPartTotal += partVal
+      globalFintoTotal += fintoVal
+      globalAvailTotal += availVal
+      globalNetPayTotal += netPayVal
+      globalThirdInvTotal += (thirdInvVal ?? 0)
+      globalPaidTotal += paidVal
+      globalOwedTotal += owedVal
+      globalNetOwedTotal += netOwedVal
+
+      const fcAlert = tpNit ? (fcAlertsMap.get(tpNit) ?? { count: 0, total: 0 }) : { count: 0, total: 0 }
+
+      const group: ThirdPartyGroup = groups.get(tpId) ?? {
+        id: tpId,
+        name: tpName,
+        identification: tpNit,
+        person_type: tp?.person_type,
+        has_tax_profile: !!profileRow,
+        tax_profile_name: profileRow?.name ?? null,
+        invoices_count: 0,
+        participation_total: 0,
+        finto_invoiced_total: 0,
+        collected_total: 0,
+        available_total: 0,
+        net_payable_total: 0,
+        third_party_invoiced_total: 0,
+        paid_total: 0,
+        balance_owed: 0,
+        net_balance_owed: 0,
+        unmatched_fc_count: fcAlert.count,
+        unmatched_fc_total: fcAlert.total,
+        invoices: [],
+      }
+
+      group.invoices_count += 1
+      group.participation_total = r2(group.participation_total + partVal)
+      group.finto_invoiced_total = r2(group.finto_invoiced_total + fintoVal)
+      group.collected_total = r2(group.collected_total + collVal)
+      group.available_total = r2(group.available_total + availVal)
+      group.net_payable_total = r2(group.net_payable_total + netPayVal)
+      group.third_party_invoiced_total = r2(group.third_party_invoiced_total + (thirdInvVal ?? 0))
+      group.paid_total = r2(group.paid_total + paidVal)
+      group.balance_owed = r2(group.balance_owed + owedVal)
+      group.net_balance_owed = r2(group.net_balance_owed + netOwedVal)
+
+      group.invoices.push({
+        id: (row as any).id,
+        purchase_order: (row as any).purchase_order,
+        period: (row as any).period,
+        contract_type: (row as any).contract_type,
+        client_name: co?.name ?? '—',
+        client_nit: co?.nit ?? '',
+        service_name: svc?.name ?? '—',
+        finto_invoice: (row as any).finto_invoice,
+        finto_invoice_date: (row as any).finto_invoice_date,
+        finto_invoice_value: fintoVal,
+        credit_note_value: Number((row as any).credit_note_value ?? 0),
+        debit_note_value: Number((row as any).debit_note_value ?? 0),
+        participation_value: partVal,
+        collected: collVal,
+        cash_receipts: (row as any).cash_receipts,
+        cash_receipt_date: rcDate,
+        available_for_payment: availVal,
+        net_payable: r2(netPayVal),
+        third_party_invoice: (row as any).third_party_invoice,
+        third_party_invoice_date: (row as any).third_party_invoice_date,
+        third_party_invoice_value: thirdInvVal,
+        payment_order: (row as any).payment_order,
+        egress_voucher: (row as any).egress_voucher,
+        egress_voucher_date: (row as any).egress_voucher_date,
+        egress_voucher_value: paidVal,
+        balance_owed: r2(owedVal),
+        net_balance_owed: r2(netOwedVal),
+        status: (row as any).status,
+        has_tax_profile: !!profileRow,
+        tax_profile_name: profileRow?.name ?? null,
+        tax_partition: partition,
+        _raw: rowWithPartition,
+      })
+
+      groups.set(tpId, group)
+    }
+
+    let list = [...groups.values()]
+
+    // Filtrar por búsqueda si aplica
+    if (filters.q?.trim()) {
+      const term = filters.q.trim().toLowerCase()
+      list = list.filter(g =>
+        g.name.toLowerCase().includes(term) ||
+        g.identification.toLowerCase().includes(term) ||
+        g.invoices.some(inv =>
+          (inv.finto_invoice && String(inv.finto_invoice).toLowerCase().includes(term)) ||
+          (inv.third_party_invoice && String(inv.third_party_invoice).toLowerCase().includes(term)) ||
+          (inv.purchase_order && String(inv.purchase_order).toLowerCase().includes(term)) ||
+          (inv.client_name && String(inv.client_name).toLowerCase().includes(term))
+        )
+      )
+    }
+
+    // Ordenar: primero los terceros con mayor saldo por pagar, luego por nombre
+    list.sort((a, b) => (b.balance_owed - a.balance_owed) || a.name.localeCompare(b.name))
+
+    return {
+      summary: {
+        third_parties_count: list.length,
+        invoices_count: (data ?? []).length,
+        participation_total: r2(globalPartTotal),
+        finto_invoiced_total: r2(globalFintoTotal),
+        available_total: r2(globalAvailTotal),
+        net_payable_total: r2(globalNetPayTotal),
+        third_party_invoiced_total: r2(globalThirdInvTotal),
+        paid_total: r2(globalPaidTotal),
+        balance_owed_total: r2(globalOwedTotal),
+        net_balance_owed_total: r2(globalNetOwedTotal),
+      },
+      third_parties: list,
     }
   }
 

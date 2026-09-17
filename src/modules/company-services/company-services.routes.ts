@@ -47,16 +47,26 @@ app.post('/:companyId',
   zValidator('json', assignServiceSchema),
   async (c) => {
     const companyId = c.req.param('companyId')!
+    const valid = c.req.valid('json')
+    const startDate = valid.start_date || new Date().toISOString().split('T')[0]
     const { data, error } = await supabase
       .from('company_services')
       .upsert(
-        { ...c.req.valid('json'), company_id: companyId, active: true },
+        { ...valid, start_date: startDate, company_id: companyId, active: true },
         { onConflict: 'company_id,service_id' },
       )
       .select('*, services(name)')
       .single()
 
     if (error) throw error
+
+    // Sincronizar start_date con service_participations si ya existe para este servicio
+    if (data?.id && startDate) {
+      await supabase
+        .from('service_participations')
+        .update({ start_date: startDate, updated_at: new Date().toISOString() })
+        .eq('company_service_id', data.id)
+    }
 
     // Si el servicio activado es Contabilidad, generar la ficha del cliente
     // con la copia del calendario tributario maestro (módulo contable)
@@ -80,15 +90,28 @@ app.patch('/:companyId/:serviceId',
   requireRole('admin', 'rs_admin'),
   zValidator('json', assignServiceSchema.partial()),
   async (c) => {
+    const valid = c.req.valid('json')
     const { data, error } = await supabase
       .from('company_services')
-      .update(c.req.valid('json'))
+      .update(valid)
       .eq('company_id', c.req.param('companyId')!)
       .eq('service_id', c.req.param('serviceId')!)
-      .select()
+      .select('*, services(name)')
       .single()
 
     if (error) throw error
+
+    // Sincronizar fecha de activación o retiro con service_participations
+    if (data?.id && (valid.start_date !== undefined || valid.end_date !== undefined)) {
+      const partUpdate: Record<string, any> = { updated_at: new Date().toISOString() }
+      if (valid.start_date) partUpdate.start_date = valid.start_date
+      if (valid.end_date !== undefined) partUpdate.end_date = valid.end_date
+      await supabase
+        .from('service_participations')
+        .update(partUpdate)
+        .eq('company_service_id', data.id)
+    }
+
     return c.json(data)
   },
 )
