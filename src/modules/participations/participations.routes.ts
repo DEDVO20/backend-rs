@@ -9,6 +9,7 @@ import {
   upsertParticipationSchema, accountSettingsSchema,
   applyManualPaymentSchema,
   updateInvoiceParticipationSchema, reallocatePaymentSchema, unlinkPaymentSchema,
+  unlinkSaleInvoiceSchema,
 } from './participations.schema.js'
 
 const app = new Hono()
@@ -341,6 +342,20 @@ app.post('/unlink-payment',
     const body = c.req.valid('json')
     const result = await ParticipationsService.unlinkPayment(body)
     auditAsync({ action: 'update', resource: 'invoice_participations', resource_id: body.invoice_id, metadata: { source: 'unlink-payment', ...body }, user, c })
+    return c.json(result)
+  },
+)
+
+// POST /api/participations/unlink-sale-invoice — desvincula la factura de venta (FV) de una OC
+app.post('/unlink-sale-invoice',
+  requireRole('admin', 'rs_admin', 'contador'),
+  requirePermission('participations', 'update'),
+  zValidator('json', unlinkSaleInvoiceSchema),
+  async (c) => {
+    const user = c.get('user')
+    const body = c.req.valid('json')
+    const result = await ParticipationsService.unlinkSaleInvoice(body)
+    auditAsync({ action: 'update', resource: 'invoice_participations', resource_id: body.invoice_id, metadata: { source: 'unlink-sale-invoice', ...body }, user, c })
     return c.json(result)
   },
 )

@@ -104,3 +104,8 @@ export const unlinkPaymentSchema = z.object({
   comprobante: z.string().trim().min(1, 'El comprobante es obligatorio'),
 })
 
+export const unlinkSaleInvoiceSchema = z.object({
+  invoice_id:      z.string().uuid('ID de factura inválido'),
+  unlink_receipts: z.boolean().default(false),
+})
+

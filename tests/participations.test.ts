@@ -22,6 +22,7 @@ import {
   updateInvoiceParticipationSchema,
   reallocatePaymentSchema,
   unlinkPaymentSchema,
+  unlinkSaleInvoiceSchema,
 } from '../src/modules/participations/participations.schema.js'
 
 
@@ -440,6 +441,32 @@ describe('Edición manual de etapas y reasignación de pagos', () => {
       amount: 0,
       comprobante: '',
     })).toThrow()
+  })
+
+  it('valida el esquema de desvinculación de factura de venta (FV) de una OC', () => {
+    const valid = unlinkSaleInvoiceSchema.parse({
+      invoice_id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+      unlink_receipts: true,
+    })
+    expect(valid.invoice_id).toBe('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')
+    expect(valid.unlink_receipts).toBe(true)
+
+    // Por defecto unlink_receipts es false
+    const def = unlinkSaleInvoiceSchema.parse({
+      invoice_id: 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22',
+    })
+    expect(def.unlink_receipts).toBe(false)
+  })
+
+  it('al desvincular la factura de venta (FV) el estado regresa a pending_invoice', () => {
+    const status = deriveInvoiceStatus({
+      finto_invoice: null,
+      finto_invoice_value: 0,
+      collected: 0,
+      available_for_payment: 0,
+      participation_value: 200_000,
+    })
+    expect(status).toBe('pending_invoice')
   })
 
   it('recalcula disponibilidad para el tercero proporcional al recaudo editado', () => {

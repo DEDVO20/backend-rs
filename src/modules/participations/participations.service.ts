@@ -1339,7 +1339,7 @@ export class ParticipationsService {
   static async updateInvoiceParticipation(id: string, patch: Record<string, any>) {
     const { data: current, error: curErr } = await supabase
       .from('invoice_participations')
-      .select('id, finto_invoice_value, collected, participation_value, participation_type, status')
+      .select('id, finto_invoice, finto_invoice_value, collected, participation_value, participation_type, status')
       .eq('id', id)
       .single()
     if (curErr || !current) throw Object.assign(new Error('Factura de participación no encontrada'), { statusCode: 404 })
@@ -1365,6 +1365,43 @@ export class ParticipationsService {
       .update(updatePayload)
       .eq('id', id)
     if (upErr) throw upErr
+
+    // Sincronizar estado en siigo_documents si cambió la FV
+    const oldFv = current.finto_invoice
+    const now = new Date().toISOString()
+    if (patch.finto_invoice === null && oldFv) {
+      await supabase
+        .from('siigo_documents')
+        .update({
+          matched: false,
+          note: 'Desvinculada manualmente de OC',
+          updated_at: now,
+        })
+        .eq('doc_type', 'FV')
+        .eq('comprobante', oldFv)
+    } else if (patch.finto_invoice && patch.finto_invoice !== oldFv) {
+      await supabase
+        .from('siigo_documents')
+        .update({
+          matched: true,
+          note: 'Vinculada manualmente a OC',
+          updated_at: now,
+        })
+        .eq('doc_type', 'FV')
+        .eq('comprobante', patch.finto_invoice)
+
+      if (oldFv) {
+        await supabase
+          .from('siigo_documents')
+          .update({
+            matched: false,
+            note: 'Desvinculada manualmente de OC por reemplazo',
+            updated_at: now,
+          })
+          .eq('doc_type', 'FV')
+          .eq('comprobante', oldFv)
+      }
+    }
 
     // Recalcular estado de la factura derivado de los nuevos datos
     await ParticipationsService.recomputeStatus(id)
@@ -1575,6 +1612,93 @@ export class ParticipationsService {
     }
 
     return { success: true, collected: newColl }
+  }
+
+  /**
+   * Desvincula la factura de venta (FV) asignada a una orden de compra (OC).
+   * Deja la OC en estado 'pending_invoice', resetea valores de factura y disponible,
+   * y libera la FV en siigo_documents para que pueda asignarse a otra OC.
+   * Opcionalmente también desvincula los recibos de caja asociados.
+   */
+  static async unlinkSaleInvoice(input: { invoice_id: string; unlink_receipts?: boolean }) {
+    const { invoice_id, unlink_receipts } = input
+    const { data: inv, error: invErr } = await supabase
+      .from('invoice_participations')
+      .select('id, finto_invoice, finto_invoice_value, collected, cash_receipts, participation_value, participation_type')
+      .eq('id', invoice_id)
+      .single()
+    if (invErr || !inv) throw Object.assign(new Error('Factura de participación no encontrada'), { statusCode: 404 })
+
+    const oldFv = inv.finto_invoice
+    const now = new Date().toISOString()
+
+    const updatePayload: Record<string, any> = {
+      finto_invoice: null,
+      finto_invoice_date: null,
+      finto_invoice_value: 0,
+      available_for_payment: 0,
+      updated_at: now,
+    }
+
+    if (unlink_receipts) {
+      updatePayload.collected = 0
+      updatePayload.cash_receipts = null
+      updatePayload.cash_receipt_date = null
+
+      // Liberar en siigo_documents los recibos que estaban aplicados
+      const receipts = String(inv.cash_receipts ?? '').split(',').map(s => s.trim()).filter(Boolean)
+      for (const r of receipts) {
+        const { data: rcDoc } = await supabase
+          .from('siigo_documents')
+          .select('id, amount, applied')
+          .eq('doc_type', 'RC')
+          .eq('comprobante', r)
+          .maybeSingle()
+        if (rcDoc) {
+          const curApplied = Number(rcDoc.applied ?? 0)
+          const newApplied = Math.max(0, money(curApplied - Number(inv.collected ?? 0)))
+          await supabase
+            .from('siigo_documents')
+            .update({
+              applied: newApplied,
+              matched: newApplied > 0.01,
+              note: 'Desvinculado por desvinculación de FV de OC',
+              updated_at: now,
+            })
+            .eq('id', rcDoc.id)
+        }
+      }
+    }
+
+    const { error: upErr } = await supabase
+      .from('invoice_participations')
+      .update(updatePayload)
+      .eq('id', invoice_id)
+    if (upErr) throw upErr
+
+    // Liberar la FV en siigo_documents
+    if (oldFv) {
+      await supabase
+        .from('siigo_documents')
+        .update({
+          matched: false,
+          note: 'Desvinculada manualmente de OC',
+          updated_at: now,
+        })
+        .eq('doc_type', 'FV')
+        .eq('comprobante', oldFv)
+    }
+
+    await ParticipationsService.recomputeStatus(invoice_id)
+
+    const { data: updated, error: fetchErr } = await supabase
+      .from('invoice_participations')
+      .select('*, participation:service_participations(third_party:third_parties(name, identification, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)')
+      .eq('id', invoice_id)
+      .single()
+    if (fetchErr) throw fetchErr
+
+    return updated
   }
 
   /**
