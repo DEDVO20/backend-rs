@@ -352,4 +352,13 @@ app.get('/client-uncrossed-receipts', async (c) => {
   return c.json(data)
 })
 
+// GET /api/participations/available-documents — documentos reales en SIIGO (FV, RC, FC, RP) para vincular sin inventar facturas
+app.get('/available-documents', async (c) => {
+  const doc_type = c.req.query('doc_type') || undefined
+  const nit = c.req.query('nit') || ''
+  const only_unmatched = c.req.query('only_unmatched') === 'true'
+  const data = await ParticipationsService.getAvailableDocuments({ doc_type, nit, only_unmatched })
+  return c.json(data)
+})
+
 export const participationsRoutes = app

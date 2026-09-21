@@ -316,7 +316,7 @@ export class ParticipationsService {
     let q = supabase
       .from('invoice_participations')
       .select(
-        '*, participation:service_participations(third_party:third_parties(name, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)',
+        '*, participation:service_participations(third_party:third_parties(name, identification, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)',
         { count: 'exact' },
       )
       .order('finto_invoice_date', { ascending: false })
@@ -1325,7 +1325,7 @@ export class ParticipationsService {
   static async getInvoiceParticipation(id: string) {
     const { data, error } = await supabase
       .from('invoice_participations')
-      .select('*, participation:service_participations(third_party:third_parties(name, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)')
+      .select('*, participation:service_participations(third_party:third_parties(name, identification, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)')
       .eq('id', id)
       .single()
     if (error || !data) throw Object.assign(new Error('Factura de participación no encontrada'), { statusCode: 404 })
@@ -1372,7 +1372,7 @@ export class ParticipationsService {
     // Devolver el registro completo actualizado
     const { data: updated, error: fetchErr } = await supabase
       .from('invoice_participations')
-      .select('*, participation:service_participations(third_party:third_parties(name, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)')
+      .select('*, participation:service_participations(third_party:third_parties(name, identification, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)')
       .eq('id', id)
       .single()
     if (fetchErr) throw fetchErr
@@ -1599,6 +1599,44 @@ export class ParticipationsService {
         return dNit && nitMatch(dNit, nit) && (Number(d.saldo ?? 0) > 0.01 || !d.matched)
       })
   }
+
+  /**
+   * Obtiene los documentos registrados en siigo_documents para vincular sin inventar facturas.
+   * Filtra por doc_type ('FV' | 'RC' | 'FC' | 'RP') y NIT (cliente o tercero).
+   */
+  static async getAvailableDocuments(params: { doc_type?: string; nit: string; only_unmatched?: boolean }) {
+    const { doc_type, nit, only_unmatched } = params
+    if (!nit) return []
+    const norm = normalizeNit(nit)
+    if (!norm) return []
+
+    let q = supabase
+      .from('siigo_documents')
+      .select('id, doc_type, comprobante, doc_date, amount, applied, saldo, matched, note, period, fv_ref, tercero_name, tercero_nit')
+      .order('doc_date', { ascending: false })
+      .limit(300)
+
+    if (doc_type) {
+      q = q.eq('doc_type', doc_type)
+    }
+
+    const { data, error } = await q
+    if (error) throw error
+
+    return (data ?? []).filter((d: any) => {
+      const dNit = normalizeNit(d.tercero_nit)
+      const matchesNit = dNit && nitMatch(dNit, norm)
+      if (!matchesNit) return false
+      if (only_unmatched) {
+        if (d.doc_type === 'RC' || d.doc_type === 'RP') {
+          return Number(d.saldo ?? 0) > 0.01 || !d.matched
+        }
+        return !d.matched
+      }
+      return true
+    })
+  }
+
 
 
   static async invoiceStats(f: { company_id?: string; period?: string; year?: string; from?: string; to?: string } = {}) {
