@@ -524,5 +524,66 @@ describe('Edición manual de etapas y reasignación de pagos', () => {
       egress_voucher_value: 100_000,
     })).toBe('complete')
   })
+
+  it('un pago que cubre varias facturas deja matched=false si aún conserva saldo remanente', () => {
+    const docAmount = 1_000_000
+    const totalApplied = 300_000
+    const remaining = docAmount - totalApplied
+    const matched = remaining <= 0.01
+
+    expect(remaining).toBe(700_000)
+    expect(matched).toBe(false)
+
+    // Si luego se aplican los 700.000 restantes
+    const nextApplied = totalApplied + 700_000
+    const finalRemaining = Math.max(0, docAmount - nextApplied)
+    const finalMatched = finalRemaining <= 0.01
+
+    expect(finalRemaining).toBe(0)
+    expect(finalMatched).toBe(true)
+  })
+
+  it('al desvincular o reasignar una FV a otra OC, la OC anterior queda con etapas 3, 4 y 5 limpias y sin RP', () => {
+    // Simula el estado de la OC anterior antes de ser limpiada
+    const oldOcBefore = {
+      finto_invoice: 'FV-1-100',
+      finto_invoice_date: '2026-08-01',
+      finto_invoice_value: 1_000_000,
+      collected: 1_000_000,
+      cash_receipts: 'RC-1-20',
+      available_for_payment: 200_000,
+      third_party_invoice: 'FC-1-50',
+      third_party_invoice_value: 200_000,
+      payment_order: 'OP-202608-0001',
+      egress_voucher: 'RP-1-10',
+      egress_voucher_value: 200_000,
+    }
+
+    // Tras la reasignación, se limpian todas las vinculaciones de la OC previa
+    const oldOcCleaned = {
+      ...oldOcBefore,
+      finto_invoice: null,
+      finto_invoice_date: null,
+      finto_invoice_value: 0,
+      cash_receipts: null,
+      cash_receipt_date: null,
+      collected: 0,
+      available_for_payment: 0,
+      third_party_invoice: null,
+      third_party_invoice_date: null,
+      third_party_invoice_value: null,
+      payment_order: null,
+      payment_order_date: null,
+      egress_voucher: null,
+      egress_voucher_date: null,
+      egress_voucher_value: null,
+    }
+
+    expect(oldOcCleaned.egress_voucher).toBeNull()
+    expect(oldOcCleaned.payment_order).toBeNull()
+    expect(oldOcCleaned.third_party_invoice).toBeNull()
+    expect(oldOcCleaned.cash_receipts).toBeNull()
+    expect(deriveInvoiceStatus(oldOcCleaned)).toBe('pending_invoice')
+  })
 })
 

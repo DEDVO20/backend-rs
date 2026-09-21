@@ -1274,7 +1274,7 @@ export class ParticipationsService {
     // Actualizar siigo_documents si existe el comprobante
     const { data: doc } = await supabase
       .from('siigo_documents')
-      .select('id, amount, applied')
+      .select('id, amount, applied, fv_ref')
       .eq('doc_type', 'RC')
       .eq('comprobante', comprobante)
       .maybeSingle()
@@ -1284,13 +1284,25 @@ export class ParticipationsService {
       const prevApplied = Number((doc as any).applied ?? 0)
       const newApplied = money(prevApplied + totalApplied)
       const remaining = Math.max(0, money(docAmount - newApplied))
+
+      // Combinar fv_ref sin duplicar
+      const existingRefs = String((doc as any).fv_ref ?? '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+      for (const fv of appliedFvs) {
+        if (!existingRefs.some(r => normalizeInvoiceNumber(r) === normalizeInvoiceNumber(fv))) {
+          existingRefs.push(fv)
+        }
+      }
+
       await supabase
         .from('siigo_documents')
         .update({
           applied: newApplied,
-          matched: newApplied > 0,
-          fv_ref: appliedFvs.join(', '),
-          note: remaining > 0.01 ? 'Saldo restante' : null,
+          matched: remaining <= 0.01,
+          fv_ref: existingRefs.join(', '),
+          note: remaining > 0.01 ? `Saldo restante: $${remaining.toLocaleString('es-CO')}` : null,
           updated_at: new Date().toISOString(),
         })
         .eq('id', (doc as any).id)
@@ -1334,24 +1346,236 @@ export class ParticipationsService {
 
   /**
    * Actualiza manualmente los campos de las etapas 2, 3, 4 y 5 de una participación.
+   * Si se reasigna una FV existente en otra OC:
+   *  - Limpia completamente la OC previa (etapas 2, 3, 4 y 5, quitando vinculaciones a RP).
+   *  - Traspasa y ejecuta las etapas 3, 4 y 5 en la nueva OC.
+   *  - Consulta siigo_documents para autocompletar etapas pendientes vinculadas a la FV.
    * Recalcula automáticamente el valor disponible y el estado.
    */
   static async updateInvoiceParticipation(id: string, patch: Record<string, any>) {
     const { data: current, error: curErr } = await supabase
       .from('invoice_participations')
-      .select('id, finto_invoice, finto_invoice_value, collected, participation_value, participation_type, status')
+      .select('id, period, finto_invoice, finto_invoice_date, finto_invoice_value, collected, cash_receipts, third_party_invoice, third_party_invoice_date, third_party_invoice_value, payment_order, payment_order_date, egress_voucher, egress_voucher_date, egress_voucher_value, participation_value, participation_type, status')
       .eq('id', id)
       .single()
     if (curErr || !current) throw Object.assign(new Error('Factura de participación no encontrada'), { statusCode: 404 })
 
-    const updatePayload: Record<string, any> = { ...patch, updated_at: new Date().toISOString() }
+    const now = new Date().toISOString()
+    const updatePayload: Record<string, any> = { ...patch, updated_at: now }
 
-    const coll = patch.collected !== undefined ? Number(patch.collected) : Number(current.collected ?? 0)
-    const fintoVal = patch.finto_invoice_value !== undefined ? Number(patch.finto_invoice_value) : Number(current.finto_invoice_value ?? 0)
-    const partVal = patch.participation_value !== undefined ? Number(patch.participation_value) : Number(current.participation_value ?? 0)
+    const oldFv = current.finto_invoice
+    const newFv = patch.finto_invoice !== undefined ? (patch.finto_invoice ? String(patch.finto_invoice).trim() : null) : undefined
+
+    // ── Si se está quitando la FV (finto_invoice === null o '') ──
+    if (patch.finto_invoice === null || (patch.finto_invoice !== undefined && !String(patch.finto_invoice).trim())) {
+      updatePayload.finto_invoice = null
+      updatePayload.finto_invoice_date = null
+      updatePayload.finto_invoice_value = 0
+      updatePayload.cash_receipts = null
+      updatePayload.cash_receipt_date = null
+      updatePayload.collected = 0
+      updatePayload.available_for_payment = 0
+      updatePayload.third_party_invoice = null
+      updatePayload.third_party_invoice_date = null
+      updatePayload.third_party_invoice_value = null
+      updatePayload.payment_order = null
+      updatePayload.payment_order_date = null
+      updatePayload.egress_voucher = null
+      updatePayload.egress_voucher_date = null
+      updatePayload.egress_voucher_value = null
+
+      if (oldFv) {
+        await supabase
+          .from('siigo_documents')
+          .update({ matched: false, note: 'Desvinculada manualmente de OC', updated_at: now })
+          .eq('doc_type', 'FV')
+          .eq('comprobante', oldFv)
+      }
+
+      // Liberar en siigo_documents los recibos que estaban aplicados a esta factura
+      const receipts = String(current.cash_receipts ?? '').split(',').map(s => s.trim()).filter(Boolean)
+      for (const r of receipts) {
+        const { data: rcDoc } = await supabase
+          .from('siigo_documents')
+          .select('id, amount, applied')
+          .eq('doc_type', 'RC')
+          .eq('comprobante', r)
+          .maybeSingle()
+        if (rcDoc) {
+          const curApplied = Number(rcDoc.applied ?? 0)
+          const newApplied = Math.max(0, money(curApplied - Number(current.collected ?? 0)))
+          await supabase
+            .from('siigo_documents')
+            .update({
+              applied: newApplied,
+              matched: newApplied > 0.01,
+              note: 'Desvinculado por remoción de FV',
+              updated_at: now,
+            })
+            .eq('id', rcDoc.id)
+        }
+      }
+    }
+    // ── Si se está asignando o cambiando a una nueva FV ──
+    else if (newFv && (!oldFv || normalizeInvoiceNumber(oldFv) !== normalizeInvoiceNumber(newFv))) {
+      // 1. Buscar si otra OC ya tenía asignada esta FV
+      const { data: allInvs } = await supabase
+        .from('invoice_participations')
+        .select('*')
+        .neq('id', id)
+
+      const otherInv = (allInvs ?? []).find((o: any) =>
+        o.finto_invoice && normalizeInvoiceNumber(o.finto_invoice) === normalizeInvoiceNumber(newFv)
+      )
+
+      if (otherInv) {
+        // "quitar las vinculaciones a las que tenia antes de los rp":
+        // Limpiar la OC anterior completamente
+        await supabase
+          .from('invoice_participations')
+          .update({
+            finto_invoice: null,
+            finto_invoice_date: null,
+            finto_invoice_value: 0,
+            cash_receipts: null,
+            cash_receipt_date: null,
+            collected: 0,
+            available_for_payment: 0,
+            third_party_invoice: null,
+            third_party_invoice_date: null,
+            third_party_invoice_value: null,
+            payment_order: null,
+            payment_order_date: null,
+            egress_voucher: null,
+            egress_voucher_date: null,
+            egress_voucher_value: null,
+            updated_at: now,
+          })
+          .eq('id', otherInv.id)
+
+        await ParticipationsService.recomputeStatus(otherInv.id)
+
+        // Traspasar las etapas 2, 3, 4 y 5 a la nueva OC
+        if (updatePayload.finto_invoice_date === undefined && otherInv.finto_invoice_date) {
+          updatePayload.finto_invoice_date = otherInv.finto_invoice_date
+        }
+        if (updatePayload.finto_invoice_value === undefined && otherInv.finto_invoice_value) {
+          updatePayload.finto_invoice_value = Number(otherInv.finto_invoice_value)
+        }
+        if (updatePayload.cash_receipts === undefined && otherInv.cash_receipts) {
+          updatePayload.cash_receipts = otherInv.cash_receipts
+          updatePayload.cash_receipt_date = otherInv.cash_receipt_date
+          updatePayload.collected = Number(otherInv.collected ?? 0)
+        }
+        if (updatePayload.third_party_invoice === undefined && otherInv.third_party_invoice) {
+          updatePayload.third_party_invoice = otherInv.third_party_invoice
+          updatePayload.third_party_invoice_date = otherInv.third_party_invoice_date
+          updatePayload.third_party_invoice_value = otherInv.third_party_invoice_value
+          updatePayload.payment_order = otherInv.payment_order
+          updatePayload.payment_order_date = otherInv.payment_order_date
+        }
+        if (updatePayload.egress_voucher === undefined && otherInv.egress_voucher) {
+          updatePayload.egress_voucher = otherInv.egress_voucher
+          updatePayload.egress_voucher_date = otherInv.egress_voucher_date
+          updatePayload.egress_voucher_value = otherInv.egress_voucher_value
+        }
+      }
+
+      // 2. Consultar siigo_documents para completar automáticamente etapas vinculadas a esta FV
+      const { data: siigoDocs } = await supabase
+        .from('siigo_documents')
+        .select('*')
+
+      const fvNorm = normalizeInvoiceNumber(newFv)
+      const matchingDocs = (siigoDocs ?? []).filter((d: any) => {
+        const refs = String(d.fv_ref ?? '').split(',').map(r => normalizeInvoiceNumber(r.trim()))
+        return refs.includes(fvNorm)
+      })
+
+      // Etapa 2: valor y fecha desde FV en siigo_documents si no venían
+      const fvDoc = (siigoDocs ?? []).find((d: any) => d.doc_type === 'FV' && normalizeInvoiceNumber(d.comprobante) === fvNorm)
+      if (fvDoc) {
+        if (updatePayload.finto_invoice_value === undefined && fvDoc.amount) {
+          updatePayload.finto_invoice_value = Number(fvDoc.amount)
+        }
+        if (updatePayload.finto_invoice_date === undefined && fvDoc.doc_date) {
+          updatePayload.finto_invoice_date = fvDoc.doc_date
+        }
+      }
+
+      // Etapa 3: RC desde siigo_documents si no tiene cash_receipts
+      if (!updatePayload.cash_receipts) {
+        const rcDocs = matchingDocs.filter((d: any) => d.doc_type === 'RC')
+        if (rcDocs.length > 0) {
+          updatePayload.cash_receipts = rcDocs.map((d: any) => d.comprobante).join(', ')
+          updatePayload.cash_receipt_date = rcDocs[0].doc_date || null
+          const totalRc = rcDocs.reduce((a: number, d: any) => a + Number(d.amount ?? 0), 0)
+          const targetInvVal = Number(updatePayload.finto_invoice_value ?? current.finto_invoice_value ?? 0)
+          updatePayload.collected = targetInvVal > 0 ? Math.min(totalRc, targetInvVal) : totalRc
+        }
+      }
+
+      // Etapa 4: FC desde siigo_documents si no tiene third_party_invoice
+      if (!updatePayload.third_party_invoice) {
+        const fcDocs = matchingDocs.filter((d: any) => d.doc_type === 'FC')
+        if (fcDocs.length > 0) {
+          updatePayload.third_party_invoice = fcDocs.map((d: any) => d.comprobante).join(', ')
+          updatePayload.third_party_invoice_date = fcDocs[0].doc_date || null
+          updatePayload.third_party_invoice_value = fcDocs.reduce((a: number, d: any) => a + Number(d.amount ?? 0), 0)
+        }
+      }
+
+      // Etapa 5: RP desde siigo_documents si no tiene egress_voucher
+      if (!updatePayload.egress_voucher) {
+        const rpDocs = matchingDocs.filter((d: any) => d.doc_type === 'RP')
+        if (rpDocs.length > 0) {
+          updatePayload.egress_voucher = rpDocs.map((d: any) => d.comprobante).join(', ')
+          updatePayload.egress_voucher_date = rpDocs[0].doc_date || null
+          updatePayload.egress_voucher_value = rpDocs.reduce((a: number, d: any) => a + Number(d.amount ?? 0), 0)
+        }
+      }
+
+      // Marcar nueva FV como vinculada en siigo_documents
+      await supabase
+        .from('siigo_documents')
+        .update({ matched: true, note: 'Vinculada a OC', updated_at: now })
+        .eq('doc_type', 'FV')
+        .eq('comprobante', newFv)
+
+      if (oldFv) {
+        await supabase
+          .from('siigo_documents')
+          .update({ matched: false, note: 'Desvinculada por reemplazo de FV', updated_at: now })
+          .eq('doc_type', 'FV')
+          .eq('comprobante', oldFv)
+      }
+    }
+
+    // Auto-generación de Orden de Pago (OP) para Etapa 4 si concilia y aún no tiene OP
+    const finalPartVal = updatePayload.participation_value !== undefined ? Number(updatePayload.participation_value) : Number(current.participation_value ?? 0)
+    const finalFcVal = updatePayload.third_party_invoice_value !== undefined ? Number(updatePayload.third_party_invoice_value) : Number(current.third_party_invoice_value ?? 0)
+    const finalFcDoc = updatePayload.third_party_invoice !== undefined ? updatePayload.third_party_invoice : current.third_party_invoice
+
+    if (finalFcVal > 0 && finalFcDoc && !updatePayload.payment_order && !current.payment_order) {
+      const conc = validateThirdPartyInvoice(finalPartVal, { number: finalFcDoc, value: finalFcVal }).ok
+      if (conc) {
+        const periodStr = current.period ?? (updatePayload.finto_invoice_date ? String(updatePayload.finto_invoice_date).slice(0, 7) : '2026-01')
+        const [y, m] = periodStr.split('-')
+        const { count } = await supabase
+          .from('invoice_participations')
+          .select('id', { count: 'exact', head: true })
+          .ilike('payment_order', `OP-${y}${m}-%`)
+        updatePayload.payment_order = formatPaymentOrder(Number(y), Number(m), (count ?? 0) + 1)
+        updatePayload.payment_order_date = updatePayload.third_party_invoice_date ?? now.split('T')[0]
+      }
+    }
 
     // Recalcular disponible si cambia recaudo, valor de factura o participación
-    if (patch.collected !== undefined || patch.finto_invoice_value !== undefined || patch.participation_value !== undefined) {
+    const coll = updatePayload.collected !== undefined ? Number(updatePayload.collected) : Number(current.collected ?? 0)
+    const fintoVal = updatePayload.finto_invoice_value !== undefined ? Number(updatePayload.finto_invoice_value) : Number(current.finto_invoice_value ?? 0)
+    const partVal = updatePayload.participation_value !== undefined ? Number(updatePayload.participation_value) : Number(current.participation_value ?? 0)
+
+    if (updatePayload.collected !== undefined || updatePayload.finto_invoice_value !== undefined || updatePayload.participation_value !== undefined) {
       updatePayload.available_for_payment = availableParticipation({
         type: current.participation_type || 'percentage',
         participationValue: partVal,
@@ -1366,40 +1590,43 @@ export class ParticipationsService {
       .eq('id', id)
     if (upErr) throw upErr
 
-    // Sincronizar estado en siigo_documents si cambió la FV
-    const oldFv = current.finto_invoice
-    const now = new Date().toISOString()
-    if (patch.finto_invoice === null && oldFv) {
-      await supabase
-        .from('siigo_documents')
-        .update({
-          matched: false,
-          note: 'Desvinculada manualmente de OC',
-          updated_at: now,
-        })
-        .eq('doc_type', 'FV')
-        .eq('comprobante', oldFv)
-    } else if (patch.finto_invoice && patch.finto_invoice !== oldFv) {
-      await supabase
-        .from('siigo_documents')
-        .update({
-          matched: true,
-          note: 'Vinculada manualmente a OC',
-          updated_at: now,
-        })
-        .eq('doc_type', 'FV')
-        .eq('comprobante', patch.finto_invoice)
+    // Sincronizar siigo_documents para los RC aplicados
+    const currentRcList = String(updatePayload.cash_receipts ?? current.cash_receipts ?? '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean)
 
-      if (oldFv) {
+    for (const rcComp of currentRcList) {
+      const { data: rcDoc } = await supabase
+        .from('siigo_documents')
+        .select('id, amount, applied, fv_ref')
+        .eq('doc_type', 'RC')
+        .eq('comprobante', rcComp)
+        .maybeSingle()
+
+      if (rcDoc) {
+        const { data: allWithRc } = await supabase
+          .from('invoice_participations')
+          .select('id, finto_invoice, collected, cash_receipts')
+
+        const related = (allWithRc ?? []).filter((r: any) =>
+          String(r.cash_receipts ?? '').split(',').some(s => normalizeInvoiceNumber(s) === normalizeInvoiceNumber(rcComp))
+        )
+        const totalColl = money(related.reduce((sum: number, r: any) => sum + Number(r.collected ?? 0), 0))
+        const docAmt = Number(rcDoc.amount ?? totalColl)
+        const remaining = Math.max(0, money(docAmt - totalColl))
+        const fvs = related.map((r: any) => r.finto_invoice).filter(Boolean)
+
         await supabase
           .from('siigo_documents')
           .update({
-            matched: false,
-            note: 'Desvinculada manualmente de OC por reemplazo',
+            applied: totalColl,
+            matched: remaining <= 0.01,
+            fv_ref: fvs.join(', '),
+            note: remaining > 0.01 ? `Saldo restante: $${remaining.toLocaleString('es-CO')}` : null,
             updated_at: now,
           })
-          .eq('doc_type', 'FV')
-          .eq('comprobante', oldFv)
+          .eq('id', rcDoc.id)
       }
     }
 
@@ -1636,37 +1863,42 @@ export class ParticipationsService {
       finto_invoice: null,
       finto_invoice_date: null,
       finto_invoice_value: 0,
+      collected: 0,
+      cash_receipts: null,
+      cash_receipt_date: null,
       available_for_payment: 0,
+      third_party_invoice: null,
+      third_party_invoice_date: null,
+      third_party_invoice_value: null,
+      payment_order: null,
+      payment_order_date: null,
+      egress_voucher: null,
+      egress_voucher_date: null,
+      egress_voucher_value: null,
       updated_at: now,
     }
 
-    if (unlink_receipts) {
-      updatePayload.collected = 0
-      updatePayload.cash_receipts = null
-      updatePayload.cash_receipt_date = null
-
-      // Liberar en siigo_documents los recibos que estaban aplicados
-      const receipts = String(inv.cash_receipts ?? '').split(',').map(s => s.trim()).filter(Boolean)
-      for (const r of receipts) {
-        const { data: rcDoc } = await supabase
+    // Liberar en siigo_documents los recibos que estaban aplicados
+    const receipts = String(inv.cash_receipts ?? '').split(',').map(s => s.trim()).filter(Boolean)
+    for (const r of receipts) {
+      const { data: rcDoc } = await supabase
+        .from('siigo_documents')
+        .select('id, amount, applied')
+        .eq('doc_type', 'RC')
+        .eq('comprobante', r)
+        .maybeSingle()
+      if (rcDoc) {
+        const curApplied = Number(rcDoc.applied ?? 0)
+        const newApplied = Math.max(0, money(curApplied - Number(inv.collected ?? 0)))
+        await supabase
           .from('siigo_documents')
-          .select('id, amount, applied')
-          .eq('doc_type', 'RC')
-          .eq('comprobante', r)
-          .maybeSingle()
-        if (rcDoc) {
-          const curApplied = Number(rcDoc.applied ?? 0)
-          const newApplied = Math.max(0, money(curApplied - Number(inv.collected ?? 0)))
-          await supabase
-            .from('siigo_documents')
-            .update({
-              applied: newApplied,
-              matched: newApplied > 0.01,
-              note: 'Desvinculado por desvinculación de FV de OC',
-              updated_at: now,
-            })
-            .eq('id', rcDoc.id)
-        }
+          .update({
+            applied: newApplied,
+            matched: newApplied > 0.01,
+            note: 'Desvinculado por desvinculación de FV de OC',
+            updated_at: now,
+          })
+          .eq('id', rcDoc.id)
       }
     }
 
