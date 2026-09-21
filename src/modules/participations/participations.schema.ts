@@ -61,3 +61,12 @@ export const accountSettingsSchema = z.object({
   third_invoice_account: acct,
   payment_account:       acct,
 })
+
+export const applyManualPaymentSchema = z.object({
+  comprobante: z.string().min(1, 'El comprobante es obligatorio'),
+  client_nit:  z.string().min(1, 'El NIT del cliente es obligatorio'),
+  allocations: z.array(z.object({
+    invoice_id: z.string().uuid('ID de factura inválido'),
+    amount:     z.number().positive('El monto debe ser positivo'),
+  })).min(1, 'Debe asignar al menos una factura'),
+})

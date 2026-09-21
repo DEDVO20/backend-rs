@@ -7,7 +7,7 @@ import {
   normalizeSiigoInvoice, nitMatch, normalizeNit,
   parseAccountingMovement, PARTICIPATION_ACCOUNTS, billedPeriods,
 } from './participations.domain.js'
-import type { ParticipationAccounts } from './participations.domain.js'
+import type { ParticipationAccounts, MovCollection } from './participations.domain.js'
 import { computeOperation, partitionInvoice } from '../tax/tax.domain.js'
 import { rowToProfile, rowToSettings, type TaxProfileRow, type SettingsRow } from '../tax/tax.service.js'
 import type { z }   from 'zod'
@@ -600,10 +600,15 @@ export class ParticipationsService {
         // 1. La FV ya existe → actualiza y conserva su OC
         const { data: byFv } = await supabase
           .from('invoice_participations')
-          .select('id')
+          .select('id, collected, cash_receipts, available_for_payment')
           .eq('finto_invoice', w.finto_invoice)
           .maybeSingle()
         if (byFv) {
+          if ((byFv as any).collected > 0) {
+            w.collected = (byFv as any).collected
+            w.cash_receipts = (byFv as any).cash_receipts
+            w.available_for_payment = (byFv as any).available_for_payment
+          }
           const { error: upErr } = await supabase.from('invoice_participations').update(w).eq('id', byFv.id)
           if (upErr) throw upErr
           updated++
@@ -638,27 +643,131 @@ export class ParticipationsService {
         created++
       }
 
-      // ── Recaudo (RC) sobre FV YA existentes (causadas en un informe anterior) ──
-      const pendingFvs = mov.collections.map(c => c.fv).filter(fv => !causadasFv.has(normalizeInvoiceNumber(fv)))
-      if (pendingFvs.length) {
-        const { data: existing } = await supabase
+      // ── Recaudo (RC): pagos de clientes sobre la cartera 13050501 ───────────
+      // Un RC se asigna siguiendo la jerarquía:
+      //  1. Si trae FV explícita en descripción → atiende esa factura primero.
+      //  2. Si trae mes explícito en descripción (ej: 'pago mayo') → atiende la FV de ese período.
+      //  3. Por defecto / remanente → FIFO (factura más antigua primero por finto_invoice_date / period).
+      // Idempotente: si el comprobante RC ya figura en cash_receipts de alguna factura, no se vuelve a sumar.
+      if (mov.collections.length) {
+        const { data: openInvoices } = await supabase
           .from('invoice_participations')
-          .select('id, finto_invoice, finto_invoice_value, participation_value')
-          .in('finto_invoice', pendingFvs)
-        for (const ip of existing ?? []) {
-          const coll = collByFv.get(normalizeInvoiceNumber((ip as any).finto_invoice))
-          if (!coll) continue
-          const base      = Number((ip as any).finto_invoice_value ?? 0)
-          const partValue = Number((ip as any).participation_value ?? 0)
-          const collected = coll.collected
-          const available = availableParticipation({ type: 'percentage', participationValue: partValue, invoiceValue: base, collected })
-          const { error: upErr } = await supabase
-            .from('invoice_participations')
-            .update({ collected, cash_receipts: coll.receipts.join(', '), available_for_payment: available, updated_at: new Date().toISOString() })
-            .eq('id', (ip as any).id)
-          if (upErr) throw upErr
-          await ParticipationsService.recomputeStatus((ip as any).id)
-          recaudo_updated++
+          .select('id, finto_invoice, finto_invoice_date, finto_invoice_value, period, collected, cash_receipts, participation_value, participation_type, company:companies(nit)')
+
+        const clientNitOf = (ip: any) => normalizeNit(String(one(ip.company)?.nit ?? ''))
+        const hasRc = (receipts: string | null, rc: string) =>
+          String(receipts ?? '').split(',').some(s => normalizeInvoiceNumber(s) === normalizeInvoiceNumber(rc))
+
+        const rcState = new Map<string, { collected: number; receipts: string[] }>()
+        const stateOfRc = (ip: any) => {
+          let st = rcState.get(ip.id)
+          if (!st) {
+            st = {
+              collected: Number(ip.collected ?? 0),
+              receipts:  String(ip.cash_receipts ?? '').split(',').map(s => s.trim()).filter(Boolean),
+            }
+            rcState.set(ip.id, st)
+          }
+          return st
+        }
+
+        const rcDoc = (c: MovCollection, applied: number, matched: boolean, appliedFvs: string[], note?: string) => docs.push({
+          doc_type: 'RC',
+          comprobante: c.receipt,
+          fv_ref: appliedFvs.length ? appliedFvs.join(', ') : (c.fvRef ?? ''),
+          tercero_nit: c.clientNit || null,
+          tercero_name: c.clientName || null,
+          period: c.iso ? c.iso.slice(0, 7) : null,
+          doc_date: c.iso || null,
+          amount: c.amount,
+          applied,
+          matched,
+          note: note ?? (matched ? null : 'Sin facturas pendientes del cliente'),
+        })
+
+        for (const c of mov.collections) {
+          if (!normalizeNit(c.clientNit)) {
+            rcDoc(c, 0, false, [], 'RC sin NIT de cliente')
+            continue
+          }
+
+          const mine = (openInvoices ?? []).filter((ip: any) => {
+            const nit = clientNitOf(ip)
+            return nit && nitMatch(nit, c.clientNit)
+          })
+
+          if (!mine.length) {
+            rcDoc(c, 0, false, [], 'Sin facturas configuradas para este cliente')
+            continue
+          }
+
+          // Idempotencia: si este RC ya figura en alguna factura del cliente, ya se aplicó
+          if (mine.some((ip: any) => hasRc(ip.cash_receipts, c.receipt))) continue
+
+          // FIFO: factura más antigua primero (fecha de venta, luego periodo)
+          const ordered = [...mine].sort((a: any, b: any) =>
+            String(a.finto_invoice_date ?? a.period ?? '').localeCompare(String(b.finto_invoice_date ?? b.period ?? ''))
+          )
+
+          // Prioridad 1: Factura explícita en descripción
+          if (c.fvRef) {
+            const idx = ordered.findIndex((ip: any) => normalizeInvoiceNumber(ip.finto_invoice ?? '') === normalizeInvoiceNumber(c.fvRef!))
+            if (idx > 0) ordered.unshift(ordered.splice(idx, 1)[0]!)
+          }
+          // Prioridad 2: Mes explícito en descripción (si no hubo FV o la FV no coincidió)
+          else if (c.monthRef) {
+            const idx = ordered.findIndex((ip: any) => {
+              const p = ip.period || (ip.finto_invoice_date ? String(ip.finto_invoice_date).slice(0, 7) : '')
+              return p === c.monthRef
+            })
+            if (idx > 0) ordered.unshift(ordered.splice(idx, 1)[0]!)
+          }
+
+          let remaining = c.amount
+          let appliedTotal = 0
+          const appliedFvs: string[] = []
+
+          for (const ip of ordered) {
+            if (remaining <= 0.01) break
+            const st = stateOfRc(ip)
+            const invoiceVal = Number(ip.finto_invoice_value ?? 0)
+            const owed = money(invoiceVal - st.collected)
+            if (owed <= 0.01) continue
+
+            const applied = money(Math.min(remaining, owed))
+            st.collected = money(st.collected + applied)
+            if (!st.receipts.some(r => normalizeInvoiceNumber(r) === normalizeInvoiceNumber(c.receipt))) {
+              st.receipts.push(c.receipt)
+            }
+            remaining = money(remaining - applied)
+            appliedTotal = money(appliedTotal + applied)
+            if (ip.finto_invoice) appliedFvs.push(ip.finto_invoice)
+
+            // Recalcular disponible para pago de participación
+            const partValue = Number(ip.participation_value ?? 0)
+            const available = availableParticipation({
+              type: ip.participation_type || 'percentage',
+              participationValue: partValue,
+              invoiceValue: invoiceVal,
+              collected: st.collected,
+            })
+
+            const { error: upErr } = await supabase
+              .from('invoice_participations')
+              .update({
+                collected: st.collected,
+                cash_receipts: st.receipts.join(', '),
+                available_for_payment: available,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', ip.id)
+            if (upErr) throw upErr
+            await ParticipationsService.recomputeStatus(ip.id)
+            recaudo_updated++
+          }
+
+          const matched = appliedTotal > 0
+          rcDoc(c, appliedTotal, matched, appliedFvs, remaining > 0.01 ? 'Saldo restante sin aplicar (excede facturas pendientes)' : undefined)
         }
       }
 
@@ -867,24 +976,6 @@ export class ParticipationsService {
           matched, note: matched ? null : (r.note ?? r.outcome),
         })
       }
-      // RC: cruzado si su FV tiene participación (creada esta corrida o existente)
-      const collFvs = mov.collections.map(c => c.fv)
-      const knownFv = new Set(causadasFv)
-      if (collFvs.length) {
-        const { data: exist } = await supabase
-          .from('invoice_participations').select('finto_invoice').in('finto_invoice', collFvs)
-        for (const e of exist ?? []) knownFv.add(normalizeInvoiceNumber((e as any).finto_invoice))
-      }
-      for (const c of mov.collections) {
-        const ok = knownFv.has(normalizeInvoiceNumber(c.fv))
-        docs.push({
-          doc_type: 'RC', comprobante: c.receipts.join(', '), fv_ref: c.fv,
-          tercero_nit: c.clientNit || null, tercero_name: c.clientName || null,
-          period: c.iso ? c.iso.slice(0, 7) : null, doc_date: c.iso || null,
-          amount: c.collected, applied: ok ? c.collected : 0, matched: ok,
-          note: ok ? null : 'FV no configurada',
-        })
-      }
       for (const n of mov.creditNotes) docs.push({
         doc_type: 'NC', comprobante: n.comprobante, fv_ref: n.fvRef ?? '',
         tercero_nit: n.clientNit || null, tercero_name: n.clientName || null,
@@ -1080,6 +1171,132 @@ export class ParticipationsService {
         periods,
       },
     }
+  }
+
+  /**
+   * Obtiene las facturas pendientes de cobro de un cliente (finto_invoice_value > collected),
+   * ordenadas cronológicamente (FIFO).
+   */
+  static async getPendingInvoicesByClient(clientNit: string) {
+    if (!clientNit) return []
+    const nit = normalizeNit(clientNit)
+    if (!nit) return []
+
+    // Buscar compañías que coincidan por NIT
+    const { data: companies, error: coErr } = await supabase
+      .from('companies')
+      .select('id, name, nit')
+    if (coErr) throw coErr
+
+    const targetCompany = (companies ?? []).find(co => nitMatch(co.nit, nit))
+    if (!targetCompany) return []
+
+    const { data, error } = await supabase
+      .from('invoice_participations')
+      .select('id, finto_invoice, finto_invoice_date, finto_invoice_value, period, collected, cash_receipts, available_for_payment, status')
+      .eq('company_id', targetCompany.id)
+      .order('finto_invoice_date', { ascending: true })
+
+    if (error) throw error
+
+    return (data ?? [])
+      .map((ip: any) => {
+        const val = Number(ip.finto_invoice_value ?? 0)
+        const coll = Number(ip.collected ?? 0)
+        const balance = Math.max(0, money(val - coll))
+        return {
+          ...ip,
+          balance,
+          client_name: targetCompany.name,
+          client_nit: targetCompany.nit,
+        }
+      })
+      .filter((ip: any) => ip.balance > 0.01)
+  }
+
+  /**
+   * Aplica un comprobante de recaudo RC de forma manual a una o más facturas seleccionadas.
+   */
+  static async applyManualPayment(input: {
+    comprobante: string
+    client_nit: string
+    allocations: { invoice_id: string; amount: number }[]
+  }) {
+    const { comprobante, allocations } = input
+    if (!allocations.length) throw Object.assign(new Error('Debe asignar al menos una factura'), { statusCode: 400 })
+
+    const invoiceIds = allocations.map(a => a.invoice_id)
+    const { data: invoices, error } = await supabase
+      .from('invoice_participations')
+      .select('id, finto_invoice, finto_invoice_value, participation_value, participation_type, collected, cash_receipts')
+      .in('id', invoiceIds)
+    if (error) throw error
+
+    let totalApplied = 0
+    const appliedFvs: string[] = []
+
+    for (const alloc of allocations) {
+      if (alloc.amount <= 0) continue
+      const ip = (invoices ?? []).find((i: any) => i.id === alloc.invoice_id)
+      if (!ip) continue
+      const currentColl = Number((ip as any).collected ?? 0)
+      const newColl = money(currentColl + alloc.amount)
+      const existingReceipts = String((ip as any).cash_receipts ?? '').split(',').map(s => s.trim()).filter(Boolean)
+      if (!existingReceipts.some(r => normalizeInvoiceNumber(r) === normalizeInvoiceNumber(comprobante))) {
+        existingReceipts.push(comprobante)
+      }
+
+      const invVal = Number((ip as any).finto_invoice_value ?? 0)
+      const partVal = Number((ip as any).participation_value ?? 0)
+      const available = availableParticipation({
+        type: (ip as any).participation_type || 'percentage',
+        participationValue: partVal,
+        invoiceValue: invVal,
+        collected: newColl,
+      })
+
+      const { error: upErr } = await supabase
+        .from('invoice_participations')
+        .update({
+          collected: newColl,
+          cash_receipts: existingReceipts.join(', '),
+          available_for_payment: available,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', (ip as any).id)
+      if (upErr) throw upErr
+      await ParticipationsService.recomputeStatus((ip as any).id)
+
+      totalApplied = money(totalApplied + alloc.amount)
+      if ((ip as any).finto_invoice) appliedFvs.push((ip as any).finto_invoice)
+    }
+
+    // Actualizar siigo_documents si existe el comprobante
+    const { data: doc } = await supabase
+      .from('siigo_documents')
+      .select('id, amount, applied')
+      .eq('doc_type', 'RC')
+      .eq('comprobante', comprobante)
+      .maybeSingle()
+
+    if (doc) {
+      const docAmount = Number((doc as any).amount ?? totalApplied)
+      const prevApplied = Number((doc as any).applied ?? 0)
+      const newApplied = money(prevApplied + totalApplied)
+      const remaining = Math.max(0, money(docAmount - newApplied))
+      await supabase
+        .from('siigo_documents')
+        .update({
+          applied: newApplied,
+          matched: newApplied > 0,
+          fv_ref: appliedFvs.join(', '),
+          note: remaining > 0.01 ? 'Saldo restante' : null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', (doc as any).id)
+    }
+
+    return { success: true, applied: totalApplied, invoices: appliedFvs }
   }
 
   /** Recalcula el estado de una participación por factura desde sus datos */

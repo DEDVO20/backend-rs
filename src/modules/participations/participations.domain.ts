@@ -261,6 +261,67 @@ export function extractInvoiceRef(text: string): string | null {
 }
 
 /**
+ * Extrae un período 'YYYY-MM' de un texto libre (ej: "pago mayo", "mes de junio 2026", "2026-05", "05/2026").
+ * Si no viene el año en el texto, usa el año de `docDate` o el año actual como fallback.
+ * Ignora fechas completas tipo DD/MM/YYYY (ej. "Fecha: 17/06/2026") para no confundirlas con el mes facturado.
+ */
+export function extractMonthRef(text: string, docDate?: string | null): string | null {
+  if (!text) return null
+
+  // 1. Quitar fechas completas (ej: 17/06/2026, 01-05-2025) para no confundir días con meses
+  const cleaned = String(text)
+    .replace(/\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b/g, ' ')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+
+  // 2. Formato explícito YYYY-MM o YYYY/MM (ej: 2026-05, 2026/05)
+  const isoMatch = cleaned.match(/\b(202\d)[\/\-](0?[1-9]|1[0-2])\b/)
+  if (isoMatch) {
+    return `${isoMatch[1]}-${isoMatch[2]!.padStart(2, '0')}`
+  }
+
+  // 3. Formato explícito MM/YYYY precedido o seguido de indicador de mes o período
+  const myMatch = cleaned.match(/\b(?:mes|periodo|cuota)?\s*(0?[1-9]|1[0-2])[\/\-](202\d)\b/)
+  if (myMatch && myMatch[2]) {
+    return `${myMatch[2]}-${myMatch[1]!.padStart(2, '0')}`
+  }
+
+  // 4. Meses nombrados en español
+  const months: Record<string, string> = {
+    enero: '01',
+    febrero: '02',
+    marzo: '03',
+    abril: '04',
+    mayo: '05',
+    junio: '06',
+    julio: '07',
+    agosto: '08',
+    septiembre: '09',
+    setiembre: '09',
+    octubre: '10',
+    noviembre: '11',
+    diciembre: '12',
+  }
+
+  // Determinar año: buscar año de 4 dígitos (202x) en el texto
+  const yrMatch = cleaned.match(/\b(202\d)\b/)
+  let year = yrMatch ? yrMatch[1]! : null
+  if (!year) {
+    if (docDate && /^\d{4}/.test(docDate)) year = docDate.slice(0, 4)
+    else year = String(new Date().getFullYear())
+  }
+
+  for (const [name, num] of Object.entries(months)) {
+    if (new RegExp(`\\b${name}\\b`).test(cleaned)) {
+      return `${year}-${num}`
+    }
+  }
+
+  return null
+}
+
+/**
  * Parsea un número en formato colombiano a `number`: el punto es separador de
  * miles y la coma el decimal ("$33.823.175,51" → 33823175.51). Ignora símbolos
  * de moneda y espacios. Devuelve 0 si no es numérico.
@@ -406,8 +467,21 @@ export type MovSale = {
 }
 /** Nota crédito (NC) sobre la cartera 13050501 — anula/rebaja una factura. */
 export type MovCreditNote = { comprobante: string; clientNit: string; clientName: string; iso: string; amount: number; fvRef: string | null }
-/** Recaudo (RC) sobre la cartera 13050501 — lo que paga el cliente, por FV. */
-export type MovCollection = { fv: string; collected: number; receipts: string[]; iso: string; clientNit: string; clientName: string }
+/** Recaudo (RC) sobre la cartera 13050501 — lo que paga el cliente. */
+export type MovCollection = {
+  receipt: string
+  clientNit: string
+  clientName: string
+  iso: string
+  amount: number
+  desc: string
+  fvRef: string | null
+  monthRef: string | null
+  // Compatibilidad con código existente:
+  fv: string
+  collected: number
+  receipts: string[]
+}
 /** Factura de compra que envía el tercero (FC) sobre la cuenta 2335. */
 export type MovThirdInvoice = { terceroNit: string; terceroName: string; doc: string; iso: string; amount: number; fvRef: string | null }
 /** Pago al tercero (RP) por la cuenta de banco 11200504. */
@@ -440,7 +514,7 @@ export function parseAccountingMovement(rows: string[][], accounts?: Participati
   const acc = { ...PARTICIPATION_ACCOUNTS, ...accounts }
 
   const sales = new Map<string, MovSale>()
-  const collections = new Map<string, MovCollection>()
+  const collections: MovCollection[] = []
   const creditNotes: MovCreditNote[] = []
   const debitNotes: MovCreditNote[] = []
   const thirdInvoices = new Map<string, MovThirdInvoice>()
@@ -490,17 +564,25 @@ export function parseAccountingMovement(rows: string[][], accounts?: Participati
     }
 
     // ── Recaudo (RC) sobre la cartera 13050501 ───────────────────────────────
-    if (type === 'RC' && matchAcct(code, acc.receivable) && fvRefOk && value > 0) {
-      const key = `${normalizeInvoiceNumber(comp)}::${normalizeInvoiceNumber(fvRefOk)}`
+    if (type === 'RC' && matchAcct(code, acc.receivable) && value > 0) {
+      const monthRef = desc ? extractMonthRef(desc, d?.iso) : null
+      const fvTarget = fvRefOk || ''
+      const key = `${normalizeInvoiceNumber(comp)}::${normalizeInvoiceNumber(fvTarget)}::${value}`
       if (seenRc.has(key)) continue
       seenRc.add(key)
-      const g = collections.get(fvRefOk) ?? { fv: fvRefOk, collected: 0, receipts: [], iso: '', clientNit: nit, clientName: name }
-      g.collected = money(g.collected + value)
-      g.receipts.push(comp)
-      if (!g.clientNit && nit) g.clientNit = nit
-      if (!g.clientName && name) g.clientName = name
-      if (d?.iso && d.iso > g.iso) g.iso = d.iso
-      collections.set(fvRefOk, g)
+      collections.push({
+        receipt: comp,
+        clientNit: nit,
+        clientName: name,
+        amount: value,
+        iso: d?.iso ?? '',
+        desc,
+        fvRef: fvRefOk,
+        monthRef,
+        fv: fvTarget,
+        collected: value,
+        receipts: [comp],
+      })
       continue
     }
 
@@ -540,7 +622,7 @@ export function parseAccountingMovement(rows: string[][], accounts?: Participati
     sales:        [...sales.values()].filter(s => s.income > 0 || s.mandate > 0 || s.taxBase > 0),
     creditNotes,
     debitNotes,
-    collections:  [...collections.values()],
+    collections,
     thirdInvoices: [...thirdInvoices.values()],
     payments:     [...payments.values()],
   }

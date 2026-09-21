@@ -7,6 +7,7 @@ import {
   formatPaymentOrder,
   excelSerialToISO,
   extractInvoiceRef,
+  extractMonthRef,
   validateThirdPartyInvoice,
   normalizeInvoiceNumber,
   normalizeSiigoInvoice,
@@ -274,7 +275,8 @@ describe('parseAccountingMovement (reporte Movimiento por cuenta contable)', () 
 
   it('recaudo: RC de la cuenta 13050501, por FV', () => {
     const m = parseAccountingMovement(rows)
-    expect(m.collections).toEqual([{ fv: 'FV-2-70', collected: 2_678_350, receipts: ['RC-1-53'], iso: '2026-07-03', clientNit: '901178069', clientName: 'Sukot Roofing SAS' }])
+    expect(m.collections).toHaveLength(1)
+    expect(m.collections[0]).toMatchObject({ fv: 'FV-2-70', collected: 2_678_350, receipts: ['RC-1-53'], iso: '2026-07-03', clientNit: '901178069', clientName: 'Sukot Roofing SAS' })
   })
 
   it('nota crédito: NC de la cuenta 13050501, con FV si viene en la descripción', () => {
@@ -324,5 +326,50 @@ describe('parseAccountingMovement (reporte Movimiento por cuenta contable)', () 
     const m = parseAccountingMovement(custom, { income: '7001' })
     expect(m.sales).toHaveLength(1)
     expect(m.sales[0]!.income).toBe(1_000_000)
+  })
+
+  it('captura RC sin FV en la descripción y detecta el mes', () => {
+    const rcRows: string[][] = [
+      header,
+      ['13050501', '901178069', 'RC-1-80', '7/10/26', '1,500,000.00', 'Pago mensualidad mes de mayo', '', 'Sukot Roofing SAS', ''],
+      ['13050501', '901178069', 'RC-1-81', '7/12/26', '800,000.00', 'Abono transferencia Bancolombia', '', 'Sukot Roofing SAS', ''],
+    ]
+    const m = parseAccountingMovement(rcRows)
+    expect(m.collections).toHaveLength(2)
+    expect(m.collections[0]).toMatchObject({
+      receipt: 'RC-1-80',
+      fvRef: null,
+      monthRef: '2026-05',
+      amount: 1_500_000,
+    })
+    expect(m.collections[1]).toMatchObject({
+      receipt: 'RC-1-81',
+      fvRef: null,
+      monthRef: null,
+      amount: 800_000,
+    })
+  })
+})
+
+describe('extractMonthRef', () => {
+  it('detecta meses nombrados en español', () => {
+    expect(extractMonthRef('Pago mensualidad mayo', '2026-07-15')).toBe('2026-05')
+    expect(extractMonthRef('Abono mes de junio 2025', '2026-07-15')).toBe('2025-06')
+    expect(extractMonthRef('Honorarios diciembre', '2026-07-15')).toBe('2026-12')
+    expect(extractMonthRef('Servicio setiembre', '2026-07-15')).toBe('2026-09')
+  })
+
+  it('detecta formatos numéricos YYYY-MM y MM/YYYY', () => {
+    expect(extractMonthRef('Pago periodo 2026-04')).toBe('2026-04')
+    expect(extractMonthRef('Cuota 03/2026')).toBe('2026-03')
+  })
+
+  it('no confunde fechas completas DD/MM/YYYY con meses de facturación', () => {
+    expect(extractMonthRef('FV-2-70 Cuota: 1 Fecha: 17/06/2026')).toBeNull()
+  })
+
+  it('retorna null si no hay mes en la descripción', () => {
+    expect(extractMonthRef('Transferencia Bancolombia')).toBeNull()
+    expect(extractMonthRef('')).toBeNull()
   })
 })

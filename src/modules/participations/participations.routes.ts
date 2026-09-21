@@ -7,6 +7,7 @@ import { ParticipationsService } from './participations.service.js'
 import {
   thirdPartySchema, updateThirdPartySchema,
   upsertParticipationSchema, accountSettingsSchema,
+  applyManualPaymentSchema,
 } from './participations.schema.js'
 
 const app = new Hono()
@@ -268,6 +269,27 @@ app.post('/generate-monthly',
     const user = c.get('user')
     const result = await ParticipationsService.generateMonthlyOCs({ period })
     auditAsync({ action: 'create', resource: 'invoice_participations', metadata: { source: 'monthly-oc', period: result.target, created: result.created }, user, c })
+    return c.json(result)
+  },
+)
+
+// GET /api/participations/client-pending-invoices — facturas pendientes de cobro de un cliente (FIFO)
+app.get('/client-pending-invoices', async (c) => {
+  const nit = c.req.query('nit') || ''
+  const data = await ParticipationsService.getPendingInvoicesByClient(nit)
+  return c.json(data)
+})
+
+// POST /api/participations/apply-manual-payment — aplica un comprobante de recaudo RC manualmente
+app.post('/apply-manual-payment',
+  requireRole('admin', 'rs_admin', 'contador'),
+  requirePermission('participations', 'update'),
+  zValidator('json', applyManualPaymentSchema),
+  async (c) => {
+    const user = c.get('user')
+    const body = c.req.valid('json')
+    const result = await ParticipationsService.applyManualPayment(body)
+    auditAsync({ action: 'update', resource: 'invoice_participations', metadata: { source: 'manual-payment-apply', ...result }, user, c })
     return c.json(result)
   },
 )
