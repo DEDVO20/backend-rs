@@ -70,3 +70,37 @@ export const applyManualPaymentSchema = z.object({
     amount:     z.number().positive('El monto debe ser positivo'),
   })).min(1, 'Debe asignar al menos una factura'),
 })
+
+export const updateInvoiceParticipationSchema = z.object({
+  // Etapa 2: Venta
+  finto_invoice:             z.string().trim().nullable().optional(),
+  finto_invoice_date:        z.string().trim().nullable().optional(),
+  finto_invoice_value:       z.number().min(0).optional(),
+  // Etapa 3: Recaudo
+  cash_receipts:             z.string().trim().nullable().optional(),
+  cash_receipt_date:         z.string().trim().nullable().optional(),
+  collected:                 z.number().min(0).optional(),
+  // Etapa 4: Factura de compra tercero + OP
+  third_party_invoice:       z.string().trim().nullable().optional(),
+  third_party_invoice_date:  z.string().trim().nullable().optional(),
+  third_party_invoice_value: z.number().min(0).nullable().optional(),
+  payment_order:             z.string().trim().nullable().optional(),
+  // Etapa 5: Pago al tercero (RP)
+  egress_voucher:            z.string().trim().nullable().optional(),
+  egress_voucher_date:       z.string().trim().nullable().optional(),
+  egress_voucher_value:      z.number().min(0).nullable().optional(),
+})
+
+export const reallocatePaymentSchema = z.object({
+  from_invoice_id: z.string().uuid('ID de factura origen inválido'),
+  to_invoice_id:   z.string().uuid('ID de factura destino inválido'),
+  amount:          z.number().positive('El monto a transferir debe ser positivo'),
+  comprobante:     z.string().trim().optional(),
+})
+
+export const unlinkPaymentSchema = z.object({
+  invoice_id:  z.string().uuid('ID de factura inválido'),
+  amount:      z.number().positive('El monto a desvincular debe ser positivo'),
+  comprobante: z.string().trim().min(1, 'El comprobante es obligatorio'),
+})
+

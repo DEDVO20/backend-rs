@@ -316,7 +316,7 @@ export class ParticipationsService {
     let q = supabase
       .from('invoice_participations')
       .select(
-        '*, participation:service_participations(third_party:third_parties(name, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name)',
+        '*, participation:service_participations(third_party:third_parties(name, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)',
         { count: 'exact' },
       )
       .order('finto_invoice_date', { ascending: false })
@@ -1318,6 +1318,288 @@ export class ParticipationsService {
     if (upErr) throw upErr
     return data
   }
+
+  /**
+   * Obtiene el registro completo de una participación por factura por su ID.
+   */
+  static async getInvoiceParticipation(id: string) {
+    const { data, error } = await supabase
+      .from('invoice_participations')
+      .select('*, participation:service_participations(third_party:third_parties(name, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)')
+      .eq('id', id)
+      .single()
+    if (error || !data) throw Object.assign(new Error('Factura de participación no encontrada'), { statusCode: 404 })
+    return data
+  }
+
+  /**
+   * Actualiza manualmente los campos de las etapas 2, 3, 4 y 5 de una participación.
+   * Recalcula automáticamente el valor disponible y el estado.
+   */
+  static async updateInvoiceParticipation(id: string, patch: Record<string, any>) {
+    const { data: current, error: curErr } = await supabase
+      .from('invoice_participations')
+      .select('id, finto_invoice_value, collected, participation_value, participation_type, status')
+      .eq('id', id)
+      .single()
+    if (curErr || !current) throw Object.assign(new Error('Factura de participación no encontrada'), { statusCode: 404 })
+
+    const updatePayload: Record<string, any> = { ...patch, updated_at: new Date().toISOString() }
+
+    const coll = patch.collected !== undefined ? Number(patch.collected) : Number(current.collected ?? 0)
+    const fintoVal = patch.finto_invoice_value !== undefined ? Number(patch.finto_invoice_value) : Number(current.finto_invoice_value ?? 0)
+    const partVal = patch.participation_value !== undefined ? Number(patch.participation_value) : Number(current.participation_value ?? 0)
+
+    // Recalcular disponible si cambia recaudo, valor de factura o participación
+    if (patch.collected !== undefined || patch.finto_invoice_value !== undefined || patch.participation_value !== undefined) {
+      updatePayload.available_for_payment = availableParticipation({
+        type: current.participation_type || 'percentage',
+        participationValue: partVal,
+        invoiceValue: fintoVal,
+        collected: coll,
+      })
+    }
+
+    const { error: upErr } = await supabase
+      .from('invoice_participations')
+      .update(updatePayload)
+      .eq('id', id)
+    if (upErr) throw upErr
+
+    // Recalcular estado de la factura derivado de los nuevos datos
+    await ParticipationsService.recomputeStatus(id)
+
+    // Devolver el registro completo actualizado
+    const { data: updated, error: fetchErr } = await supabase
+      .from('invoice_participations')
+      .select('*, participation:service_participations(third_party:third_parties(name, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)')
+      .eq('id', id)
+      .single()
+    if (fetchErr) throw fetchErr
+
+    return updated
+  }
+
+  /**
+   * Reasigna un monto de pago (recaudo) entre dos facturas del mismo cliente.
+   */
+  static async reallocatePayment(input: {
+    from_invoice_id: string
+    to_invoice_id: string
+    amount: number
+    comprobante?: string
+  }) {
+    const { from_invoice_id, to_invoice_id, amount, comprobante } = input
+    if (from_invoice_id === to_invoice_id) {
+      throw Object.assign(new Error('Las facturas de origen y destino deben ser distintas'), { statusCode: 400 })
+    }
+
+    const { data: fromInv, error: fromErr } = await supabase
+      .from('invoice_participations')
+      .select('id, finto_invoice, finto_invoice_value, collected, cash_receipts, participation_value, participation_type')
+      .eq('id', from_invoice_id)
+      .single()
+    if (fromErr || !fromInv) throw Object.assign(new Error('Factura origen no encontrada'), { statusCode: 404 })
+
+    const { data: toInv, error: toErr } = await supabase
+      .from('invoice_participations')
+      .select('id, finto_invoice, finto_invoice_value, collected, cash_receipts, participation_value, participation_type')
+      .eq('id', to_invoice_id)
+      .single()
+    if (toErr || !toInv) throw Object.assign(new Error('Factura destino no encontrada'), { statusCode: 404 })
+
+    const fromColl = Number(fromInv.collected ?? 0)
+    if (amount > fromColl + 0.01) {
+      throw Object.assign(new Error(`El monto a transferir (${amount}) supera el recaudo actual de la factura origen (${fromColl})`), { statusCode: 400 })
+    }
+
+    const newFromColl = Math.max(0, money(fromColl - amount))
+    const newToColl = money(Number(toInv.collected ?? 0) + amount)
+
+    // Ajustar comprobantes
+    let fromReceipts = String(fromInv.cash_receipts ?? '').split(',').map(s => s.trim()).filter(Boolean)
+    let toReceipts = String(toInv.cash_receipts ?? '').split(',').map(s => s.trim()).filter(Boolean)
+
+    if (comprobante) {
+      const compNorm = normalizeInvoiceNumber(comprobante)
+      if (newFromColl <= 0.01) {
+        fromReceipts = fromReceipts.filter(r => normalizeInvoiceNumber(r) !== compNorm)
+      }
+      if (!toReceipts.some(r => normalizeInvoiceNumber(r) === compNorm)) {
+        toReceipts.push(comprobante)
+      }
+    }
+
+    const fromAvail = availableParticipation({
+      type: fromInv.participation_type || 'percentage',
+      participationValue: Number(fromInv.participation_value ?? 0),
+      invoiceValue: Number(fromInv.finto_invoice_value ?? 0),
+      collected: newFromColl,
+    })
+
+    const toAvail = availableParticipation({
+      type: toInv.participation_type || 'percentage',
+      participationValue: Number(toInv.participation_value ?? 0),
+      invoiceValue: Number(toInv.finto_invoice_value ?? 0),
+      collected: newToColl,
+    })
+
+    const now = new Date().toISOString()
+    const { error: upFromErr } = await supabase
+      .from('invoice_participations')
+      .update({
+        collected: newFromColl,
+        cash_receipts: fromReceipts.join(', '),
+        available_for_payment: fromAvail,
+        updated_at: now,
+      })
+      .eq('id', from_invoice_id)
+    if (upFromErr) throw upFromErr
+
+    const { error: upToErr } = await supabase
+      .from('invoice_participations')
+      .update({
+        collected: newToColl,
+        cash_receipts: toReceipts.join(', '),
+        available_for_payment: toAvail,
+        updated_at: now,
+      })
+      .eq('id', to_invoice_id)
+    if (upToErr) throw upToErr
+
+    await ParticipationsService.recomputeStatus(from_invoice_id)
+    await ParticipationsService.recomputeStatus(to_invoice_id)
+
+    // Si el comprobante figura en siigo_documents, actualizar referencia a la nueva factura
+    if (comprobante) {
+      const { data: doc } = await supabase
+        .from('siigo_documents')
+        .select('id, fv_ref')
+        .eq('doc_type', 'RC')
+        .eq('comprobante', comprobante)
+        .maybeSingle()
+
+      if (doc) {
+        const refs = String(doc.fv_ref ?? '').split(',').map(s => s.trim()).filter(Boolean)
+        const targetFv = toInv.finto_invoice
+        if (targetFv && !refs.some(r => normalizeInvoiceNumber(r) === normalizeInvoiceNumber(targetFv))) {
+          refs.push(targetFv)
+        }
+        await supabase
+          .from('siigo_documents')
+          .update({
+            fv_ref: refs.join(', '),
+            note: 'Reasignado manualmente',
+            updated_at: now,
+          })
+          .eq('id', doc.id)
+      }
+    }
+
+    return {
+      success: true,
+      from_collected: newFromColl,
+      to_collected: newToColl,
+      from_invoice: fromInv.finto_invoice,
+      to_invoice: toInv.finto_invoice,
+    }
+  }
+
+  /**
+   * Desvincula un comprobante o monto de recaudo de una factura, liberándolo en siigo_documents.
+   */
+  static async unlinkPayment(input: {
+    invoice_id: string
+    amount: number
+    comprobante: string
+  }) {
+    const { invoice_id, amount, comprobante } = input
+
+    const { data: inv, error: invErr } = await supabase
+      .from('invoice_participations')
+      .select('id, finto_invoice_value, collected, cash_receipts, participation_value, participation_type')
+      .eq('id', invoice_id)
+      .single()
+    if (invErr || !inv) throw Object.assign(new Error('Factura no encontrada'), { statusCode: 404 })
+
+    const curColl = Number(inv.collected ?? 0)
+    const newColl = Math.max(0, money(curColl - amount))
+
+    const compNorm = normalizeInvoiceNumber(comprobante)
+    const receipts = String(inv.cash_receipts ?? '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(r => normalizeInvoiceNumber(r) !== compNorm)
+
+    const avail = availableParticipation({
+      type: inv.participation_type || 'percentage',
+      participationValue: Number(inv.participation_value ?? 0),
+      invoiceValue: Number(inv.finto_invoice_value ?? 0),
+      collected: newColl,
+    })
+
+    const now = new Date().toISOString()
+    const { error: upErr } = await supabase
+      .from('invoice_participations')
+      .update({
+        collected: newColl,
+        cash_receipts: receipts.join(', '),
+        available_for_payment: avail,
+        updated_at: now,
+      })
+      .eq('id', invoice_id)
+    if (upErr) throw upErr
+
+    await ParticipationsService.recomputeStatus(invoice_id)
+
+    // Liberar en siigo_documents
+    const { data: doc } = await supabase
+      .from('siigo_documents')
+      .select('id, amount, applied')
+      .eq('doc_type', 'RC')
+      .eq('comprobante', comprobante)
+      .maybeSingle()
+
+    if (doc) {
+      const curApplied = Number(doc.applied ?? 0)
+      const newApplied = Math.max(0, money(curApplied - amount))
+      await supabase
+        .from('siigo_documents')
+        .update({
+          applied: newApplied,
+          matched: newApplied > 0.01,
+          note: 'Desvinculado manualmente de factura',
+          updated_at: now,
+        })
+        .eq('id', doc.id)
+    }
+
+    return { success: true, collected: newColl }
+  }
+
+  /**
+   * Obtiene los recibos de caja (RC) no cruzados o con saldo disponibles de un cliente.
+   */
+  static async getClientUncrossedReceipts(clientNit: string) {
+    if (!clientNit) return []
+    const nit = normalizeNit(clientNit)
+    if (!nit) return []
+
+    const { data, error } = await supabase
+      .from('siigo_documents')
+      .select('id, comprobante, doc_date, amount, applied, saldo, note, period, fv_ref, tercero_name, tercero_nit')
+      .eq('doc_type', 'RC')
+      .order('doc_date', { ascending: false })
+
+    if (error) throw error
+
+    return (data ?? [])
+      .filter((d: any) => {
+        const dNit = normalizeNit(d.tercero_nit)
+        return dNit && nitMatch(dNit, nit) && (Number(d.saldo ?? 0) > 0.01 || !d.matched)
+      })
+  }
+
 
   static async invoiceStats(f: { company_id?: string; period?: string; year?: string; from?: string; to?: string } = {}) {
     let q = supabase.from('invoice_participations')

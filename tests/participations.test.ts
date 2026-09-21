@@ -18,6 +18,12 @@ import {
   addMonths,
   billedPeriods,
 } from '../src/modules/participations/participations.domain.js'
+import {
+  updateInvoiceParticipationSchema,
+  reallocatePaymentSchema,
+  unlinkPaymentSchema,
+} from '../src/modules/participations/participations.schema.js'
+
 
 describe('calcParticipation', () => {
   it('calcula valor × (porcentaje / 100)', () => {
@@ -373,3 +379,123 @@ describe('extractMonthRef', () => {
     expect(extractMonthRef('')).toBeNull()
   })
 })
+
+describe('Edición manual de etapas y reasignación de pagos', () => {
+  it('valida el esquema de edición de etapas 2, 3, 4 y 5', () => {
+    const valid = updateInvoiceParticipationSchema.parse({
+      finto_invoice: 'FV-4-5000',
+      finto_invoice_date: '2026-08-10',
+      finto_invoice_value: 1_200_000,
+      cash_receipts: 'RC-1-99',
+      collected: 600_000,
+      third_party_invoice: 'FC-1-20',
+      third_party_invoice_value: 300_000,
+      payment_order: 'OP-202608-000001',
+      egress_voucher: 'RP-1-88',
+      egress_voucher_value: 300_000,
+    })
+    expect(valid.finto_invoice).toBe('FV-4-5000')
+    expect(valid.collected).toBe(600_000)
+    expect(valid.egress_voucher_value).toBe(300_000)
+  })
+
+  it('permite valores nulos para limpiar campos en edición manual', () => {
+    const cleared = updateInvoiceParticipationSchema.parse({
+      finto_invoice: null,
+      third_party_invoice: null,
+      egress_voucher: null,
+    })
+    expect(cleared.finto_invoice).toBeNull()
+    expect(cleared.third_party_invoice).toBeNull()
+  })
+
+  it('valida el esquema de reasignación de pagos', () => {
+    const valid = reallocatePaymentSchema.parse({
+      from_invoice_id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+      to_invoice_id: 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22',
+      amount: 450_000,
+      comprobante: 'RC-1-53',
+    })
+    expect(valid.amount).toBe(450_000)
+    expect(valid.comprobante).toBe('RC-1-53')
+
+    expect(() => reallocatePaymentSchema.parse({
+      from_invoice_id: 'invalid-uuid',
+      to_invoice_id: 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22',
+      amount: -10,
+    })).toThrow()
+  })
+
+  it('valida el esquema de desvinculación de pagos', () => {
+    const valid = unlinkPaymentSchema.parse({
+      invoice_id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+      amount: 250_000,
+      comprobante: 'RC-1-80',
+    })
+    expect(valid.amount).toBe(250_000)
+    expect(valid.comprobante).toBe('RC-1-80')
+
+    expect(() => unlinkPaymentSchema.parse({
+      invoice_id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+      amount: 0,
+      comprobante: '',
+    })).toThrow()
+  })
+
+  it('recalcula disponibilidad para el tercero proporcional al recaudo editado', () => {
+    // Si la participación es del 20% (100.000 sobre 500.000) y se recauda la mitad (250.000)
+    const availHalf = availableParticipation({
+      type: 'percentage',
+      participationValue: 100_000,
+      invoiceValue: 500_000,
+      collected: 250_000,
+    })
+    expect(availHalf).toBe(50_000)
+
+    // Si se edita el recaudo al 100% (500.000)
+    const availFull = availableParticipation({
+      type: 'percentage',
+      participationValue: 100_000,
+      invoiceValue: 500_000,
+      collected: 500_000,
+    })
+    expect(availFull).toBe(100_000)
+  })
+
+  it('recalcula el estado según los datos ingresados en las etapas 2, 4 y 5', () => {
+    // 1. Sin FV ni FC ni RP -> pending_invoice
+    expect(deriveInvoiceStatus({
+      finto_invoice: null,
+      third_party_invoice: null,
+      egress_voucher: null,
+    })).toBe('pending_invoice')
+
+    // 2. Con FV pero sin FC -> pending_third_invoice
+    expect(deriveInvoiceStatus({
+      finto_invoice: 'FV-4-100',
+      finto_invoice_value: 500_000,
+      participation_value: 100_000,
+      third_party_invoice: null,
+    })).toBe('pending_third_invoice')
+
+    // 3. Con FC conciliada (100.000 = 100.000) sin pago -> pending_payment
+    expect(deriveInvoiceStatus({
+      finto_invoice: 'FV-4-100',
+      participation_value: 100_000,
+      third_party_invoice: 'FC-1-20',
+      third_party_invoice_value: 100_000,
+      egress_voucher: null,
+    })).toBe('pending_payment')
+
+    // 4. Con RP pagado (100.000) -> complete
+    expect(deriveInvoiceStatus({
+      finto_invoice: 'FV-4-100',
+      participation_value: 100_000,
+      third_party_invoice: 'FC-1-20',
+      third_party_invoice_value: 100_000,
+      egress_voucher: 'RP-1-5',
+      egress_voucher_value: 100_000,
+    })).toBe('complete')
+  })
+})
+

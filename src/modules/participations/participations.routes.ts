@@ -8,6 +8,7 @@ import {
   thirdPartySchema, updateThirdPartySchema,
   upsertParticipationSchema, accountSettingsSchema,
   applyManualPaymentSchema,
+  updateInvoiceParticipationSchema, reallocatePaymentSchema, unlinkPaymentSchema,
 } from './participations.schema.js'
 
 const app = new Hono()
@@ -293,5 +294,62 @@ app.post('/apply-manual-payment',
     return c.json(result)
   },
 )
+
+// GET /api/participations/invoices/:id — detalle de una participación por factura
+app.get('/invoices/:id', async (c) => {
+  const id = c.req.param('id')
+  const data = await ParticipationsService.getInvoiceParticipation(id)
+  return c.json(data)
+})
+
+// PATCH /api/participations/invoices/:id — edición manual de las etapas 2, 3, 4 y 5
+app.patch('/invoices/:id',
+  requireRole('admin', 'rs_admin', 'contador'),
+  requirePermission('participations', 'update'),
+  zValidator('json', updateInvoiceParticipationSchema),
+  async (c) => {
+    const user = c.get('user')
+    const id = c.req.param('id')
+    const body = c.req.valid('json')
+    const result = await ParticipationsService.updateInvoiceParticipation(id, body)
+    auditAsync({ action: 'update', resource: 'invoice_participations', resource_id: id, metadata: { source: 'manual-edit', ...body }, user, c })
+    return c.json(result)
+  },
+)
+
+// POST /api/participations/reallocate-payment — reasigna un recaudo de una factura a otra del cliente
+app.post('/reallocate-payment',
+  requireRole('admin', 'rs_admin', 'contador'),
+  requirePermission('participations', 'update'),
+  zValidator('json', reallocatePaymentSchema),
+  async (c) => {
+    const user = c.get('user')
+    const body = c.req.valid('json')
+    const result = await ParticipationsService.reallocatePayment(body)
+    auditAsync({ action: 'update', resource: 'invoice_participations', metadata: { source: 'reallocate-payment', ...body }, user, c })
+    return c.json(result)
+  },
+)
+
+// POST /api/participations/unlink-payment — desvincula un recaudo de una factura y lo libera
+app.post('/unlink-payment',
+  requireRole('admin', 'rs_admin', 'contador'),
+  requirePermission('participations', 'update'),
+  zValidator('json', unlinkPaymentSchema),
+  async (c) => {
+    const user = c.get('user')
+    const body = c.req.valid('json')
+    const result = await ParticipationsService.unlinkPayment(body)
+    auditAsync({ action: 'update', resource: 'invoice_participations', resource_id: body.invoice_id, metadata: { source: 'unlink-payment', ...body }, user, c })
+    return c.json(result)
+  },
+)
+
+// GET /api/participations/client-uncrossed-receipts — recibos de caja sin cruzar o con saldo de un cliente
+app.get('/client-uncrossed-receipts', async (c) => {
+  const nit = c.req.query('nit') || ''
+  const data = await ParticipationsService.getClientUncrossedReceipts(nit)
+  return c.json(data)
+})
 
 export const participationsRoutes = app
