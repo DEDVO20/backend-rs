@@ -719,18 +719,28 @@ export class ParticipationsService {
           // Un mismo RC puede pagar varias FVs distintas del mismo cliente (varias filas
           // en el archivo). Solo saltar si este RC ya está aplicado a la FV específica.
           const targetFvNorm = c.fv ? normalizeInvoiceNumber(c.fv) : null
-          const alreadyApplied = mine.some((ip: any) => {
-            const ipFvNorm = normalizeInvoiceNumber(ip.finto_invoice ?? '')
-            const rcInIp   = hasRc(stateOfRc(ip).receipts.join(', '), c.receipt)
+          const alreadyApplied = (() => {
             if (targetFvNorm) {
               // Collection tiene FV explícita → idempotente solo si ya está en ESA FV
-              return ipFvNorm === targetFvNorm && rcInIp
+              return mine.some((ip: any) => {
+                const ipFvNorm = normalizeInvoiceNumber(ip.finto_invoice ?? '')
+                return ipFvNorm === targetFvNorm && hasRc(stateOfRc(ip).receipts.join(', '), c.receipt)
+              })
             }
-            // Sin FV explícita (FIFO) → si el RC ya aparece en cualquier factura del
-            // cliente, se considera duplicado (comportamiento original conservado).
-            return rcInIp
-          })
+            // Sin FV explícita (FIFO): descartar solo si el RC ya figura en TODAS
+            // las facturas del cliente que aún tienen saldo pendiente. Si queda alguna
+            // factura sin saldo completamente cubierto y sin este RC, se procesa.
+            const withBalance = mine.filter((ip: any) => {
+              const st = stateOfRc(ip)
+              const invoiceVal = Number(ip.finto_invoice_value ?? 0)
+              return money(invoiceVal - st.collected) > 0.01
+            })
+            if (!withBalance.length) return true  // todas saldadas → skip
+            // Si alguna con saldo pendiente NO tiene este RC, hay trabajo por hacer
+            return withBalance.every((ip: any) => hasRc(stateOfRc(ip).receipts.join(', '), c.receipt))
+          })()
           if (alreadyApplied) continue
+
 
           // FIFO: factura más antigua primero (fecha de venta, luego periodo)
           const ordered = [...mine].sort((a: any, b: any) =>
