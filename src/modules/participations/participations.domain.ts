@@ -519,7 +519,7 @@ export function parseAccountingMovement(rows: string[][], accounts?: Participati
   const debitNotes: MovCreditNote[] = []
   const thirdInvoices = new Map<string, MovThirdInvoice>()
   const payments = new Map<string, MovPayment>()
-  const seenRc = new Set<string>()
+  const seenRc = new Map<string, MovCollection>()
 
   const str = (r: string[], i: number) => (i >= 0 ? String(r[i] ?? '').trim() : '')
   const compType = (comp: string) => comp.slice(0, 2).toUpperCase()
@@ -567,24 +567,34 @@ export function parseAccountingMovement(rows: string[][], accounts?: Participati
     if (type === 'RC' && matchAcct(code, acc.receivable) && value > 0) {
       const monthRef = desc ? extractMonthRef(desc, d?.iso) : null
       const fvTarget = fvRefOk || ''
-      const key = `${normalizeInvoiceNumber(comp)}::${normalizeInvoiceNumber(fvTarget)}::${value}`
-      if (seenRc.has(key)) continue
-      seenRc.add(key)
-      collections.push({
-        receipt: comp,
-        clientNit: nit,
-        clientName: name,
-        amount: value,
-        iso: d?.iso ?? '',
-        desc,
-        fvRef: fvRefOk,
-        monthRef,
-        fv: fvTarget,
-        collected: value,
-        receipts: [comp],
-      })
+      // Clave = RC + FV (sin incluir monto). Permite acumular cuotas del mismo
+      // recibo hacia la misma factura; evita duplicados verdaderos del reporte.
+      const key = `${normalizeInvoiceNumber(comp)}::${normalizeInvoiceNumber(fvTarget)}`
+      const existing = seenRc.get(key)
+      if (existing) {
+        // Acumular: mismo RC, misma FV pero distinto monto (cuotas del mismo recibo)
+        existing.amount    = money(existing.amount    + value)
+        existing.collected = money(existing.collected + value)
+      } else {
+        const entry: MovCollection = {
+          receipt: comp,
+          clientNit: nit,
+          clientName: name,
+          amount: value,
+          iso: d?.iso ?? '',
+          desc,
+          fvRef: fvRefOk,
+          monthRef,
+          fv: fvTarget,
+          collected: value,
+          receipts: [comp],
+        }
+        seenRc.set(key, entry)
+        collections.push(entry)
+      }
       continue
     }
+
 
     // ── Nota crédito (NC) sobre la cartera 13050501 → resta del neto ─────────
     if (type === 'NC' && matchAcct(code, acc.receivable) && value > 0) {

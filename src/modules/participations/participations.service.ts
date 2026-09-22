@@ -437,7 +437,21 @@ export class ParticipationsService {
         new Error('El reporte no tiene movimientos de participaciones (ventas 41, recaudo 13050501, factura tercero 2335, pagos 1120/1110) con las columnas esperadas'),
         { statusCode: 400 },
       )
-    const collByFv = new Map(mov.collections.map(c => [normalizeInvoiceNumber(c.fv), c]))
+    // Bug fix: agrupar recaudos por FV sumando montos (un RC puede tener varias filas
+    // hacia distintas FVs; un mismo mapa de FV→colección único sobreescribía el anterior).
+    const collByFv = new Map<string, MovCollection>()
+    for (const c of mov.collections) {
+      const fvKey = normalizeInvoiceNumber(c.fv)
+      if (!fvKey) continue
+      const existing = collByFv.get(fvKey)
+      if (existing) {
+        existing.collected  = money(existing.collected  + c.collected)
+        existing.amount     = money(existing.amount     + c.amount)
+        if (!existing.receipts.includes(c.receipt)) existing.receipts.push(c.receipt)
+      } else {
+        collByFv.set(fvKey, { ...c })
+      }
+    }
     // NC/ND ajustan el neto: solo las que referencian la FV en su descripción.
     const sumByFv = (list: { amount: number; fvRef: string | null }[]) => {
       const m = new Map<string, number>()
@@ -701,8 +715,22 @@ export class ParticipationsService {
             continue
           }
 
-          // Idempotencia: si este RC ya figura en alguna factura del cliente, ya se aplicó
-          if (mine.some((ip: any) => hasRc(ip.cash_receipts, c.receipt))) continue
+          // Idempotencia: verificar por combinación (RC + FV destino), no solo por RC.
+          // Un mismo RC puede pagar varias FVs distintas del mismo cliente (varias filas
+          // en el archivo). Solo saltar si este RC ya está aplicado a la FV específica.
+          const targetFvNorm = c.fv ? normalizeInvoiceNumber(c.fv) : null
+          const alreadyApplied = mine.some((ip: any) => {
+            const ipFvNorm = normalizeInvoiceNumber(ip.finto_invoice ?? '')
+            const rcInIp   = hasRc(stateOfRc(ip).receipts.join(', '), c.receipt)
+            if (targetFvNorm) {
+              // Collection tiene FV explícita → idempotente solo si ya está en ESA FV
+              return ipFvNorm === targetFvNorm && rcInIp
+            }
+            // Sin FV explícita (FIFO) → si el RC ya aparece en cualquier factura del
+            // cliente, se considera duplicado (comportamiento original conservado).
+            return rcInIp
+          })
+          if (alreadyApplied) continue
 
           // FIFO: factura más antigua primero (fecha de venta, luego periodo)
           const ordered = [...mine].sort((a: any, b: any) =>
