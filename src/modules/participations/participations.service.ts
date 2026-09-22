@@ -1335,6 +1335,9 @@ export class ParticipationsService {
    * Obtiene el registro completo de una participación por factura por su ID.
    */
   static async getInvoiceParticipation(id: string) {
+    if (!id || id === 'undefined' || id === 'null') {
+      throw Object.assign(new Error('ID de factura de participación no válido'), { statusCode: 400 })
+    }
     const { data, error } = await supabase
       .from('invoice_participations')
       .select('*, participation:service_participations(third_party:third_parties(name, identification, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)')
@@ -1353,6 +1356,9 @@ export class ParticipationsService {
    * Recalcula automáticamente el valor disponible y el estado.
    */
   static async updateInvoiceParticipation(id: string, patch: Record<string, any>) {
+    if (!id || id === 'undefined' || id === 'null') {
+      throw Object.assign(new Error('ID de factura de participación no válido'), { statusCode: 400 })
+    }
     const { data: current, error: curErr } = await supabase
       .from('invoice_participations')
       .select('id, period, finto_invoice, finto_invoice_date, finto_invoice_value, collected, cash_receipts, third_party_invoice, third_party_invoice_date, third_party_invoice_value, payment_order, payment_order_date, egress_voucher, egress_voucher_date, egress_voucher_value, participation_value, participation_type, status')
@@ -1371,18 +1377,7 @@ export class ParticipationsService {
       updatePayload.finto_invoice = null
       updatePayload.finto_invoice_date = null
       updatePayload.finto_invoice_value = 0
-      updatePayload.cash_receipts = null
-      updatePayload.cash_receipt_date = null
-      updatePayload.collected = 0
       updatePayload.available_for_payment = 0
-      updatePayload.third_party_invoice = null
-      updatePayload.third_party_invoice_date = null
-      updatePayload.third_party_invoice_value = null
-      updatePayload.payment_order = null
-      updatePayload.payment_order_date = null
-      updatePayload.egress_voucher = null
-      updatePayload.egress_voucher_date = null
-      updatePayload.egress_voucher_value = null
 
       if (oldFv) {
         await supabase
@@ -1863,42 +1858,38 @@ export class ParticipationsService {
       finto_invoice: null,
       finto_invoice_date: null,
       finto_invoice_value: 0,
-      collected: 0,
-      cash_receipts: null,
-      cash_receipt_date: null,
       available_for_payment: 0,
-      third_party_invoice: null,
-      third_party_invoice_date: null,
-      third_party_invoice_value: null,
-      payment_order: null,
-      payment_order_date: null,
-      egress_voucher: null,
-      egress_voucher_date: null,
-      egress_voucher_value: null,
       updated_at: now,
     }
 
-    // Liberar en siigo_documents los recibos que estaban aplicados
-    const receipts = String(inv.cash_receipts ?? '').split(',').map(s => s.trim()).filter(Boolean)
-    for (const r of receipts) {
-      const { data: rcDoc } = await supabase
-        .from('siigo_documents')
-        .select('id, amount, applied')
-        .eq('doc_type', 'RC')
-        .eq('comprobante', r)
-        .maybeSingle()
-      if (rcDoc) {
-        const curApplied = Number(rcDoc.applied ?? 0)
-        const newApplied = Math.max(0, money(curApplied - Number(inv.collected ?? 0)))
-        await supabase
+    // Solo si se solicita desvincular y liberar también los recibos de caja asociados
+    if (unlink_receipts) {
+      updatePayload.collected = 0
+      updatePayload.cash_receipts = null
+      updatePayload.cash_receipt_date = null
+
+      // Liberar en siigo_documents los recibos que estaban aplicados
+      const receipts = String(inv.cash_receipts ?? '').split(',').map(s => s.trim()).filter(Boolean)
+      for (const r of receipts) {
+        const { data: rcDoc } = await supabase
           .from('siigo_documents')
-          .update({
-            applied: newApplied,
-            matched: newApplied > 0.01,
-            note: 'Desvinculado por desvinculación de FV de OC',
-            updated_at: now,
-          })
-          .eq('id', rcDoc.id)
+          .select('id, amount, applied')
+          .eq('doc_type', 'RC')
+          .eq('comprobante', r)
+          .maybeSingle()
+        if (rcDoc) {
+          const curApplied = Number(rcDoc.applied ?? 0)
+          const newApplied = Math.max(0, money(curApplied - Number(inv.collected ?? 0)))
+          await supabase
+            .from('siigo_documents')
+            .update({
+              applied: newApplied,
+              matched: newApplied > 0.01,
+              note: 'Desvinculado por desvinculación de FV de OC',
+              updated_at: now,
+            })
+            .eq('id', rcDoc.id)
+        }
       }
     }
 
