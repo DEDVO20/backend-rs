@@ -351,11 +351,12 @@ function bucketFromDays(days: number): string | null {
 /**
  * Formato "Dashboard WIP": Cliente identificacion, Cliente nombre, Fecha
  * factura, Nombre factura, Dias vencidos, Balance original.
+ * Variante sin NIT: una sola columna 'Clientes' (o 'Cliente') con el nombre.
  * El tramo se calcula desde 'Dias vencidos' y la fecha viene en español.
  */
 function mapSiigoRowWip(raw: Record<string, string>): Record<string, string> | null {
   const nit  = (raw['Cliente identificacion'] ?? '').trim()
-  const name = (raw['Cliente nombre'] ?? '').trim()
+  const name = (raw['Cliente nombre'] ?? raw['Clientes'] ?? raw['Cliente'] ?? '').trim()
   if (!nit && !name) return null
 
   const saldo = parseAmount(raw['Balance original'] ?? '')
@@ -464,7 +465,7 @@ app.post('/debtors/import',
       return c.json({ error: 'El CSV debe tener al menos una fila de datos además del encabezado' }, 400)
     }
 
-    const headers = parseCsvLine(lines[0]!)
+    const headers = parseCsvLine(lines[0]!.replace(/^﻿/, ''))
     // Cada formato se detecta por una columna que lo delata; así se ramifica
     // sin afectar a los otros:
     //   'Dias vencidos'     → Dashboard WIP (mapSiigoRowWip)
@@ -483,6 +484,15 @@ app.post('/debtors/import',
       const mapped = mapper(raw)
       if (mapped) rows.push(mapped)
       else ignored++
+    }
+
+    // Sin filas válidas NO se importa: importDebtors trata el CSV como la foto
+    // completa de la cartera y marcaría como pagadas todas las facturas.
+    if (rows.length === 0) {
+      return c.json({
+        error: `No se reconoció ninguna fila válida (${ignored} ignoradas). Revisa las columnas del CSV.`,
+        headers,
+      }, 400)
     }
 
     // SSE: stream progress
