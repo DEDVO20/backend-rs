@@ -919,17 +919,21 @@ export class ParticipationsService {
         }
       }
 
-      // ── Pago al tercero (RP): un RP puede cubrir varias participaciones del
-      //    mismo tercero. Se reparte FIFO (facturas más antiguas primero) entre
-      //    sus participaciones con disponible sin pagar; permite pago parcial
-      //    (acumula en `egress_voucher_value`) y guarda la lista de RP aplicados
-      //    en `egress_voucher`. Idempotente: un RP ya registrado no se resuma.
-      //    Si el RP trae el FV en su descripción, esa factura se atiende primero. ──
+      // ── Pago al tercero (RP): un RP es un egreso REAL ya ejecutado en SIIGO.
+      //    Se reparte FIFO (participaciones más antiguas primero) entre las OC del
+      //    mismo tercero con causado pendiente de pago (participation_value −
+      //    egress_voucher_value > 0), **sin depender del recaudo** (available_for_
+      //    payment): se paga hasta lo causado, no hasta lo disponible. Así el pago
+      //    llena primero la OC más vieja aunque el cliente aún no haya pagado esa
+      //    factura. Permite pago parcial (acumula en `egress_voucher_value`) y
+      //    guarda la lista de RP en `egress_voucher`. Idempotente: un RP ya
+      //    registrado no se resuma. Si el RP trae el FV en su descripción, esa
+      //    factura se atiende primero. ──
       if (mov.payments.length) {
         const { data: openRp } = await supabase
           .from('invoice_participations')
-          .select('id, finto_invoice, finto_invoice_date, period, available_for_payment, egress_voucher, egress_voucher_value, participation:service_participations(third_party:third_parties(identification))')
-          .gt('available_for_payment', 0)
+          .select('id, finto_invoice, finto_invoice_date, period, participation_value, available_for_payment, egress_voucher, egress_voucher_value, participation:service_participations(third_party:third_parties(identification))')
+          .gt('participation_value', 0)
         const nitOf = (ip: any) => normalizeNit(String(one(one(ip.participation)?.third_party)?.identification ?? ''))
         const hasRp = (voucher: string | null, rp: string) =>
           String(voucher ?? '').split(',').some(s => normalizeInvoiceNumber(s) === normalizeInvoiceNumber(rp))
@@ -955,14 +959,19 @@ export class ParticipationsService {
         })
         for (const p of mov.payments) {
           if (!normalizeNit(p.terceroNit)) { rpDoc(p, 0, false, 'RP sin NIT de tercero'); continue }
-          const mine = (openRp ?? []).filter((ip: any) => {
+          // Todas las OC del tercero (para idempotencia, incluidas las ya pagadas).
+          const terceroRows = (openRp ?? []).filter((ip: any) => {
             const nit = nitOf(ip)
             return nit && nitMatch(nit, p.terceroNit)
           })
-          if (!mine.length) { rpDoc(p, 0, false, 'sin participación del tercero'); continue }
-          // Idempotencia: si este RP ya figura en alguna participación del tercero
+          if (!terceroRows.length) { rpDoc(p, 0, false, 'sin participación del tercero'); continue }
+          // Idempotencia: si este RP ya figura en alguna OC del tercero (pagada o no)
           // el pago ya se repartió → no volver a sumarlo (no se re-registra).
-          if (mine.some((ip: any) => hasRp(ip.egress_voucher, p.rp))) continue
+          if (terceroRows.some((ip: any) => hasRp(ip.egress_voucher, p.rp))) continue
+          // Candidatas: solo OC con causado pendiente de pago al tercero.
+          const mine = terceroRows.filter((ip: any) =>
+            money(Number(ip.participation_value ?? 0) - Number(ip.egress_voucher_value ?? 0)) > 0.01)
+          if (!mine.length) { rpDoc(p, 0, false, 'sin participación del tercero con saldo por pagar'); continue }
 
           // FIFO: factura más antigua primero (fecha de venta, luego periodo).
           const ordered = [...mine].sort((a: any, b: any) =>
@@ -978,7 +987,8 @@ export class ParticipationsService {
           for (const ip of ordered) {
             if (remaining <= 0.01) break
             const st = stateOf(ip)
-            const owed = money(Number(ip.available_for_payment ?? 0) - st.paid)
+            // Se paga hasta lo CAUSADO (participation_value), no hasta el disponible.
+            const owed = money(Number(ip.participation_value ?? 0) - st.paid)
             if (owed <= 0.01) continue
             const applied = money(Math.min(remaining, owed))
             st.paid = money(st.paid + applied)
