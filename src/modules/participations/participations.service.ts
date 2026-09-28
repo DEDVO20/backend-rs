@@ -1004,15 +1004,46 @@ export class ParticipationsService {
 
       // ── Documentos FV / RC / NC / ND para Cruce y Pagos ──────────────────────
       const salesByFv = new Map(mov.sales.map(s => [normalizeInvoiceNumber(s.fv), s]))
+
+      // Saldo de cartera por FV = valor facturado − recaudado (estado actual en BD,
+      // ya con los RC de este informe aplicados). Así la FV "lleva" su saldo no
+      // cruzado igual que RC/FC/RP: saldo>0 = pendiente de recaudo.
+      const cartByFv = new Map<string, { invoiceValue: number; collected: number }>()
+      const fvNums = mov.sales.map(s => s.fv).filter(Boolean)
+      if (fvNums.length) {
+        const { data: ipRows } = await supabase
+          .from('invoice_participations')
+          .select('finto_invoice, finto_invoice_value, collected')
+          .in('finto_invoice', fvNums)
+        for (const ip of ipRows ?? []) {
+          const k = normalizeInvoiceNumber(ip.finto_invoice ?? '')
+          if (!k) continue
+          const prev = cartByFv.get(k)
+          const invoiceValue = Number(ip.finto_invoice_value ?? 0)
+          const collected = Number(ip.collected ?? 0)
+          cartByFv.set(k, prev
+            ? { invoiceValue: money(prev.invoiceValue + invoiceValue), collected: money(prev.collected + collected) }
+            : { invoiceValue, collected })
+        }
+      }
+
       for (const r of results) {
-        const s = salesByFv.get(normalizeInvoiceNumber(r.fv))
+        const fvKey = normalizeInvoiceNumber(r.fv)
+        const s = salesByFv.get(fvKey)
         const matched = r.outcome === 'matched'
+        const cart = cartByFv.get(fvKey)
+        // amount = valor facturado al cliente (cartera); fallback a la base si no hay
+        // participación creada (FV sin configuración).
+        const amount = cart && cart.invoiceValue > 0 ? cart.invoiceValue : (r.base ?? s?.base ?? 0)
+        const applied = cart ? money(Math.min(cart.collected, amount)) : 0
         docs.push({
           doc_type: 'FV', comprobante: r.fv, fv_ref: '',
           tercero_nit: s?.clientNit || null, tercero_name: r.client || s?.clientName || null,
           period: s?.iso ? s.iso.slice(0, 7) : null, doc_date: s?.iso || null,
-          amount: r.base ?? s?.base ?? 0, applied: matched ? (r.base ?? s?.base ?? 0) : 0,
-          matched, note: matched ? null : (r.note ?? r.outcome),
+          amount, applied, matched,
+          note: matched
+            ? (money(amount - applied) > 0.01 ? 'Pendiente de recaudo' : null)
+            : (r.note ?? r.outcome),
         })
       }
       for (const n of mov.creditNotes) docs.push({
@@ -1118,20 +1149,26 @@ export class ParticipationsService {
    * Cliente, periodo (mes), NIT y búsqueda general.
    */
   static async paymentBalances(f: {
-    doc_type?: 'RC' | 'RP'
+    doc_type?: 'FV' | 'FC' | 'RC' | 'RP'
     period?: string
     nit?: string
     client?: string
     third_party?: string
     search?: string
   } = {}) {
+    // Los cuatro tipos llevan su saldo no cruzado:
+    //  · FV = cartera pendiente de recaudo · RC = recaudo sin aplicar
+    //  · FC = factura del tercero sin conciliar/pagar · RP = pago sin aplicar
+    const ALL_TYPES = ['FV', 'FC', 'RC', 'RP']
+    // FV/RC son del lado del cliente; FC/RP del lado del tercero.
+    const isClientSide = (t: string) => t === 'FV' || t === 'RC'
     let q = supabase
       .from('siigo_documents')
       .select('*')
-      .in('doc_type', f.doc_type ? [f.doc_type] : ['RC', 'RP'])
+      .in('doc_type', f.doc_type ? [f.doc_type] : ALL_TYPES)
       .gt('saldo', 0)
       .order('doc_date', { ascending: false })
-      .limit(2000)
+      .limit(3000)
 
     if (f.period) q = q.eq('period', f.period)
     if (f.nit)    q = q.eq('tercero_nit', f.nit)
@@ -1140,11 +1177,11 @@ export class ParticipationsService {
     if (error) throw error
     let rows = data ?? []
 
-    // Filtro por Cliente (aplica a RC donde tercero_nit o tercero_name es el cliente)
+    // Filtro por Cliente (aplica a documentos del lado del cliente: FV / RC)
     if (f.client) {
       const c = f.client.trim().toLowerCase()
       rows = rows.filter((r: any) => {
-        if (r.doc_type !== 'RC') return false
+        if (!isClientSide(r.doc_type)) return false
         return (
           (r.tercero_nit && String(r.tercero_nit).toLowerCase().includes(c)) ||
           (r.tercero_name && String(r.tercero_name).toLowerCase().includes(c))
@@ -1152,11 +1189,11 @@ export class ParticipationsService {
       })
     }
 
-    // Filtro por Tercero (aplica a RP donde tercero_nit o tercero_name es el mandante/proveedor)
+    // Filtro por Tercero (aplica a documentos del lado del tercero: FC / RP)
     if (f.third_party) {
       const tp = f.third_party.trim().toLowerCase()
       rows = rows.filter((r: any) => {
-        if (r.doc_type !== 'RP') return false
+        if (isClientSide(r.doc_type)) return false
         return (
           (r.tercero_nit && String(r.tercero_nit).toLowerCase().includes(tp)) ||
           (r.tercero_name && String(r.tercero_name).toLowerCase().includes(tp))
@@ -1179,7 +1216,7 @@ export class ParticipationsService {
     const { data: allUncrossed } = await supabase
       .from('siigo_documents')
       .select('doc_type, tercero_nit, tercero_name, period')
-      .in('doc_type', ['RC', 'RP'])
+      .in('doc_type', ALL_TYPES)
       .gt('saldo', 0)
 
     const clientMap = new Map<string, string>()
@@ -1191,11 +1228,10 @@ export class ParticipationsService {
       const nit = (r.tercero_nit ?? '').trim()
       const name = (r.tercero_name ?? '').trim()
       const label = name ? `${name}${nit ? ` (${nit})` : ''}` : nit
-      if (r.doc_type === 'RC' && (nit || name)) {
-        clientMap.set(nit || name, label)
-      } else if (r.doc_type === 'RP' && (nit || name)) {
-        tpMap.set(nit || name, label)
-      }
+      if (!(nit || name)) continue
+      // FV/RC → cliente; FC/RP → tercero
+      if (isClientSide(r.doc_type)) clientMap.set(nit || name, label)
+      else                          tpMap.set(nit || name, label)
     }
 
     const clients = Array.from(clientMap.entries())
@@ -1209,19 +1245,31 @@ export class ParticipationsService {
     const periods = Array.from(periodsSet).sort().reverse()
 
     const sum = (t: string) => money(rows.filter((r: any) => r.doc_type === t).reduce((a: number, r: any) => a + Number(r.saldo ?? 0), 0))
-    const rc_count = rows.filter((r: any) => r.doc_type === 'RC').length
-    const rp_count = rows.filter((r: any) => r.doc_type === 'RP').length
+    const count = (t: string) => rows.filter((r: any) => r.doc_type === t).length
+    const fv_count = count('FV')
+    const fc_count = count('FC')
+    const rc_count = count('RC')
+    const rp_count = count('RP')
+    const fv_saldo = sum('FV')
+    const fc_saldo = sum('FC')
     const rc_saldo = sum('RC')
     const rp_saldo = sum('RP')
 
     return {
       summary: {
         count: rows.length,
+        fv_count,
+        fc_count,
         rc_count,
         rp_count,
+        fv_saldo,
+        fc_saldo,
         rc_saldo,
         rp_saldo,
-        total_saldo: money(rc_saldo + rp_saldo),
+        // Cartera pendiente de cobro (nos deben) y CxP con el tercero (debemos)
+        client_saldo: money(fv_saldo + rc_saldo),
+        third_party_saldo: money(fc_saldo + rp_saldo),
+        total_saldo: money(fv_saldo + fc_saldo + rc_saldo + rp_saldo),
       },
       items: rows,
       filter_options: {

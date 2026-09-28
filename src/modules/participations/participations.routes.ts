@@ -141,12 +141,13 @@ app.get('/cruce', async (c) => {
   return c.json(data)
 })
 
-// GET /api/participations/pagos — saldos de RC y RP no cruzados.
-// Filtros: ?doc_type=RC|RP&period=YYYY-MM&nit=&client=&third_party=&search=
+// GET /api/participations/pagos — saldos no cruzados de FV, FC, RC y RP.
+// Filtros: ?doc_type=FV|FC|RC|RP&period=YYYY-MM&nit=&client=&third_party=&search=
 app.get('/pagos', async (c) => {
   const dt = c.req.query('doc_type')
+  const valid = dt === 'FV' || dt === 'FC' || dt === 'RC' || dt === 'RP'
   const data = await ParticipationsService.paymentBalances({
-    doc_type:    dt === 'RC' || dt === 'RP' ? dt : undefined,
+    doc_type:    valid ? dt : undefined,
     period:      c.req.query('period') || undefined,
     nit:         c.req.query('nit') || undefined,
     client:      c.req.query('client') || undefined,
