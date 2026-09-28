@@ -9,7 +9,7 @@ import {
   upsertParticipationSchema, accountSettingsSchema,
   applyManualPaymentSchema,
   updateInvoiceParticipationSchema, reallocatePaymentSchema, unlinkPaymentSchema,
-  unlinkSaleInvoiceSchema,
+  unlinkEgressSchema, unlinkSaleInvoiceSchema,
 } from './participations.schema.js'
 
 const app = new Hono()
@@ -342,6 +342,20 @@ app.post('/unlink-payment',
     const body = c.req.valid('json')
     const result = await ParticipationsService.unlinkPayment(body)
     auditAsync({ action: 'update', resource: 'invoice_participations', resource_id: body.invoice_id, metadata: { source: 'unlink-payment', ...body }, user, c })
+    return c.json(result)
+  },
+)
+
+// POST /api/participations/unlink-egress — desvincula un pago al tercero (RP) y lo libera
+app.post('/unlink-egress',
+  requireRole('admin', 'rs_admin', 'contador'),
+  requirePermission('participations', 'update'),
+  zValidator('json', unlinkEgressSchema),
+  async (c) => {
+    const user = c.get('user')
+    const body = c.req.valid('json')
+    const result = await ParticipationsService.unlinkEgress(body)
+    auditAsync({ action: 'update', resource: 'invoice_participations', resource_id: body.invoice_id, metadata: { source: 'unlink-egress', ...body }, user, c })
     return c.json(result)
   },
 )

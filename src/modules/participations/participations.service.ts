@@ -319,7 +319,8 @@ export class ParticipationsService {
         '*, participation:service_participations(third_party:third_parties(name, identification, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)',
         { count: 'exact' },
       )
-      .order('finto_invoice_date', { ascending: false })
+      .order('period', { ascending: true })
+      .order('purchase_order', { ascending: true })
       .range(offset, offset + f.limit - 1)
     if (f.status)               q = q.eq('status', f.status)
     if (f.company_id)           q = q.eq('company_id', f.company_id)
@@ -1029,9 +1030,29 @@ export class ParticipationsService {
         note: n.fvRef ? null : 'sin FV en la descripción',
       })
 
-      // Persistir documentos (upsert por tipo+comprobante+FV)
+      // Persistir documentos (upsert por tipo+comprobante+FV).
+      // Bug fix: un mismo comprobante (típicamente un RC) puede llegar en varias
+      // filas del informe "mov contable" (varias cuotas / líneas de cartera del
+      // mismo recibo hacia la misma factura). Todas comparten la clave de conflicto
+      // (doc_type, comprobante, fv_ref); si se envían tal cual, PostgREST conserva
+      // solo UNA y descarta el resto → "toma una y no suma los valores". Aquí se
+      // consolidan por clave sumando amount/applied antes del upsert.
       if (docs.length) {
-        const rows = docs.map(d => ({ ...d, updated_at: new Date().toISOString() }))
+        const merged = new Map<string, any>()
+        for (const d of docs) {
+          const key = `${d.doc_type}|${String(d.comprobante ?? '').trim()}|${String(d.fv_ref ?? '').trim()}`
+          const prev = merged.get(key)
+          if (!prev) { merged.set(key, { ...d }); continue }
+          prev.amount   = money(Number(prev.amount ?? 0)  + Number(d.amount ?? 0))
+          prev.applied  = money(Number(prev.applied ?? 0) + Number(d.applied ?? 0))
+          prev.matched  = prev.matched || d.matched
+          prev.tercero_nit  = prev.tercero_nit  ?? d.tercero_nit
+          prev.tercero_name = prev.tercero_name ?? d.tercero_name
+          prev.period   = prev.period   ?? d.period
+          prev.doc_date = prev.doc_date ?? d.doc_date
+          prev.note     = prev.matched ? null : (prev.note ?? d.note)
+        }
+        const rows = [...merged.values()].map(d => ({ ...d, updated_at: new Date().toISOString() }))
         const { error: docErr } = await supabase
           .from('siigo_documents')
           .upsert(rows, { onConflict: 'doc_type,comprobante,fv_ref' })
@@ -1875,6 +1896,72 @@ export class ParticipationsService {
   }
 
   /**
+   * Desvincula un comprobante de egreso (RP) / pago al tercero de una factura,
+   * liberándolo en siigo_documents para que pueda reasignarse a la OC correcta.
+   * Análogo a unlinkPayment pero sobre egress_voucher / egress_voucher_value.
+   */
+  static async unlinkEgress(input: {
+    invoice_id: string
+    amount: number
+    comprobante: string
+  }) {
+    const { invoice_id, amount, comprobante } = input
+
+    const { data: inv, error: invErr } = await supabase
+      .from('invoice_participations')
+      .select('id, egress_voucher, egress_voucher_value')
+      .eq('id', invoice_id)
+      .single()
+    if (invErr || !inv) throw Object.assign(new Error('Factura no encontrada'), { statusCode: 404 })
+
+    const curPaid = Number(inv.egress_voucher_value ?? 0)
+    const newPaid = Math.max(0, money(curPaid - amount))
+
+    const compNorm = normalizeInvoiceNumber(comprobante)
+    const vouchers = String(inv.egress_voucher ?? '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(r => r && normalizeInvoiceNumber(r) !== compNorm)
+
+    const now = new Date().toISOString()
+    const { error: upErr } = await supabase
+      .from('invoice_participations')
+      .update({
+        egress_voucher: vouchers.length ? vouchers.join(', ') : null,
+        egress_voucher_value: newPaid > 0 ? newPaid : null,
+        updated_at: now,
+      })
+      .eq('id', invoice_id)
+    if (upErr) throw upErr
+
+    await ParticipationsService.recomputeStatus(invoice_id)
+
+    // Liberar el RP en siigo_documents
+    const { data: doc } = await supabase
+      .from('siigo_documents')
+      .select('id, amount, applied')
+      .eq('doc_type', 'RP')
+      .eq('comprobante', comprobante)
+      .maybeSingle()
+
+    if (doc) {
+      const curApplied = Number(doc.applied ?? 0)
+      const newApplied = Math.max(0, money(curApplied - amount))
+      await supabase
+        .from('siigo_documents')
+        .update({
+          applied: newApplied,
+          matched: newApplied > 0.01,
+          note: 'Desvinculado manualmente de factura',
+          updated_at: now,
+        })
+        .eq('id', doc.id)
+    }
+
+    return { success: true, egress_voucher_value: newPaid }
+  }
+
+  /**
    * Desvincula la factura de venta (FV) asignada a una orden de compra (OC).
    * Deja la OC en estado 'pending_invoice', resetea valores de factura y disponible,
    * y libera la FV en siigo_documents para que pueda asignarse a otra OC.
@@ -2169,6 +2256,8 @@ export class ParticipationsService {
     let q = supabase
       .from('invoice_participations')
       .select('purchase_order, period, finto_invoice, finto_invoice_value, collected, cash_receipts, participation_value, available_for_payment, egress_voucher, egress_voucher_value, company_id, companies(name), participation:service_participations(third_party:third_parties(name, identification))')
+      .order('period', { ascending: true })
+      .order('purchase_order', { ascending: true })
     if (filters.period)     q = q.eq('period', filters.period)
     else if (filters.year)  q = q.like('period', `${filters.year}-%`)
     if (filters.company_id) q = q.eq('company_id', filters.company_id)
@@ -2228,9 +2317,11 @@ export class ParticipationsService {
       cxp.set(tkey, te)
     }
 
-    // Ordena los ítems: primero los que tienen saldo pendiente, luego por periodo
+    // Ordena los ítems: primero los que tienen saldo pendiente, luego por periodo y OC (más antigua a más nueva)
     const byPending = (k: 'outstanding' | 'owed') => (a: any, b: any) =>
-      (b[k] > 0 ? 1 : 0) - (a[k] > 0 ? 1 : 0) || String(a.period).localeCompare(String(b.period))
+      (b[k] > 0 ? 1 : 0) - (a[k] > 0 ? 1 : 0) ||
+      String(a.period || '').localeCompare(String(b.period || '')) ||
+      String(a.purchase_order || '').localeCompare(String(b.purchase_order || ''))
 
     return {
       summary: {
@@ -2291,8 +2382,8 @@ export class ParticipationsService {
           company_service:company_services (services (name))
         )
       `)
-      .order('finto_invoice_date', { ascending: false })
-      .order('purchase_order', { ascending: false })
+      .order('period', { ascending: true })
+      .order('purchase_order', { ascending: true })
 
     if (filters.period)     q = q.eq('period', filters.period)
     else if (filters.year)  q = q.like('period', `${filters.year}-%`)
@@ -2501,6 +2592,15 @@ export class ParticipationsService {
           (inv.client_name && String(inv.client_name).toLowerCase().includes(term))
         )
       )
+    }
+
+    // Ordenar cada lista de OCs de más antigua a más nueva
+    for (const g of list) {
+      g.invoices.sort((a, b) => {
+        const pComp = String(a.period || '').localeCompare(String(b.period || ''))
+        if (pComp !== 0) return pComp
+        return String(a.purchase_order || '').localeCompare(String(b.purchase_order || ''))
+      })
     }
 
     // Ordenar: primero los terceros con mayor saldo por pagar, luego por nombre

@@ -33,6 +33,7 @@ import { documentsRoutes }  from './modules/documents/documents.routes.js'
 import { auditRoutes }      from './modules/audit/audit.routes.js'
 import { rolesRoutes }      from './modules/roles/roles.routes.js'
 import { blogRoutes }       from './modules/blog/blog.routes.js'
+import { contactRoutes }    from './modules/contact/contact.routes.js'
 
 const app = new Hono()
 
@@ -93,6 +94,9 @@ app.route('/auth', authRoutes)
 // ── Invitaciones (públicas — no requieren JWT) ────────────────────────────────
 app.route('/invitations', invitationsRoutes)
 app.route('/auth/invitations', invitationsRoutes)
+
+// ── Formulario de contacto del landing page (público) ─────────────────────────
+app.route('/contact', contactRoutes)
 
 // ── Rutas protegidas — rate limiter + audit log ───────────────────────────────
 app.use('/api/*', rateLimiter({ windowMs: 60_000, max: 100 }))

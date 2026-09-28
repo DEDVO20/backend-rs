@@ -356,6 +356,38 @@ describe('parseAccountingMovement (reporte Movimiento por cuenta contable)', () 
       amount: 800_000,
     })
   })
+
+  it('acumula varias filas del mismo RC hacia la misma FV (cuotas) en un solo recaudo sumado', () => {
+    const rcRows: string[][] = [
+      header,
+      // Mismo recibo RC-1-90, misma factura FV-2-77, en tres filas (cuotas/líneas de cartera)
+      ['13050501', '901178069', 'RC-1-90', '7/5/26', '1,000,000.00', 'Abono FV-2-77 cuota 1', '', 'Sukot Roofing SAS', ''],
+      ['13050501', '901178069', 'RC-1-90', '7/5/26', '500,000.00', 'Abono FV-2-77 cuota 2', '', 'Sukot Roofing SAS', ''],
+      ['13050501', '901178069', 'RC-1-90', '7/5/26', '250,000.00', 'Abono FV-2-77 cuota 3', '', 'Sukot Roofing SAS', ''],
+    ]
+    const m = parseAccountingMovement(rcRows)
+    // Una sola colección con el total sumado, no tres ni una sola fila.
+    expect(m.collections).toHaveLength(1)
+    expect(m.collections[0]).toMatchObject({
+      receipt: 'RC-1-90',
+      fv: 'FV-2-77',
+      amount: 1_750_000,
+      collected: 1_750_000,
+      receipts: ['RC-1-90'],
+    })
+  })
+
+  it('un mismo RC hacia FVs distintas queda como recaudos separados por factura', () => {
+    const rcRows: string[][] = [
+      header,
+      ['13050501', '901178069', 'RC-1-91', '7/5/26', '600,000.00', 'Abono FV-2-77', '', 'Sukot Roofing SAS', ''],
+      ['13050501', '901178069', 'RC-1-91', '7/5/26', '400,000.00', 'Abono FV-2-78', '', 'Sukot Roofing SAS', ''],
+    ]
+    const m = parseAccountingMovement(rcRows)
+    expect(m.collections).toHaveLength(2)
+    expect(m.collections.find(c => c.fv === 'FV-2-77')!.amount).toBe(600_000)
+    expect(m.collections.find(c => c.fv === 'FV-2-78')!.amount).toBe(400_000)
+  })
 })
 
 describe('extractMonthRef', () => {

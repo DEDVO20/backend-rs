@@ -191,6 +191,43 @@ const templates: Record<string, Builder> = {
     `),
     text: `Mensaje de ${str(d.from)} vía ${str(d.channel)}: ${str(d.text)}`,
   }),
+
+  // ── Formulario de contacto (Landing page) ─────────────────────────────────
+  'contact_lead_internal': (d) => ({
+    subject: `🔔 Nuevo lead: ${str(d.name)} — ${str(d.serviceLabel)}`,
+    html: layout('Nuevo prospecto desde la web', `
+      <p>Se acaba de registrar un nuevo lead desde el formulario de la landing page.</p>
+      <div class="info">
+        <p><strong>👤 Nombre:</strong> ${str(d.name)}</p>
+        <p><strong>🏢 Empresa:</strong> ${str(d.company)}</p>
+        <p><strong>📱 WhatsApp:</strong> ${str(d.phone)}</p>
+        <p><strong>📧 Email:</strong> ${str(d.email)}</p>
+      </div>
+      <div class="info">
+        <p><strong>🎯 Servicio de interés:</strong> ${str(d.serviceLabel)}</p>
+        <p><strong>📐 Tamaño de operación:</strong> ${str(d.sizeLabel)}</p>
+        <p><strong>📊 Volumen mensual:</strong> ${str(d.volumeLabel)}</p>
+        <p><strong>🗓️ ¿Cuándo quiere empezar?</strong> ${str(d.startLabel)}</p>
+      </div>
+      <p>Recuerda contactar al prospecto en menos de 48 horas.</p>
+    `),
+    text: `Nuevo lead: ${str(d.name)} (${str(d.company)}) — ${str(d.serviceLabel)} — ${str(d.phone)} — ${str(d.email)}`,
+  }),
+
+  'contact_lead_confirm': (d) => ({
+    subject: `¡Recibimos tu solicitud, ${str(d.name)}! Finto te contactará pronto`,
+    html: layout('¡Tu cotización está en camino!', `
+      <p>Hola <strong>${str(d.name)}</strong>,</p>
+      <p>Gracias por contactarnos. Recibimos tu solicitud sobre <strong>${str(d.serviceLabel)}</strong>.</p>
+      <p>Nuestro equipo revisará tu información y te enviará una propuesta personalizada en menos de <strong>48 horas</strong>.</p>
+      <div class="info">
+        <p>Mientras tanto, si tienes alguna duda urgente puedes escribirnos directamente a <strong>finto@finto.la</strong>.</p>
+      </div>
+      <p>¡Nos vemos pronto!</p>
+      <p><em>El equipo de Finto</em></p>
+    `),
+    text: `Hola ${str(d.name)}, recibimos tu solicitud sobre ${str(d.serviceLabel)}. Te contactaremos en menos de 48 horas.`,
+  }),
 }
 
 // ─── Exportación ─────────────────────────────────────────────────────────────
