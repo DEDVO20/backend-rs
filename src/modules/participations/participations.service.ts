@@ -1310,7 +1310,7 @@ export class ParticipationsService {
   static async recomputeOcFromAllocations(id: string) {
     const { data: oc } = await supabase
       .from('invoice_participations')
-      .select('id, period, finto_invoice_date, finto_invoice_value, participation_value, participation_type, payment_order, payment_order_date')
+      .select('id, period, finto_invoice, finto_invoice_date, finto_invoice_value, participation_value, participation_type, payment_order, payment_order_date')
       .eq('id', id)
       .maybeSingle()
     if (!oc) return
@@ -1370,6 +1370,19 @@ export class ParticipationsService {
       egress_voucher_value:      rpList.length ? rpVal : null,
       updated_at:                now,
     }).eq('id', id)
+
+    // La cartera de la FV en siigo_documents (para Saldos) se deriva del recaudo
+    // asignado: applied = recaudado → saldo = valor factura − recaudado. NO se toca
+    // `matched` (eso sigue marcando "FV sin configuración" en el Cruce, para no
+    // inundarlo con facturas que solo están pendientes de recaudo).
+    const fv = (oc as any).finto_invoice
+    if (fv) {
+      await supabase.from('siigo_documents')
+        .update({ applied: collected, updated_at: now })
+        .eq('doc_type', 'FV')
+        .eq('comprobante', fv)
+    }
+
     await ParticipationsService.recomputeStatus(id)
   }
 
