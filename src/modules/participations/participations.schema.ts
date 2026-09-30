@@ -108,9 +108,14 @@ export const unlinkPaymentSchema = z.object({
 export const createAllocationSchema = z.object({
   source_doc_type:          z.enum(['RC', 'FC', 'RP']),
   source_comprobante:       z.string().trim().min(1, 'El comprobante es obligatorio'),
-  invoice_participation_id: z.string().uuid('ID de OC inválido'),
+  // La OC se puede identificar por su NÚMERO (estable) o por id interno. Preferir
+  // el número: evita fallos por ids viejos en el navegador.
+  invoice_participation_id: z.string().uuid('ID de OC inválido').optional(),
+  purchase_order:           z.string().trim().optional(),
   amount:                   z.number().positive('El monto debe ser positivo'),
   source_nit:               z.string().trim().optional(),
+}).refine(d => !!(d.invoice_participation_id || d.purchase_order), {
+  message: 'Se requiere el número de OC (purchase_order) o el id de la OC',
 })
 
 export const applyAllocationsSchema = z.object({

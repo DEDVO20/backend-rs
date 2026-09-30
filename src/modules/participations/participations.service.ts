@@ -1545,25 +1545,42 @@ export class ParticipationsService {
     return { ocs, available }
   }
 
-  /** Crea (o acumula) una asignación de un documento a una OC. */
+  /** Crea (o acumula) una asignación de un documento a una OC. La OC se identifica
+   *  por su NÚMERO (purchase_order, estable) o por id interno; se resuelve fresca. */
   static async createAllocation(input: {
     source_doc_type: 'RC' | 'FC' | 'RP'
     source_comprobante: string
-    invoice_participation_id: string
+    invoice_participation_id?: string
+    purchase_order?: string
     amount: number
     source_nit?: string
     origin?: 'auto' | 'manual'
   }) {
-    const { source_doc_type, invoice_participation_id } = input
+    const { source_doc_type } = input
     const comp = String(input.source_comprobante ?? '').trim()
     if (!comp) throw Object.assign(new Error('Comprobante requerido'), { statusCode: 400 })
 
-    const { data: oc } = await supabase
-      .from('invoice_participations')
-      .select('id')
-      .eq('id', invoice_participation_id)
-      .maybeSingle()
-    if (!oc) throw Object.assign(new Error('OC no encontrada'), { statusCode: 404 })
+    // Resolver la OC fresca por número (preferido) o por id.
+    let ocId = input.invoice_participation_id
+    const po = String(input.purchase_order ?? '').trim()
+    if (po) {
+      const { data: rows } = await supabase
+        .from('invoice_participations')
+        .select('id')
+        .eq('purchase_order', po)
+      if (!rows || rows.length === 0) throw Object.assign(new Error(`No existe la OC ${po}`), { statusCode: 404 })
+      if (rows.length > 1) throw Object.assign(new Error(`Hay ${rows.length} OC con el número ${po}; corrige el duplicado`), { statusCode: 409 })
+      ocId = rows[0]!.id
+    } else if (ocId) {
+      const { data: oc } = await supabase
+        .from('invoice_participations')
+        .select('id')
+        .eq('id', ocId)
+        .maybeSingle()
+      if (!oc) throw Object.assign(new Error('OC no encontrada'), { statusCode: 404 })
+    } else {
+      throw Object.assign(new Error('Se requiere el número de OC o su id'), { statusCode: 400 })
+    }
 
     const avail = await ParticipationsService.docAvailable(source_doc_type, comp)
     const want = money(Number(input.amount ?? 0))
@@ -1576,7 +1593,7 @@ export class ParticipationsService {
       .select('id, amount')
       .eq('source_doc_type', source_doc_type)
       .eq('source_comprobante', comp)
-      .eq('invoice_participation_id', invoice_participation_id)
+      .eq('invoice_participation_id', ocId)
       .maybeSingle()
     const now = new Date().toISOString()
     if (existing) {
@@ -1586,10 +1603,10 @@ export class ParticipationsService {
     } else {
       await supabase.from('participation_allocations').insert({
         source_doc_type, source_comprobante: comp, source_nit: input.source_nit ?? null,
-        invoice_participation_id, amount: applyAmt, origin: input.origin ?? 'manual',
+        invoice_participation_id: ocId, amount: applyAmt, origin: input.origin ?? 'manual',
       })
     }
-    await ParticipationsService.recomputeOcFromAllocations(invoice_participation_id)
+    await ParticipationsService.recomputeOcFromAllocations(ocId!)
     await ParticipationsService.syncSiigoApplied(source_doc_type, comp)
     return { success: true, applied: applyAmt }
   }
