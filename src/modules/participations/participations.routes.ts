@@ -10,6 +10,7 @@ import {
   applyManualPaymentSchema,
   updateInvoiceParticipationSchema, reallocatePaymentSchema, unlinkPaymentSchema,
   unlinkEgressSchema, unlinkSaleInvoiceSchema,
+  linkSaleInvoiceByOrderSchema,
   createAllocationSchema, applyAllocationsSchema,
 } from './participations.schema.js'
 
@@ -421,6 +422,21 @@ app.post('/unlink-egress',
     const body = c.req.valid('json')
     const result = await ParticipationsService.unlinkEgress(body)
     auditAsync({ action: 'update', resource: 'invoice_participations', resource_id: body.invoice_id, metadata: { source: 'unlink-egress', ...body }, user, c })
+    return c.json(result)
+  },
+)
+
+// POST /api/participations/link-sale-invoice — vincula la FV a una OC por su NÚMERO
+// (purchase_order). Robusto ante ids viejos en el navegador; el server resuelve la OC actual.
+app.post('/link-sale-invoice',
+  requireRole('admin', 'rs_admin', 'contador'),
+  requirePermission('participations', 'update'),
+  zValidator('json', linkSaleInvoiceByOrderSchema),
+  async (c) => {
+    const user = c.get('user')
+    const body = c.req.valid('json')
+    const result = await ParticipationsService.linkSaleInvoiceByOrder(body)
+    auditAsync({ action: 'update', resource: 'invoice_participations', metadata: { source: 'link-sale-invoice', ...body }, user, c })
     return c.json(result)
   },
 )

@@ -123,6 +123,15 @@ export const applyAllocationsSchema = z.object({
   })).min(1, 'No hay sugerencias para aplicar'),
 })
 
+// Vincular la FV a una OC por su NÚMERO (purchase_order), no por id interno.
+// Robusto ante ids viejos en el navegador: el servidor resuelve la OC actual.
+export const linkSaleInvoiceByOrderSchema = z.object({
+  purchase_order:      z.string().trim().min(1, 'La orden de compra es obligatoria'),
+  finto_invoice:       z.string().trim().min(1, 'La factura de venta es obligatoria').nullable(),
+  finto_invoice_date:  z.string().nullable().optional(),
+  finto_invoice_value: z.number().nullable().optional(),
+})
+
 export const unlinkEgressSchema = z.object({
   invoice_id:  z.string().uuid('ID de factura inválido'),
   amount:      z.number().positive('El monto a desvincular debe ser positivo'),

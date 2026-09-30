@@ -2417,6 +2417,34 @@ export class ParticipationsService {
   }
 
   /**
+   * Vincula (o cambia) la factura de venta (FV) de una OC identificada por su
+   * NÚMERO (`purchase_order`), no por id interno. El servidor resuelve la OC
+   * actual en el momento, así que funciona aunque el navegador tenga un id viejo
+   * (p. ej. tras regenerar las OC). Reutiliza toda la lógica de updateInvoiceParticipation.
+   */
+  static async linkSaleInvoiceByOrder(input: {
+    purchase_order: string
+    finto_invoice: string | null
+    finto_invoice_date?: string | null
+    finto_invoice_value?: number | null
+  }) {
+    const po = String(input.purchase_order ?? '').trim()
+    if (!po) throw Object.assign(new Error('Orden de compra requerida'), { statusCode: 400 })
+    const { data: rows, error } = await supabase
+      .from('invoice_participations')
+      .select('id')
+      .eq('purchase_order', po)
+    if (error) throw error
+    if (!rows || rows.length === 0) throw Object.assign(new Error(`No existe la OC ${po}`), { statusCode: 404 })
+    if (rows.length > 1) throw Object.assign(new Error(`Hay ${rows.length} OC con el número ${po}; corrige el duplicado antes de vincular`), { statusCode: 409 })
+
+    const patch: Record<string, any> = { finto_invoice: input.finto_invoice ?? null }
+    if (input.finto_invoice_date !== undefined)  patch.finto_invoice_date = input.finto_invoice_date
+    if (input.finto_invoice_value !== undefined) patch.finto_invoice_value = input.finto_invoice_value
+    return ParticipationsService.updateInvoiceParticipation(rows[0]!.id, patch)
+  }
+
+  /**
    * Desvincula la factura de venta (FV) asignada a una orden de compra (OC).
    * Deja la OC en estado 'pending_invoice', resetea valores de factura y disponible,
    * y libera la FV en siigo_documents para que pueda asignarse a otra OC.
