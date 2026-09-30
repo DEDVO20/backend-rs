@@ -1,18 +1,15 @@
 import { z } from 'zod'
 
-const SERVICE_VALUES = [
-  'facturacion', 'cartera', 'controller',
-  'contabilidad', 'pagos', 'nomina', 'multiples',
-] as const
+const SERVICE_VALUES = ['control', 'contabilidad', 'facturacion', 'nomina'] as const
 
 export const contactLeadSchema = z.object({
-  // Pregunta 1 — Servicios de interés (multi-selección)
+  // Servicios seleccionados (los 4 módulos del landing)
   services: z.array(z.enum(SERVICE_VALUES)).min(1, 'Selecciona al menos un servicio'),
 
-  // Pregunta 2 — Tamaño de operación (4 opciones)
-  companySize: z.enum(['1-3', '4-10', '11-24', '25+']),
+  // Tamaño de operación
+  companySize: z.enum(['0-3', '4-9', '10-24', '25+']),
 
-  // Pregunta 3 — Cuándo quiere empezar
+  // Cuándo quiere empezar
   startDate: z.enum(['asap', 'this-month', 'next-month', 'just-quoting']),
 
   // Datos de contacto

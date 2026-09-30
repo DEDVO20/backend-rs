@@ -6,20 +6,17 @@ import type { ContactLeadInput } from './contact.schema.js'
 // ── Labels legibles para el email ────────────────────────────────────────────
 
 const SERVICE_LABELS: Record<string, string> = {
-  facturacion:  '🧾 Facturación',
-  cartera:      '💰 Cobro de cartera',
-  controller:   '📊 Controller financiero y reportes',
+  control:      '📊 Control financiero y tesorería',
   contabilidad: '📚 Contabilidad e impuestos',
-  pagos:        '💳 Pagos y tesorería',
-  nomina:       '👥 Nómina y gestión administrativa',
-  multiples:    '🚀 Tercerizar varias áreas',
+  facturacion:  '🧾 Facturación, cobranza y datos',
+  nomina:       '👥 Gestión de personal y SG-SST',
 }
 
 const SIZE_LABELS: Record<string, string> = {
-  '1-3':   '1 a 3 empleados',
-  '4-10':  '4 a 10 empleados',
-  '11-24': '11 a 24 empleados',
-  '25+':   '25 o más empleados',
+  '0-3':   '0 a 3 empleados (Emprendedor)',
+  '4-9':   '4 a 9 empleados (Pequeña empresa)',
+  '10-24': '10 a 24 empleados (Mediana empresa)',
+  '25+':   '25 o más empleados (Oferta personalizada)',
 }
 
 const START_LABELS: Record<string, string> = {
@@ -33,14 +30,11 @@ const START_LABELS: Record<string, string> = {
 
 export const contactService = {
   async submitLead(data: ContactLeadInput): Promise<void> {
-    // Construir lista legible de servicios
     const servicesLabel = data.services
       .map(s => SERVICE_LABELS[s] ?? s)
       .join(', ')
 
-    const firstService = data.services[0] ?? 'multiples'
-
-    // 1. Guardar en base de datos
+    // 1. Guardar en base de datos (prioridad: email siempre guardado)
     const { error: dbError } = await supabase.from('contact_leads').insert({
       service:        data.services.join(','),
       company_size:   data.companySize,
@@ -53,10 +47,12 @@ export const contactService = {
     })
 
     if (dbError) {
-      logger.warn({ err: dbError.message }, 'No se pudo guardar contact_lead en BD (continuando)')
+      logger.error({ err: dbError.message, email: data.email }, 'Error guardando contact_lead en BD')
+    } else {
+      logger.info({ email: data.email }, 'Lead guardado en BD correctamente')
     }
 
-    // 2. Enviar email al equipo Finto (múltiples destinatarios — errores aislados)
+    // 2. Emails internos (errores aislados — no bloquean la respuesta)
     const internalRecipients = [
       process.env.FINTO_CONTACT_EMAIL ?? 'finto@finto.la',
       'pblanco@raddf.com',
@@ -74,8 +70,8 @@ export const contactService = {
             phone:        data.phone,
             email:        data.email,
             serviceLabel: servicesLabel,
-            sizeLabel:    SIZE_LABELS[data.companySize]  ?? data.companySize,
-            startLabel:   START_LABELS[data.startDate]   ?? data.startDate,
+            sizeLabel:    SIZE_LABELS[data.companySize] ?? data.companySize,
+            startLabel:   START_LABELS[data.startDate]  ?? data.startDate,
           },
         })
       } catch (err: any) {
@@ -83,7 +79,7 @@ export const contactService = {
       }
     }
 
-    // 3. Email de confirmación al prospecto
+    // 3. Confirmación al prospecto
     try {
       await NotificationService.sendNow({
         channel:  'email',
@@ -98,6 +94,6 @@ export const contactService = {
       logger.warn({ err: err.message }, 'No se pudo enviar email de confirmación al prospecto')
     }
 
-    logger.info({ email: data.email, services: data.services }, 'Nuevo lead de contacto procesado')
+    logger.info({ email: data.email, services: data.services, size: data.companySize }, 'Lead procesado')
   },
 }
