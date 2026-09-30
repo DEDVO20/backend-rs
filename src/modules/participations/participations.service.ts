@@ -546,10 +546,11 @@ export class ParticipationsService {
         // Valor de factura para el % de recaudo: mandato = total facturado
         // (ingreso Finto + porción del tercero); servicio = base del servicio.
         const invoiceValue = isMandate ? s.base : serviceBase
-        // Recaudo del cliente (RC) de este mismo informe → libera el disponible
-        const coll      = collByFv.get(normalizeInvoiceNumber(s.fv))
-        const collected = coll?.collected ?? 0
-        const available = availableParticipation({ type: 'percentage', participationValue, invoiceValue, collected })
+        // Fase 1 (conciliación manual): la OC se crea SOLO con lo causado; el
+        // recaudo/pago se asignan luego en la rejilla (participation_allocations).
+        // No se auto-aplica el RC del mismo archivo.
+        const collected = 0
+        const available = 0
         const status = deriveInvoiceStatus({
           finto_invoice: s.fv, finto_invoice_value: invoiceValue, collected,
           available_for_payment: available, participation_value: participationValue,
@@ -575,10 +576,7 @@ export class ParticipationsService {
           percentage:            cfg.type === 'fixed' ? 0 : cfg.percentage,
           fixed_value:           cfg.type === 'fixed' && !isMandate ? cfg.fixed_value : null,
           participation_value:   participationValue,
-          collected,
-          cash_receipts:         coll?.receipts.join(', ') ?? null,
-          available_for_payment: available,
-          status,
+          _causado_status:       status,
           _period:               s.iso ? s.iso.slice(0, 7) : null,
         })
         causadasFv.add(normalizeInvoiceNumber(s.fv))
@@ -589,6 +587,11 @@ export class ParticipationsService {
     let created = 0, updated = 0, recaudo_updated = 0, third_invoice_matched = 0, paid_matched = 0
     // Documentos para Cruce/Pagos (se persisten al final del apply)
     const docs: any[] = []
+    // Fase 1 — conciliación manual asistida: el import NO aplica el dinero
+    // (RC/FC/RP); solo registra los documentos como disponibles. La asignación a
+    // las OC vive en `participation_allocations` (rejilla). Tipado boolean para no
+    // dejar código inalcanzable en los pases heredados.
+    const recordMoneyOnly: boolean = true
     if (apply) {
       const seqByPeriod = new Map<string, number>()
       const nextOc = async (period: string | null): Promise<string> => {
@@ -608,24 +611,27 @@ export class ParticipationsService {
 
       for (const w of toWrite) {
         const period = (w._period ?? null) as string | null
+        const causadoStatus = (w._causado_status ?? 'pending_third_invoice') as string
         delete w._period
+        delete w._causado_status
         w.period = period
         w.updated_at = new Date().toISOString()
+
+        // Al ACTUALIZAR una OC existente solo se tocan los campos del CAUSADO; el
+        // dinero (recaudo/factura tercero/pago) y el estado se derivan de las
+        // asignaciones (recomputeOcFromAllocations), no del import.
+        const causadoOnly = { ...w }
 
         // 1. La FV ya existe → actualiza y conserva su OC
         const { data: byFv } = await supabase
           .from('invoice_participations')
-          .select('id, collected, cash_receipts, available_for_payment')
+          .select('id')
           .eq('finto_invoice', w.finto_invoice)
           .maybeSingle()
         if (byFv) {
-          if ((byFv as any).collected > 0) {
-            w.collected = (byFv as any).collected
-            w.cash_receipts = (byFv as any).cash_receipts
-            w.available_for_payment = (byFv as any).available_for_payment
-          }
-          const { error: upErr } = await supabase.from('invoice_participations').update(w).eq('id', byFv.id)
+          const { error: upErr } = await supabase.from('invoice_participations').update(causadoOnly).eq('id', byFv.id)
           if (upErr) throw upErr
+          await ParticipationsService.recomputeOcFromAllocations(byFv.id)
           updated++
           continue
         }
@@ -644,16 +650,17 @@ export class ParticipationsService {
           placeholder = data as any
         }
         if (placeholder) {
-          w.purchase_order = placeholder.purchase_order
-          const { error: upErr } = await supabase.from('invoice_participations').update(w).eq('id', placeholder.id)
+          causadoOnly.purchase_order = placeholder.purchase_order
+          const { error: upErr } = await supabase.from('invoice_participations').update(causadoOnly).eq('id', placeholder.id)
           if (upErr) throw upErr
+          await ParticipationsService.recomputeOcFromAllocations(placeholder.id)
           updated++
           continue
         }
 
-        // 3. Sin OC previa → nueva OC para la FV
-        w.purchase_order = await nextOc(period)
-        const { error: insErr } = await supabase.from('invoice_participations').insert(w)
+        // 3. Sin OC previa → nueva OC para la FV (dinero en 0, estado del causado)
+        const insertRow = { ...w, purchase_order: await nextOc(period), collected: 0, available_for_payment: 0, status: causadoStatus }
+        const { error: insErr } = await supabase.from('invoice_participations').insert(insertRow)
         if (insErr) throw insErr
         created++
       }
@@ -701,6 +708,9 @@ export class ParticipationsService {
         })
 
         for (const c of mov.collections) {
+          // Fase 1 (conciliación manual): el import solo REGISTRA el RC como
+          // documento disponible; la asignación a las OC se hace en la rejilla.
+          if (recordMoneyOnly) { rcDoc(c, 0, false, []); continue }
           if (!normalizeNit(c.clientNit)) {
             rcDoc(c, 0, false, [], 'RC sin NIT de cliente')
             continue
@@ -864,6 +874,7 @@ export class ParticipationsService {
           amount: fc.amount, applied, matched, note: note ?? null,
         })
         for (const fc of mov.thirdInvoices) {
+          if (recordMoneyOnly) { fcDoc(fc, 0, false); continue }
           if (!normalizeNit(fc.terceroNit)) { fcDoc(fc, 0, false, 'FC sin NIT de tercero'); continue }
           const mine = (openFc ?? []).filter((ip: any) => {
             const nit = nitOf(ip)
@@ -959,6 +970,7 @@ export class ParticipationsService {
         })
         for (const p of mov.payments) {
           if (!normalizeNit(p.terceroNit)) { rpDoc(p, 0, false, 'RP sin NIT de tercero'); continue }
+          if (recordMoneyOnly) { rpDoc(p, 0, false); continue }
           // Todas las OC del tercero (para idempotencia, incluidas las ya pagadas).
           const terceroRows = (openRp ?? []).filter((ip: any) => {
             const nit = nitOf(ip)
@@ -1288,6 +1300,378 @@ export class ParticipationsService {
         periods,
       },
     }
+  }
+
+  // ── Conciliación manual asistida (participation_allocations) ─────────────────
+  // El dinero (RC/FC/RP) se asigna a las OC mediante filas de asignación. De ahí
+  // se derivan los campos de dinero de la OC y el saldo de cada documento.
+
+  /** Recalcula recaudo/factura tercero/pago y estado de una OC desde sus asignaciones. */
+  static async recomputeOcFromAllocations(id: string) {
+    const { data: oc } = await supabase
+      .from('invoice_participations')
+      .select('id, period, finto_invoice_date, finto_invoice_value, participation_value, participation_type, payment_order, payment_order_date')
+      .eq('id', id)
+      .maybeSingle()
+    if (!oc) return
+    const { data: allocs } = await supabase
+      .from('participation_allocations')
+      .select('source_doc_type, source_comprobante, amount')
+      .eq('invoice_participation_id', id)
+    const list = allocs ?? []
+    const sumBy  = (t: string) => money(list.filter((a: any) => a.source_doc_type === t).reduce((s: number, a: any) => s + Number(a.amount ?? 0), 0))
+    const compBy = (t: string) => [...new Set(list.filter((a: any) => a.source_doc_type === t).map((a: any) => String(a.source_comprobante)))]
+    const collected = sumBy('RC')
+    const fcVal = sumBy('FC')
+    const rpVal = sumBy('RP')
+    const rcList = compBy('RC'), fcList = compBy('FC'), rpList = compBy('RP')
+    const partVal = Number((oc as any).participation_value ?? 0)
+    const available = availableParticipation({
+      type: (oc as any).participation_type || 'percentage',
+      participationValue: partVal,
+      invoiceValue: Number((oc as any).finto_invoice_value ?? 0),
+      collected,
+    })
+
+    // Fase 2 — Orden de Pago (OP): cuando la FC acumulada concilia lo causado y
+    // la OC aún no tiene OP, se genera una automáticamente. Si ya no concilia
+    // (se desvincularon FC) y la OP estaba pendiente, se retira. Numeración
+    // OP-YYYYMM-#### por periodo.
+    const now = new Date().toISOString()
+    let payment_order      = (oc as any).payment_order ?? null
+    let payment_order_date = (oc as any).payment_order_date ?? null
+    const conciliated = fcList.length > 0 && validateThirdPartyInvoice(partVal, { number: fcList.join(', '), value: fcVal }).ok
+    if (conciliated && !payment_order) {
+      const periodStr = (oc as any).period
+        ?? ((oc as any).finto_invoice_date ? String((oc as any).finto_invoice_date).slice(0, 7) : new Date().toISOString().slice(0, 7))
+      const [y, m] = String(periodStr).split('-')
+      const { count } = await supabase
+        .from('invoice_participations')
+        .select('id', { count: 'exact', head: true })
+        .ilike('payment_order', `OP-${y}${m}-%`)
+      payment_order = formatPaymentOrder(Number(y), Number(m), (count ?? 0) + 1)
+      payment_order_date = (oc as any).finto_invoice_date ?? now.slice(0, 10)
+    } else if (!conciliated && payment_order && rpList.length === 0) {
+      // La OP se derivó de una conciliación que ya no se cumple y aún no hay pago
+      // (RP) asignado → se retira. Si ya hubo pago, se conserva.
+      payment_order = null
+      payment_order_date = null
+    }
+
+    await supabase.from('invoice_participations').update({
+      collected,
+      cash_receipts:             rcList.length ? rcList.join(', ') : null,
+      available_for_payment:     available,
+      third_party_invoice:       fcList.length ? fcList.join(', ') : null,
+      third_party_invoice_value: fcList.length ? fcVal : null,
+      payment_order,
+      payment_order_date,
+      egress_voucher:            rpList.length ? rpList.join(', ') : null,
+      egress_voucher_value:      rpList.length ? rpVal : null,
+      updated_at:                now,
+    }).eq('id', id)
+    await ParticipationsService.recomputeStatus(id)
+  }
+
+  /** Saldo disponible de un documento = Σ valor (siigo_documents) − Σ asignado. */
+  private static async docAvailable(doc_type: string, comprobante: string): Promise<number> {
+    const compNorm = normalizeInvoiceNumber(comprobante)
+    const { data: docsRows } = await supabase
+      .from('siigo_documents')
+      .select('comprobante, amount')
+      .eq('doc_type', doc_type)
+    const total = money((docsRows ?? [])
+      .filter((d: any) => normalizeInvoiceNumber(d.comprobante) === compNorm)
+      .reduce((s: number, d: any) => s + Number(d.amount ?? 0), 0))
+    const { data: allocRows } = await supabase
+      .from('participation_allocations')
+      .select('amount, source_comprobante')
+      .eq('source_doc_type', doc_type)
+    const allocated = money((allocRows ?? [])
+      .filter((a: any) => normalizeInvoiceNumber(a.source_comprobante) === compNorm)
+      .reduce((s: number, a: any) => s + Number(a.amount ?? 0), 0))
+    return money(total - allocated)
+  }
+
+  /** Refleja lo asignado en siigo_documents.applied/matched (para Cruce/Saldos). */
+  private static async syncSiigoApplied(doc_type: string, comprobante: string) {
+    const compNorm = normalizeInvoiceNumber(comprobante)
+    const { data: rows } = await supabase
+      .from('siigo_documents')
+      .select('id, amount, comprobante')
+      .eq('doc_type', doc_type)
+      .order('imported_at', { ascending: true })
+    const mine = (rows ?? []).filter((r: any) => normalizeInvoiceNumber(r.comprobante) === compNorm)
+    const { data: allocRows } = await supabase
+      .from('participation_allocations')
+      .select('amount, source_comprobante')
+      .eq('source_doc_type', doc_type)
+    let remaining = money((allocRows ?? [])
+      .filter((a: any) => normalizeInvoiceNumber(a.source_comprobante) === compNorm)
+      .reduce((s: number, a: any) => s + Number(a.amount ?? 0), 0))
+    const now = new Date().toISOString()
+    for (const r of mine) {
+      const amt = Number(r.amount ?? 0)
+      const applied = money(Math.min(amt, Math.max(0, remaining)))
+      remaining = money(remaining - applied)
+      await supabase.from('siigo_documents')
+        .update({ applied, matched: applied + 0.01 >= amt, updated_at: now })
+        .eq('id', r.id)
+    }
+  }
+
+  /** Documentos de dinero (RC/FC/RP) con saldo disponible para asignar. */
+  static async availableMoneyDocs(f: { doc_type?: 'RC' | 'FC' | 'RP'; nit?: string } = {}) {
+    const types = f.doc_type ? [f.doc_type] : ['RC', 'FC', 'RP']
+    let q = supabase
+      .from('siigo_documents')
+      .select('doc_type, comprobante, fv_ref, tercero_nit, tercero_name, period, doc_date, amount')
+      .in('doc_type', types)
+    if (f.nit) q = q.eq('tercero_nit', f.nit)
+    const { data } = await q
+
+    const { data: allocRows } = await supabase
+      .from('participation_allocations')
+      .select('source_doc_type, source_comprobante, amount')
+    const allocMap = new Map<string, number>()
+    for (const a of allocRows ?? []) {
+      const k = `${a.source_doc_type}::${normalizeInvoiceNumber(a.source_comprobante)}`
+      allocMap.set(k, money((allocMap.get(k) ?? 0) + Number(a.amount ?? 0)))
+    }
+
+    const g = new Map<string, any>()
+    for (const d of data ?? []) {
+      const key = `${d.doc_type}::${normalizeInvoiceNumber(d.comprobante)}`
+      const prev = g.get(key)
+      if (prev) {
+        prev.amount = money(prev.amount + Number(d.amount ?? 0))
+        if (!prev.fv_ref && d.fv_ref) prev.fv_ref = d.fv_ref
+      } else {
+        g.set(key, {
+          doc_type: d.doc_type, comprobante: d.comprobante, fv_ref: d.fv_ref || '',
+          tercero_nit: d.tercero_nit, tercero_name: d.tercero_name,
+          period: d.period, doc_date: d.doc_date, amount: Number(d.amount ?? 0),
+        })
+      }
+    }
+    const out: any[] = []
+    for (const [key, v] of g) {
+      const allocated = allocMap.get(key) ?? 0
+      const available = money(v.amount - allocated)
+      if (available > 0.01) out.push({ ...v, allocated, available })
+    }
+    return out.sort((a, b) => String(a.doc_date ?? '').localeCompare(String(b.doc_date ?? '')))
+  }
+
+  /** Datos de la rejilla de conciliación: OC (con lo causado y lo asignado) + documentos disponibles. */
+  static async reconciliationData(f: { period?: string; company_id?: string; nit?: string; search?: string } = {}) {
+    let q = supabase
+      .from('invoice_participations')
+      .select('id, purchase_order, period, finto_invoice, finto_invoice_date, finto_invoice_value, participation_value, participation_type, contract_type, collected, third_party_invoice_value, payment_order, egress_voucher_value, status, company_id, companies(name, nit), participation:service_participations(third_party:third_parties(name, identification))')
+      .gt('participation_value', 0)
+      .order('period', { ascending: true })
+      .order('purchase_order', { ascending: true })
+      .limit(3000)
+    if (f.period)     q = q.eq('period', f.period)
+    if (f.company_id) q = q.eq('company_id', f.company_id)
+    const { data: ocRows, error } = await q
+    if (error) throw error
+
+    const ids = (ocRows ?? []).map((r: any) => r.id)
+    const allocByOc = new Map<string, any[]>()
+    if (ids.length) {
+      const { data: allocs } = await supabase
+        .from('participation_allocations')
+        .select('*')
+        .in('invoice_participation_id', ids)
+      for (const a of allocs ?? []) {
+        const arr = allocByOc.get(a.invoice_participation_id) ?? []
+        arr.push(a)
+        allocByOc.set(a.invoice_participation_id, arr)
+      }
+    }
+
+    const one = (v: any) => Array.isArray(v) ? v[0] : v
+    let ocs = (ocRows ?? []).map((r: any) => {
+      const co = one(r.companies)
+      const tp = one(one(r.participation)?.third_party)
+      return {
+        id: r.id, purchase_order: r.purchase_order, period: r.period,
+        finto_invoice: r.finto_invoice, finto_invoice_date: r.finto_invoice_date,
+        finto_invoice_value: Number(r.finto_invoice_value ?? 0),
+        participation_value: Number(r.participation_value ?? 0),
+        contract_type: r.contract_type, status: r.status,
+        client_name: co?.name ?? '—', client_nit: co?.nit ?? '',
+        tercero_name: tp?.name ?? '—', tercero_nit: tp?.identification ?? '',
+        collected: Number(r.collected ?? 0),
+        third_party_invoice_value: Number(r.third_party_invoice_value ?? 0),
+        payment_order: r.payment_order ?? null,
+        egress_voucher_value: Number(r.egress_voucher_value ?? 0),
+        allocations: (allocByOc.get(r.id) ?? []).map((a: any) => ({
+          id: a.id, source_doc_type: a.source_doc_type, source_comprobante: a.source_comprobante,
+          amount: Number(a.amount ?? 0), origin: a.origin,
+        })),
+      }
+    })
+
+    if (f.nit) {
+      const n = normalizeNit(f.nit)
+      ocs = ocs.filter((o: any) => nitMatch(normalizeNit(o.client_nit), n) || nitMatch(normalizeNit(o.tercero_nit), n))
+    }
+    if (f.search) {
+      const s = f.search.toLowerCase()
+      ocs = ocs.filter((o: any) => [o.purchase_order, o.finto_invoice, o.client_name, o.tercero_name, o.client_nit, o.tercero_nit]
+        .some(v => String(v ?? '').toLowerCase().includes(s)))
+    }
+
+    const available = {
+      RC: await ParticipationsService.availableMoneyDocs({ doc_type: 'RC' }),
+      FC: await ParticipationsService.availableMoneyDocs({ doc_type: 'FC' }),
+      RP: await ParticipationsService.availableMoneyDocs({ doc_type: 'RP' }),
+    }
+    return { ocs, available }
+  }
+
+  /** Crea (o acumula) una asignación de un documento a una OC. */
+  static async createAllocation(input: {
+    source_doc_type: 'RC' | 'FC' | 'RP'
+    source_comprobante: string
+    invoice_participation_id: string
+    amount: number
+    source_nit?: string
+    origin?: 'auto' | 'manual'
+  }) {
+    const { source_doc_type, invoice_participation_id } = input
+    const comp = String(input.source_comprobante ?? '').trim()
+    if (!comp) throw Object.assign(new Error('Comprobante requerido'), { statusCode: 400 })
+
+    const { data: oc } = await supabase
+      .from('invoice_participations')
+      .select('id')
+      .eq('id', invoice_participation_id)
+      .maybeSingle()
+    if (!oc) throw Object.assign(new Error('OC no encontrada'), { statusCode: 404 })
+
+    const avail = await ParticipationsService.docAvailable(source_doc_type, comp)
+    const want = money(Number(input.amount ?? 0))
+    if (want <= 0) throw Object.assign(new Error('Monto inválido'), { statusCode: 400 })
+    const applyAmt = money(Math.min(want, avail))
+    if (applyAmt <= 0.01) throw Object.assign(new Error('El documento no tiene saldo disponible'), { statusCode: 400 })
+
+    const { data: existing } = await supabase
+      .from('participation_allocations')
+      .select('id, amount')
+      .eq('source_doc_type', source_doc_type)
+      .eq('source_comprobante', comp)
+      .eq('invoice_participation_id', invoice_participation_id)
+      .maybeSingle()
+    const now = new Date().toISOString()
+    if (existing) {
+      await supabase.from('participation_allocations')
+        .update({ amount: money(Number(existing.amount ?? 0) + applyAmt), origin: input.origin ?? 'manual', updated_at: now })
+        .eq('id', existing.id)
+    } else {
+      await supabase.from('participation_allocations').insert({
+        source_doc_type, source_comprobante: comp, source_nit: input.source_nit ?? null,
+        invoice_participation_id, amount: applyAmt, origin: input.origin ?? 'manual',
+      })
+    }
+    await ParticipationsService.recomputeOcFromAllocations(invoice_participation_id)
+    await ParticipationsService.syncSiigoApplied(source_doc_type, comp)
+    return { success: true, applied: applyAmt }
+  }
+
+  /** Elimina una asignación (desvincula el documento de la OC). */
+  static async deleteAllocation(id: string) {
+    const { data: a } = await supabase
+      .from('participation_allocations')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle()
+    if (!a) throw Object.assign(new Error('Asignación no encontrada'), { statusCode: 404 })
+    await supabase.from('participation_allocations').delete().eq('id', id)
+    await ParticipationsService.recomputeOcFromAllocations(a.invoice_participation_id)
+    await ParticipationsService.syncSiigoApplied(a.source_doc_type, a.source_comprobante)
+    return { success: true }
+  }
+
+  /**
+   * Sugerencia FIFO (NO escribe): propone a qué OC asignar cada documento
+   * disponible, más antiguas primero, hasta cubrir el hueco correspondiente:
+   *  · RC → cartera del cliente (finto_invoice_value − recaudado)
+   *  · FC → causado del tercero (participation_value − facturado)
+   *  · RP → causado del tercero (participation_value − pagado)
+   */
+  static async suggestAllocationsFifo(f: { doc_type?: 'RC' | 'FC' | 'RP'; period?: string; nit?: string } = {}) {
+    const data = await ParticipationsService.reconciliationData({ period: f.period, nit: f.nit })
+    // Clave cronológica robusta: usa la fecha de la FV (YYYY-MM-DD); si no hay,
+    // el periodo como YYYY-MM-01; si tampoco, va al final. Evita comparar cadenas
+    // de distinta longitud (YYYY-MM vs YYYY-MM-DD) que desordenan el FIFO.
+    const fifoKey = (o: any) => {
+      const d = String(o.finto_invoice_date ?? '')
+      if (/^\d{4}-\d{2}-\d{2}/.test(d)) return d.slice(0, 10)
+      const p = String(o.period ?? '')
+      if (/^\d{4}-\d{2}$/.test(p)) return `${p}-01`
+      return '9999-12-31'
+    }
+    const ocs = [...data.ocs].sort((a: any, b: any) => fifoKey(a).localeCompare(fifoKey(b)))
+    const proposals: any[] = []
+    const types: ('RC' | 'FC' | 'RP')[] = f.doc_type ? [f.doc_type] : ['RC', 'FC', 'RP']
+
+    // Hueco por OC según el tipo (mutable durante el reparto)
+    const gap = (o: any, t: string) =>
+      t === 'RC' ? money(o.finto_invoice_value - o.collected)
+      : t === 'FC' ? money(o.participation_value - o.third_party_invoice_value)
+      : money(o.participation_value - o.egress_voucher_value)
+    const bump = (o: any, t: string, amt: number) => {
+      if (t === 'RC') o.collected = money(o.collected + amt)
+      else if (t === 'FC') o.third_party_invoice_value = money(o.third_party_invoice_value + amt)
+      else o.egress_voucher_value = money(o.egress_voucher_value + amt)
+    }
+
+    for (const t of types) {
+      const docs = (data.available as any)[t] as any[]
+      for (const d of docs) {
+        let remaining = money(d.available)
+        // El lado cliente (RC) matchea por NIT de cliente; FC/RP por NIT de tercero.
+        const candidates = ocs.filter((o: any) => {
+          if (remaining <= 0.01) return false
+          const ocNit = t === 'RC' ? o.client_nit : o.tercero_nit
+          return d.tercero_nit && normalizeNit(String(ocNit)) && nitMatch(normalizeNit(String(ocNit)), normalizeNit(String(d.tercero_nit)))
+        })
+        // Siempre la más antigua primero (sin excepción por la FV que nombre el
+        // documento): `candidates` ya viene ordenado cronológicamente por fifoKey.
+        const ordered = candidates
+        for (const o of ordered) {
+          if (remaining <= 0.01) break
+          const g = gap(o, t)
+          if (g <= 0.01) continue
+          const amt = money(Math.min(remaining, g))
+          proposals.push({
+            source_doc_type: t, source_comprobante: d.comprobante, source_nit: d.tercero_nit,
+            invoice_participation_id: o.id, amount: amt,
+            doc_label: `${d.comprobante}`, oc_label: `${o.purchase_order} · ${o.finto_invoice ?? o.period ?? ''}`,
+            client_name: o.client_name, tercero_name: o.tercero_name,
+          })
+          bump(o, t, amt)
+          remaining = money(remaining - amt)
+        }
+      }
+    }
+    return { proposals }
+  }
+
+  /** Aplica una lista de sugerencias (crea las asignaciones origin='auto'). */
+  static async applyAllocations(items: Array<{
+    source_doc_type: 'RC' | 'FC' | 'RP'; source_comprobante: string
+    invoice_participation_id: string; amount: number; source_nit?: string
+  }>) {
+    let created = 0
+    for (const it of items) {
+      try { await ParticipationsService.createAllocation({ ...it, origin: 'auto' }); created++ }
+      catch (e) { logger.warn({ e: (e as any)?.message, it }, 'applyAllocations: fila omitida') }
+    }
+    return { created, total: items.length }
   }
 
   /**

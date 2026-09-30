@@ -104,6 +104,25 @@ export const unlinkPaymentSchema = z.object({
   comprobante: z.string().trim().min(1, 'El comprobante es obligatorio'),
 })
 
+// ── Conciliación manual asistida (participation_allocations) ──────────────────
+export const createAllocationSchema = z.object({
+  source_doc_type:          z.enum(['RC', 'FC', 'RP']),
+  source_comprobante:       z.string().trim().min(1, 'El comprobante es obligatorio'),
+  invoice_participation_id: z.string().uuid('ID de OC inválido'),
+  amount:                   z.number().positive('El monto debe ser positivo'),
+  source_nit:               z.string().trim().optional(),
+})
+
+export const applyAllocationsSchema = z.object({
+  items: z.array(z.object({
+    source_doc_type:          z.enum(['RC', 'FC', 'RP']),
+    source_comprobante:       z.string().trim().min(1),
+    invoice_participation_id: z.string().uuid(),
+    amount:                   z.number().positive(),
+    source_nit:               z.string().trim().optional(),
+  })).min(1, 'No hay sugerencias para aplicar'),
+})
+
 export const unlinkEgressSchema = z.object({
   invoice_id:  z.string().uuid('ID de factura inválido'),
   amount:      z.number().positive('El monto a desvincular debe ser positivo'),

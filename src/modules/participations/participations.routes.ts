@@ -10,6 +10,7 @@ import {
   applyManualPaymentSchema,
   updateInvoiceParticipationSchema, reallocatePaymentSchema, unlinkPaymentSchema,
   unlinkEgressSchema, unlinkSaleInvoiceSchema,
+  createAllocationSchema, applyAllocationsSchema,
 } from './participations.schema.js'
 
 const app = new Hono()
@@ -156,6 +157,69 @@ app.get('/pagos', async (c) => {
   })
   return c.json(data)
 })
+
+// ── Conciliación manual asistida (dinero: RC/FC/RP) ──────────────────────────
+
+// GET /api/participations/reconciliation — OC (causado + asignado) + documentos disponibles
+app.get('/reconciliation', async (c) => {
+  const data = await ParticipationsService.reconciliationData({
+    period:     c.req.query('period') || undefined,
+    company_id: c.req.query('company_id') || undefined,
+    nit:        c.req.query('nit') || undefined,
+    search:     c.req.query('search') || undefined,
+  })
+  return c.json(data)
+})
+
+// GET /api/participations/allocations/suggest — sugerencia FIFO (no escribe)
+app.get('/allocations/suggest', async (c) => {
+  const dt = c.req.query('doc_type')
+  const valid = dt === 'RC' || dt === 'FC' || dt === 'RP'
+  const data = await ParticipationsService.suggestAllocationsFifo({
+    doc_type: valid ? dt : undefined,
+    period:   c.req.query('period') || undefined,
+    nit:      c.req.query('nit') || undefined,
+  })
+  return c.json(data)
+})
+
+// POST /api/participations/allocations — asigna un documento (RC/FC/RP) a una OC
+app.post('/allocations',
+  requirePermission('participations', 'update'),
+  zValidator('json', createAllocationSchema),
+  async (c) => {
+    const user = c.get('user')
+    const body = c.req.valid('json')
+    const result = await ParticipationsService.createAllocation(body)
+    auditAsync({ action: 'create', resource: 'participation_allocations', resource_id: body.invoice_participation_id, metadata: { ...body }, user, c })
+    return c.json(result, 201)
+  },
+)
+
+// POST /api/participations/allocations/apply — aplica una lista de sugerencias FIFO
+app.post('/allocations/apply',
+  requirePermission('participations', 'update'),
+  zValidator('json', applyAllocationsSchema),
+  async (c) => {
+    const user = c.get('user')
+    const body = c.req.valid('json')
+    const result = await ParticipationsService.applyAllocations(body.items)
+    auditAsync({ action: 'create', resource: 'participation_allocations', metadata: { source: 'suggest-apply', ...result }, user, c })
+    return c.json(result)
+  },
+)
+
+// DELETE /api/participations/allocations/:id — desvincula un documento de una OC
+app.delete('/allocations/:id',
+  requirePermission('participations', 'update'),
+  async (c) => {
+    const user = c.get('user')
+    const id = c.req.param('id')!
+    const result = await ParticipationsService.deleteAllocation(id)
+    auditAsync({ action: 'delete', resource: 'participation_allocations', resource_id: id, user, c })
+    return c.json(result)
+  },
+)
 
 // GET /api/participations/conciliation — vista maestra (una fila por OC con las
 // 5 etapas). Filtros opcionales: ?period=YYYY-MM&company_id=
