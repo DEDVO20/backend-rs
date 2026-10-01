@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import { authMiddleware } from '../../middleware/auth.js'
-import { requireRole } from '../../middleware/requireRole.js'
+import { requireModule, requirePermission } from '../../middleware/requireRole.js'
 import { blogService } from './blog.service.js'
 import {
   createBlogPostSchema,
@@ -41,28 +41,38 @@ app.get('/public/:slug', async (c) => {
 // ── Rutas Administrativas (Gestión desde el panel admin) ────────────────────
 
 app.use('/*', authMiddleware)
-app.use('/*', requireRole('admin', 'rs_admin', 'rs_staff'))
+app.use('/*', requireModule('blog'))
 
 // Categorías CRUD administrativo
-app.post('/categories', zValidator('json', createBlogCategorySchema), async (c) => {
-  const body = c.req.valid('json')
-  const category = await blogService.createCategory(body)
-  return c.json(category, 201)
-})
-
-app.patch('/categories/:id', zValidator('json', updateBlogCategorySchema), async (c) => {
-  const id = c.req.param('id')
-  const body = c.req.valid('json')
-  try {
-    const category = await blogService.updateCategory(id, body)
-    return c.json(category)
-  } catch (err: any) {
-    return c.json({ error: err.message }, 404)
+app.post(
+  '/categories',
+  requirePermission('blog', 'create'),
+  zValidator('json', createBlogCategorySchema),
+  async (c) => {
+    const body = c.req.valid('json')
+    const category = await blogService.createCategory(body)
+    return c.json(category, 201)
   }
-})
+)
 
-app.delete('/categories/:id', async (c) => {
-  const id = c.req.param('id')
+app.patch(
+  '/categories/:id',
+  requirePermission('blog', 'update'),
+  zValidator('json', updateBlogCategorySchema),
+  async (c) => {
+    const id = c.req.param('id') as string
+    const body = c.req.valid('json')
+    try {
+      const category = await blogService.updateCategory(id, body)
+      return c.json(category)
+    } catch (err: any) {
+      return c.json({ error: err.message }, 404)
+    }
+  }
+)
+
+app.delete('/categories/:id', requirePermission('blog', 'delete'), async (c) => {
+  const id = c.req.param('id') as string
   const success = await blogService.deleteCategory(id)
   if (!success) {
     return c.json({ error: 'Categoría no encontrada' }, 404)
@@ -77,25 +87,35 @@ app.get('/', zValidator('query', queryBlogPostSchema), async (c) => {
   return c.json(result)
 })
 
-app.post('/', zValidator('json', createBlogPostSchema), async (c) => {
-  const body = c.req.valid('json')
-  const post = await blogService.createPost(body)
-  return c.json(post, 201)
-})
-
-app.patch('/:id', zValidator('json', updateBlogPostSchema), async (c) => {
-  const id = c.req.param('id')
-  const body = c.req.valid('json')
-  try {
-    const post = await blogService.updatePost(id, body)
-    return c.json(post)
-  } catch (err: any) {
-    return c.json({ error: err.message }, 404)
+app.post(
+  '/',
+  requirePermission('blog', 'create'),
+  zValidator('json', createBlogPostSchema),
+  async (c) => {
+    const body = c.req.valid('json')
+    const post = await blogService.createPost(body)
+    return c.json(post, 201)
   }
-})
+)
 
-app.patch('/:id/toggle-publish', async (c) => {
-  const id = c.req.param('id')
+app.patch(
+  '/:id',
+  requirePermission('blog', 'update'),
+  zValidator('json', updateBlogPostSchema),
+  async (c) => {
+    const id = c.req.param('id') as string
+    const body = c.req.valid('json')
+    try {
+      const post = await blogService.updatePost(id, body)
+      return c.json(post)
+    } catch (err: any) {
+      return c.json({ error: err.message }, 404)
+    }
+  }
+)
+
+app.patch('/:id/toggle-publish', requirePermission('blog', 'update'), async (c) => {
+  const id = c.req.param('id') as string
   try {
     const post = await blogService.togglePublish(id)
     return c.json(post)
@@ -104,8 +124,8 @@ app.patch('/:id/toggle-publish', async (c) => {
   }
 })
 
-app.delete('/:id', async (c) => {
-  const id = c.req.param('id')
+app.delete('/:id', requirePermission('blog', 'delete'), async (c) => {
+  const id = c.req.param('id') as string
   const success = await blogService.deletePost(id)
   if (!success) {
     return c.json({ error: 'Artículo no encontrado' }, 404)

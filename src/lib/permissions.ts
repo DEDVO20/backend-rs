@@ -32,6 +32,8 @@ export const MODULE_CATALOG = {
   settings:             { name: 'Configuración',          scope: 'internal' },
   notifications_log:    { name: 'Log de notificaciones',  scope: 'internal' },
   roles:                { name: 'Roles y permisos',       scope: 'internal' },
+  leads:                { name: 'Leads cotizador',        scope: 'internal' },
+  blog:                 { name: 'Blog y Artículos',       scope: 'internal' },
 } as const satisfies Record<string, { name: string; scope: 'internal' | 'client' | 'shared' }>
 
 export type Module = keyof typeof MODULE_CATALOG
@@ -73,23 +75,36 @@ export function buildPermMap(rows: PermRow[]): PermMap {
 
 /** ¿El rol puede ejecutar `action` sobre `module`? (función pura sobre un mapa) */
 export function canFromMap(map: PermMap, role: Role, module: string, action: Action = 'view'): boolean {
+  if (role === 'admin') return true
   return map.get(role)?.get(module)?.has(action) ?? false
 }
 
 /** Módulos visibles (con acción 'view') para un rol. (función pura sobre un mapa) */
 export function modulesFromMap(map: PermMap, role: Role): string[] {
   const byModule = map.get(role)
-  if (!byModule) return []
-  return [...byModule.entries()].filter(([, a]) => a.has('view')).map(([m]) => m)
+  const list = byModule
+    ? [...byModule.entries()].filter(([, a]) => a.has('view')).map(([m]) => m)
+    : []
+  if (role === 'admin') {
+    const all = Object.keys(MODULE_CATALOG)
+    return Array.from(new Set([...all, ...list]))
+  }
+  return list
 }
 
 /** Permisos de un rol como { module: Action[] } (para enviar al frontend). */
 export function permissionsFromMap(map: PermMap, role: Role): Record<string, Action[]> {
   const byModule = map.get(role)
-  if (!byModule) return {}
   const out: Record<string, Action[]> = {}
-  for (const [module, actions] of byModule) {
-    out[module] = ACTIONS.filter(a => actions.has(a))
+  if (byModule) {
+    for (const [module, actions] of byModule) {
+      out[module] = ACTIONS.filter(a => actions.has(a))
+    }
+  }
+  if (role === 'admin') {
+    for (const m of Object.keys(MODULE_CATALOG)) {
+      if (!out[m]) out[m] = [...ACTIONS]
+    }
   }
   return out
 }

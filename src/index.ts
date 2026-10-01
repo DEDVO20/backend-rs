@@ -120,6 +120,7 @@ app.route('/api/documents',   documentsRoutes)
 app.route('/api/audit',       auditRoutes)
 app.route('/api/roles',       rolesRoutes)
 app.route('/api/blog',        blogRoutes)
+app.route('/api/contact',     contactRoutes)   // GET /api/contact/leads (admin)
 
 // ── 404 catch-all ─────────────────────────────────────────────────────────────
 app.notFound((c) => c.json({ error: 'Ruta no encontrada' }, 404))
