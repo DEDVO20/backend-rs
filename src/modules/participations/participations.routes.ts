@@ -435,9 +435,14 @@ app.post('/link-sale-invoice',
   async (c) => {
     const user = c.get('user')
     const body = c.req.valid('json')
-    const result = await ParticipationsService.linkSaleInvoiceByOrder(body)
-    auditAsync({ action: 'update', resource: 'invoice_participations', metadata: { source: 'link-sale-invoice', ...body }, user, c })
-    return c.json(result)
+    try {
+      const result = await ParticipationsService.linkSaleInvoiceByOrder(body)
+      auditAsync({ action: 'update', resource: 'invoice_participations', metadata: { source: 'link-sale-invoice', ...body }, user, c })
+      return c.json(result)
+    } catch (e: any) {
+      // DEBUG temporal: devolver el mensaje real para diagnosticar el 500 en producción.
+      return c.json({ error: e?.message ?? 'Error desconocido', where: 'link-sale-invoice', stack: String(e?.stack ?? '').split('\n').slice(0, 4) }, (e?.statusCode ?? 500) as any)
+    }
   },
 )
 
