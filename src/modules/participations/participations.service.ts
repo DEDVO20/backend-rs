@@ -1874,7 +1874,8 @@ export class ParticipationsService {
       .select('*, participation:service_participations(third_party:third_parties(name, identification, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)')
       .eq('id', id)
       .single()
-    if (error || !data) throw Object.assign(new Error('Factura de participación no encontrada'), { statusCode: 404 })
+    if (error && (error as any).code !== 'PGRST116') throw Object.assign(new Error(`Error al leer la OC: ${error.message}`), { statusCode: 500 })
+    if (!data) throw Object.assign(new Error('Factura de participación no encontrada'), { statusCode: 404 })
     return data
   }
 
@@ -1895,7 +1896,8 @@ export class ParticipationsService {
       .select('id, period, finto_invoice, finto_invoice_date, finto_invoice_value, collected, cash_receipts, third_party_invoice, third_party_invoice_date, third_party_invoice_value, payment_order, payment_order_date, egress_voucher, egress_voucher_date, egress_voucher_value, participation_value, participation_type, status')
       .eq('id', id)
       .single()
-    if (curErr || !current) throw Object.assign(new Error('Factura de participación no encontrada'), { statusCode: 404 })
+    if (curErr) throw Object.assign(new Error(`Error al leer la OC: ${curErr.message}`), { statusCode: 500 })
+    if (!current) throw Object.assign(new Error('Factura de participación no encontrada'), { statusCode: 404 })
 
     const now = new Date().toISOString()
     const updatePayload: Record<string, any> = { ...patch, updated_at: now }
