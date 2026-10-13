@@ -24,6 +24,9 @@ export type ChannelPayload = {
   text:     string
   subject?: string
   html?:    string
+  // Copias (solo email vía Resend — Zavu no las soporta y las ignora)
+  cc?:      string[]
+  bcc?:     string[]
   // Plantilla aprobada por Meta — requerida en WhatsApp fuera de la ventana
   // de 24 horas (los mensajes "text" rebotan con el error 131047)
   templateId?:        string

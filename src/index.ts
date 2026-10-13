@@ -34,6 +34,7 @@ import { auditRoutes }      from './modules/audit/audit.routes.js'
 import { rolesRoutes }      from './modules/roles/roles.routes.js'
 import { blogRoutes }       from './modules/blog/blog.routes.js'
 import { contactRoutes }    from './modules/contact/contact.routes.js'
+import { settingsRoutes }   from './modules/settings/settings.routes.js'
 
 const app = new Hono()
 
@@ -121,6 +122,7 @@ app.route('/api/audit',       auditRoutes)
 app.route('/api/roles',       rolesRoutes)
 app.route('/api/blog',        blogRoutes)
 app.route('/api/contact',     contactRoutes)   // GET /api/contact/leads (admin)
+app.route('/api/settings',    settingsRoutes)
 
 // ── 404 catch-all ─────────────────────────────────────────────────────────────
 app.notFound((c) => c.json({ error: 'Ruta no encontrada' }, 404))

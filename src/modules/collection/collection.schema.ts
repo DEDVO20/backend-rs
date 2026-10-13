@@ -57,6 +57,8 @@ export const createCampaignSchema = z.object({
   zavu_template_id: z.string().optional(),
   // Imagen heredada de la plantilla — se incrusta en el email al enviar
   image_url:        z.string().url().nullish(),
+  // Copias ocultas de cada correo de la campaña — solo email y solo con Resend
+  bcc:              z.array(z.string().trim().toLowerCase().email('Correo inválido')).max(10).optional(),
   company_id:       z.string().uuid().optional(),
 })
 

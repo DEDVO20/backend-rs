@@ -407,11 +407,13 @@ export class CollectionService {
   }
 
   static async createCampaign(input: CreateCampaignInput, companyId: string, createdBy: string) {
-    const { debtor_ids, message_template, ...rest } = input
+    const { debtor_ids, message_template, bcc, ...rest } = input
     const { data, error } = await supabase
       .from('collection_campaigns')
       .insert({
         ...rest,
+        // Las copias ocultas solo tienen sentido en campañas de email
+        ...(input.channel === 'email' && bcc?.length && { bcc: [...new Set(bcc)] }),
         company_id: companyId,
         created_by: createdBy,
         debtor_ids: debtor_ids ?? [],
@@ -552,6 +554,8 @@ export class CollectionService {
     // Plantilla elegida en la campaña; ZAVU_WA_TEMPLATE_ID queda como fallback global
     const waTemplateId = campaign.zavu_template_id ?? process.env.ZAVU_WA_TEMPLATE_ID
     const useTemplate  = channel === 'whatsapp' && !!waTemplateId
+    // Copias ocultas de la campaña — solo salen si el proveedor de correo es Resend
+    const bcc: string[] = channel === 'email' ? (campaign.bcc ?? []) : []
 
     if (channel === 'whatsapp' && !waTemplateId) {
       logger.warn(
@@ -569,6 +573,7 @@ export class CollectionService {
           data: { text: c.text, ...(imageUrl && { imageUrl }) },
           companyId: campaign.company_id,
           metadata: { campaignId, debtorId: c.debtorId },
+          ...(bcc.length && { bcc }),
           ...(useTemplate && {
             templateId:        waTemplateId,
             templateVariables: c.templateVariables,

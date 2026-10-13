@@ -9,11 +9,24 @@ const envSchema = z.object({
   // Plantilla de WhatsApp aprobada por Meta para campañas de cobranza
   // (fuera de la ventana de 24h solo se pueden enviar plantillas)
   ZAVU_WA_TEMPLATE_ID:       z.string().optional(),
+  // Proveedor de email: 'zavu' (por defecto) o 'resend'. SMS y WhatsApp siempre van por Zavu.
+  // Es el valor inicial: lo guardado en Configuración (tabla email_settings) tiene prioridad
+  EMAIL_PROVIDER:            z.enum(['zavu', 'resend']).default('zavu'),
+  RESEND_API_KEY:            z.string().optional(),
+  // Remitente verificado en Resend, ej: "Finto <notificaciones@tudominio.com>"
+  RESEND_FROM:               z.string().optional(),
+  // Copias ocultas globales separadas por coma (solo con Resend)
+  EMAIL_BCC:                 z.string().optional(),
   RS_TEAM_EMAIL:             z.string().email(),
   PLATFORM_URL:              z.string().url(),
   REDIS_URL:                 z.string().url(),
   PORT:                      z.coerce.number().int().positive().default(3000),
   NODE_ENV:                  z.enum(['development', 'production', 'test']).default('development'),
+}).superRefine((v, ctx) => {
+  if (v.EMAIL_PROVIDER !== 'resend') return
+  for (const key of ['RESEND_API_KEY', 'RESEND_FROM'] as const) {
+    if (!v[key]) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'Requerido cuando EMAIL_PROVIDER=resend' })
+  }
 })
 
 const result = envSchema.safeParse(process.env)

@@ -1,4 +1,6 @@
 import { ZavuChannel }        from './channels/ZavuChannel.js'
+import { ResendChannel }      from './channels/ResendChannel.js'
+import { getEmailSettings }   from './emailSettings.js'
 import { renderTemplate }     from './templates/renderTemplate.js'
 import { notificationQueue }  from './queue/notificationQueue.js'
 import { supabase }            from '../lib/supabase.js'
@@ -17,6 +19,9 @@ export type NotificationPayload = {
   // ventana de 24h; si viene, se envía messageType 'template' en vez de texto
   templateId?:        string
   templateVariables?: Record<string, string>
+  // Copias en email — solo aplican cuando el proveedor de correo es Resend
+  cc?:  string[]
+  bcc?: string[]
 }
 
 export class NotificationService {
@@ -66,6 +71,9 @@ export class NotificationService {
     let status       = 'sent'
     let errorMsg: string | null = null
     let messageId:  string | null = null
+    // Solo el email cambia de proveedor — SMS y WhatsApp siempre salen por Zavu
+    const settings = payload.channel === 'email' ? await getEmailSettings() : null
+    const provider = settings?.provider ?? 'zavu'
 
     try {
       if (payload.channel === 'whatsapp' && payload.templateId) {
@@ -80,13 +88,26 @@ export class NotificationService {
       } else {
         const { text, html, subject } = await renderTemplate(payload.template, payload.data)
 
-        messageId = await ZavuChannel.send({
-          to:      payload.to,
-          channel: payload.channel,
-          text,
-          html,
-          subject,
-        })
+        if (payload.channel === 'email' && provider === 'resend') {
+          messageId = await ResendChannel.send({
+            to:      payload.to,
+            channel: 'email',
+            text,
+            html,
+            subject,
+            cc:      payload.cc,
+            // Copias ocultas del envío + las globales definidas en Configuración
+            bcc:     [...(payload.bcc ?? []), ...(settings?.bcc ?? [])],
+          })
+        } else {
+          messageId = await ZavuChannel.send({
+            to:      payload.to,
+            channel: payload.channel,
+            text,
+            html,
+            subject,
+          })
+        }
       }
     } catch (err) {
       status   = 'failed'
@@ -103,7 +124,8 @@ export class NotificationService {
         error:          errorMsg,
         duration_ms:    Date.now() - startedAt,
         zavu_message_id: messageId,
-        metadata:       payload.metadata ?? null,
+        // Con Resend el id no es de Zavu: se marca el proveedor para distinguirlo
+        metadata:       provider === 'resend' ? { ...payload.metadata, provider } : payload.metadata ?? null,
       })
     }
   }

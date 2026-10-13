@@ -5,6 +5,7 @@ import { requireModule }  from '../../middleware/requireRole.js'
 import { requireRole, requirePermission } from '../../middleware/requireRole.js'
 import { supabase } from '../../lib/supabase.js'
 import { CollectionService } from './collection.service.js'
+import { getEmailSettings } from '../../notifications/emailSettings.js'
 import {
   listDebtorsQuerySchema,
   updateDebtorSchema,
@@ -208,6 +209,12 @@ app.get('/campaigns', async (c) => {
 
   const data = await CollectionService.listCampaigns(companyId ?? queryCompany, page, limit)
   return c.json(data)
+})
+
+// GET /api/collection/email-options — ¿el proveedor de correo actual admite copias ocultas?
+app.get('/email-options', async (c) => {
+  const { provider } = await getEmailSettings()
+  return c.json({ bccSupported: provider === 'resend' })
 })
 
 app.post('/campaigns',
