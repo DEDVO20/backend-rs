@@ -5,7 +5,10 @@ import { requireModule, requireRole, requirePermission } from '../../middleware/
 import { supabase }   from '../../lib/supabase.js'
 import { auditAsync } from '../../lib/audit.js'
 import { AccountingService } from './accounting.service.js'
-import { masterItemSchema, updateMasterItemSchema, updateEntrySchema } from './accounting.schema.js'
+import {
+  masterItemSchema, updateMasterItemSchema, updateEntrySchema,
+  updateDeadlineSchema, createDeadlineSchema, yearSchema,
+} from './accounting.schema.js'
 
 const app = new Hono()
 
@@ -61,27 +64,68 @@ app.delete('/master/:id',
 
 // ── Fichas y calendarios por empresa ─────────────────────────────────────────
 
-// GET /api/accounting/companies — análisis: estado del calendario por empresa
+// Año del calendario: ?year=2026 (por defecto el actual)
+const yearParam = (raw: string | undefined) => {
+  const parsed = yearSchema.safeParse(raw ?? new Date().getFullYear())
+  return parsed.success ? parsed.data : new Date().getFullYear()
+}
+
+// GET /api/accounting/companies?year= — análisis: estado del calendario por empresa
 app.get('/companies', async (c) => {
-  const data = await AccountingService.getCompanies()
+  const data = await AccountingService.getCompanies(yearParam(c.req.query('year')))
   return c.json(data)
 })
 
-// GET /api/accounting/companies/:companyId — calendario de una empresa
+// GET /api/accounting/companies/:companyId?year= — obligaciones y vencimientos por período
 app.get('/companies/:companyId', async (c) => {
-  const data = await AccountingService.getCompanyCalendar(c.req.param('companyId')!)
+  const data = await AccountingService.getCompanyCalendar(c.req.param('companyId')!, yearParam(c.req.query('year')))
   return c.json(data)
 })
 
-// PATCH /api/accounting/entries/:id — modificar fecha/notas de una entrada
+// PATCH /api/accounting/entries/:id — periodicidad propia de la empresa / notas
 app.patch('/entries/:id',
   requirePermission('accounting', 'update'),
   zValidator('json', updateEntrySchema),
   async (c) => {
     const user = c.get('user')
     const data = await AccountingService.updateEntry(c.req.param('id')!, c.req.valid('json'), user.id)
-    auditAsync({ action: 'update', resource: 'company_tax_entries', resource_id: data.id, metadata: { company_id: data.company_id, due_date: data.due_date, title: data.master?.title }, user, c })
+    auditAsync({ action: 'update', resource: 'company_tax_entries', resource_id: data.id, metadata: { company_id: data.company_id, ...c.req.valid('json'), title: data.master?.title }, user, c })
     return c.json(data)
+  },
+)
+
+// POST /api/accounting/entries/:id/deadlines — fecha adicional (ej. 2a cuota de renta)
+app.post('/entries/:id/deadlines',
+  requirePermission('accounting', 'update'),
+  zValidator('json', createDeadlineSchema),
+  async (c) => {
+    const user = c.get('user')
+    const data = await AccountingService.createDeadline(c.req.param('id')!, c.req.valid('json'), user.id)
+    auditAsync({ action: 'create', resource: 'company_tax_deadlines', resource_id: data.id, metadata: { company_id: data.company_id, period_label: data.period_label, due_date: data.due_date }, user, c })
+    return c.json(data, 201)
+  },
+)
+
+// PATCH /api/accounting/deadlines/:id — fecha de vencimiento de un período
+app.patch('/deadlines/:id',
+  requirePermission('accounting', 'update'),
+  zValidator('json', updateDeadlineSchema),
+  async (c) => {
+    const user = c.get('user')
+    const data = await AccountingService.updateDeadline(c.req.param('id')!, c.req.valid('json'), user.id)
+    auditAsync({ action: 'update', resource: 'company_tax_deadlines', resource_id: data.id, metadata: { company_id: data.company_id, period_label: data.period_label, due_date: data.due_date }, user, c })
+    return c.json(data)
+  },
+)
+
+// DELETE /api/accounting/deadlines/:id — solo fechas adicionales
+app.delete('/deadlines/:id',
+  requirePermission('accounting', 'update'),
+  async (c) => {
+    const user = c.get('user')
+    const data = await AccountingService.deleteDeadline(c.req.param('id')!)
+    auditAsync({ action: 'delete', resource: 'company_tax_deadlines', resource_id: data.id, metadata: { company_id: data.company_id, period_label: data.period_label }, user, c })
+    return c.json({ ok: true })
   },
 )
 
