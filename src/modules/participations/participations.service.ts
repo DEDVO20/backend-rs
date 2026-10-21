@@ -5,9 +5,9 @@ import {
   formatPurchaseOrder, formatPaymentOrder, validateThirdPartyInvoice, money,
   normalizeInvoiceNumber,
   normalizeSiigoInvoice, nitMatch, normalizeNit,
-  parseAccountingMovement, PARTICIPATION_ACCOUNTS, billedPeriods,
+  parseAccountingMovement, PARTICIPATION_ACCOUNTS, billedPeriods, emptyCollectionTaxes,
 } from './participations.domain.js'
-import type { ParticipationAccounts, MovCollection } from './participations.domain.js'
+import type { ParticipationAccounts, MovCollection, CollectionTaxes } from './participations.domain.js'
 import { computeOperation, partitionInvoice } from '../tax/tax.domain.js'
 import { rowToProfile, rowToSettings, type TaxProfileRow, type SettingsRow } from '../tax/tax.service.js'
 import type { z }   from 'zod'
@@ -360,7 +360,10 @@ export class ParticipationsService {
     }
 
     // Partición tributaria por factura: pagar al tercero / nos deben / queda en Finto.
-    const settings = await ParticipationsService.loadTaxSettings()
+    const [settings, rcTaxes] = await Promise.all([
+      ParticipationsService.loadTaxSettings(),
+      ParticipationsService.loadCollectionTaxes(rows as any[]),
+    ])
     const withPartition = rows.map((row: any) => {
       const profileRow = row?.participation?.third_party?.tax_profile as TaxProfileRow | null | undefined
       const partition = ParticipationsService.computePartition(row, profileRow ?? null, settings)
@@ -370,10 +373,85 @@ export class ParticipationsService {
         cash_receipt_date: fvKey ? (rcDates.get(fvKey) ?? null) : null,
         egress_voucher_date: row.egress_voucher_date ?? (fvKey ? (rpDates.get(fvKey) ?? null) : null),
         tax_partition: partition,
+        collection_taxes: rcTaxes.get(row.id) ?? emptyCollectionTaxes(),
       }
     })
 
     return { data: withPartition, total: count ?? 0, page: f.page, limit: f.limit }
+  }
+
+  /**
+   * Impuestos que el cliente retuvo en los recaudos (RC) de cada OC. Salen de los
+   * documentos RC importados (líneas 1355 del reporte). Si el RC está asignado a
+   * la OC en la rejilla, se prorratean por lo asignado / valor del RC; si la OC no
+   * tiene asignaciones de RC, se toman los RC que referencian su FV.
+   */
+  static async loadCollectionTaxes(rows: { id: string; finto_invoice?: string | null }[]): Promise<Map<string, CollectionTaxes>> {
+    const out = new Map<string, CollectionTaxes>()
+    if (!rows.length) return out
+    const chunks = <T,>(xs: T[], n = 150) => Array.from({ length: Math.ceil(xs.length / n) }, (_, i) => xs.slice(i * n, i * n + n))
+    const add = (ocId: string, t: CollectionTaxes, ratio = 1) => {
+      const cur = out.get(ocId) ?? emptyCollectionTaxes()
+      cur.income = money(cur.income + t.income * ratio)
+      cur.ica    = money(cur.ica    + t.ica    * ratio)
+      cur.iva    = money(cur.iva    + t.iva    * ratio)
+      cur.total  = money(cur.income + cur.ica + cur.iva)
+      out.set(ocId, cur)
+    }
+    const taxesOf = (d: any): CollectionTaxes => {
+      const income = Number(d.tax_income_withholding ?? 0), ica = Number(d.tax_ica_withholding ?? 0), iva = Number(d.tax_iva_withholding ?? 0)
+      return { income, ica, iva, total: money(income + ica + iva) }
+    }
+    try {
+      const allocs: any[] = []
+      for (const ids of chunks(rows.map(r => r.id))) {
+        const { data } = await supabase.from('participation_allocations')
+          .select('source_comprobante, invoice_participation_id, amount')
+          .eq('source_doc_type', 'RC').in('invoice_participation_id', ids)
+        allocs.push(...(data ?? []))
+      }
+
+      // Totales por comprobante RC (sumando sus filas por FV)
+      const byComp = new Map<string, { amount: number; taxes: CollectionTaxes }>()
+      const comps = [...new Set(allocs.map(a => String(a.source_comprobante)))]
+      for (const cs of chunks(comps)) {
+        const { data } = await supabase.from('siigo_documents')
+          .select('comprobante, amount, tax_income_withholding, tax_ica_withholding, tax_iva_withholding')
+          .eq('doc_type', 'RC').in('comprobante', cs)
+        for (const d of data ?? []) {
+          const k = normalizeInvoiceNumber(d.comprobante)
+          const prev = byComp.get(k) ?? { amount: 0, taxes: emptyCollectionTaxes() }
+          const t = taxesOf(d)
+          byComp.set(k, {
+            amount: money(prev.amount + Number(d.amount ?? 0)),
+            taxes: { income: money(prev.taxes.income + t.income), ica: money(prev.taxes.ica + t.ica), iva: money(prev.taxes.iva + t.iva), total: money(prev.taxes.total + t.total) },
+          })
+        }
+      }
+      const withAlloc = new Set<string>()
+      for (const a of allocs) {
+        withAlloc.add(a.invoice_participation_id)
+        const doc = byComp.get(normalizeInvoiceNumber(a.source_comprobante))
+        if (!doc || doc.taxes.total <= 0 || doc.amount <= 0) continue
+        add(a.invoice_participation_id, doc.taxes, Math.min(1, Number(a.amount ?? 0) / doc.amount))
+      }
+
+      // Sin asignaciones: RC que referencian la FV de la OC
+      const pending = rows.filter(r => !withAlloc.has(r.id) && r.finto_invoice)
+      const ocByFv = new Map(pending.map(r => [normalizeInvoiceNumber(r.finto_invoice!), r.id]))
+      for (const fvs of chunks(pending.map(r => r.finto_invoice!))) {
+        const { data } = await supabase.from('siigo_documents')
+          .select('fv_ref, tax_income_withholding, tax_ica_withholding, tax_iva_withholding')
+          .eq('doc_type', 'RC').in('fv_ref', fvs)
+        for (const d of data ?? []) {
+          const ocId = ocByFv.get(normalizeInvoiceNumber(d.fv_ref))
+          if (ocId) add(ocId, taxesOf(d))
+        }
+      }
+    } catch (e) {
+      logger.warn({ err: (e as any)?.message }, 'Error al consultar impuestos de los recaudos (RC)')
+    }
+    return out
   }
 
   /** Parámetros de la operación tributaria (singleton). Fallbacks si no existe la fila. */
@@ -388,10 +466,11 @@ export class ParticipationsService {
   /**
    * Calcula la partición de una factura con el motor tributario, usando el perfil
    * del tercero como base = participación causada. Sin perfil asignado, se asume
-   * neutro (sin IVA ni retenciones) pero igual se aplica la comisión de la firma.
+   * neutro (sin IVA ni retenciones). La comisión de la firma SOLO aplica a los
+   * contratos de mandato; en servicio el tercero recibe su participación completa.
    */
   static computePartition(
-    row: { participation_value?: number | null; finto_invoice_value?: number | null; collected?: number | null },
+    row: { participation_value?: number | null; finto_invoice_value?: number | null; collected?: number | null; contract_type?: string | null },
     profileRow: TaxProfileRow | null,
     settings: SettingsRow,
   ) {
@@ -408,6 +487,7 @@ export class ParticipationsService {
       emitter,
       receiver: { incomeWithholdingAgent: true, icaWithholdingAgent: true, ivaWithholdingAgent: true },
       settings: rowToSettings(settings),
+      withCommission: row.contract_type === 'mandato',
     })
     const partition = partitionInvoice({
       result,
@@ -448,9 +528,15 @@ export class ParticipationsService {
       if (existing) {
         existing.collected  = money(existing.collected  + c.collected)
         existing.amount     = money(existing.amount     + c.amount)
+        existing.taxes = {
+          income: money(existing.taxes.income + c.taxes.income),
+          ica:    money(existing.taxes.ica    + c.taxes.ica),
+          iva:    money(existing.taxes.iva    + c.taxes.iva),
+          total:  money(existing.taxes.total  + c.taxes.total),
+        }
         if (!existing.receipts.includes(c.receipt)) existing.receipts.push(c.receipt)
       } else {
-        collByFv.set(fvKey, { ...c })
+        collByFv.set(fvKey, { ...c, receipts: [...c.receipts], taxes: { ...c.taxes } })
       }
     }
     // NC/ND ajustan el neto: solo las que referencian la FV en su descripción.
@@ -705,6 +791,10 @@ export class ParticipationsService {
           applied,
           matched,
           note: note ?? (matched ? null : 'Sin facturas pendientes del cliente'),
+          // Impuestos que el cliente retuvo en este recaudo (cuentas 1355 del RC)
+          tax_income_withholding: c.taxes.income,
+          tax_ica_withholding:    c.taxes.ica,
+          tax_iva_withholding:    c.taxes.iva,
         })
 
         for (const c of mov.collections) {
@@ -1098,6 +1188,8 @@ export class ParticipationsService {
           if (!prev) { merged.set(key, { ...d }); continue }
           prev.amount   = money(Number(prev.amount ?? 0)  + Number(d.amount ?? 0))
           prev.applied  = money(Number(prev.applied ?? 0) + Number(d.applied ?? 0))
+          for (const k of ['tax_income_withholding', 'tax_ica_withholding', 'tax_iva_withholding'] as const)
+            if (d[k] != null) prev[k] = money(Number(prev[k] ?? 0) + Number(d[k]))
           prev.matched  = prev.matched || d.matched
           prev.tercero_nit  = prev.tercero_nit  ?? d.tercero_nit
           prev.tercero_name = prev.tercero_name ?? d.tercero_name
@@ -1122,6 +1214,11 @@ export class ParticipationsService {
       ambiguous:      results.filter(r => r.outcome === 'ambiguous').length,
       no_amount:      results.filter(r => r.outcome === 'no_amount').length,
       collections:    mov.collections.length,
+      // Impuestos retenidos por los clientes en los recaudos (RC + 1355)
+      collection_taxes: mov.collections.reduce((a, c) => ({
+        income: money(a.income + c.taxes.income), ica: money(a.ica + c.taxes.ica),
+        iva: money(a.iva + c.taxes.iva), total: money(a.total + c.taxes.total),
+      }), emptyCollectionTaxes()),
       credit_notes:   mov.creditNotes.length,
       debit_notes:    mov.debitNotes.length,
       third_invoices: mov.thirdInvoices.length,
@@ -2912,7 +3009,10 @@ export class ParticipationsService {
       fcAlertsMap.set(nit, curr)
     }
 
-    const settings = await ParticipationsService.loadTaxSettings()
+    const [settings, rcTaxes] = await Promise.all([
+      ParticipationsService.loadTaxSettings(),
+      ParticipationsService.loadCollectionTaxes((data ?? []) as any[]),
+    ])
     const one = (v: any) => Array.isArray(v) ? v[0] : v
     const r2 = (n: number) => money(n)
 
@@ -2927,6 +3027,7 @@ export class ParticipationsService {
       participation_total: number
       finto_invoiced_total: number
       collected_total: number
+      collection_taxes_total: number
       available_total: number
       net_payable_total: number
       third_party_invoiced_total: number
@@ -2979,7 +3080,8 @@ export class ParticipationsService {
       const partition = ParticipationsService.computePartition(row, profileRow ?? null, settings)
       const fv = (row as any).finto_invoice
       const rcDate = fv ? (rcDates.get(normalizeInvoiceNumber(fv)) ?? null) : null
-      const rowWithPartition = { ...row, cash_receipt_date: rcDate, tax_partition: partition }
+      const collTaxes = rcTaxes.get((row as any).id) ?? emptyCollectionTaxes()
+      const rowWithPartition = { ...row, cash_receipt_date: rcDate, tax_partition: partition, collection_taxes: collTaxes }
 
       const tpId = tp?.id ?? 'sin-tercero'
       const tpName = tp?.name ?? 'Sin tercero asignado'
@@ -3019,6 +3121,7 @@ export class ParticipationsService {
         participation_total: 0,
         finto_invoiced_total: 0,
         collected_total: 0,
+        collection_taxes_total: 0,
         available_total: 0,
         net_payable_total: 0,
         third_party_invoiced_total: 0,
@@ -3034,6 +3137,7 @@ export class ParticipationsService {
       group.participation_total = r2(group.participation_total + partVal)
       group.finto_invoiced_total = r2(group.finto_invoiced_total + fintoVal)
       group.collected_total = r2(group.collected_total + collVal)
+      group.collection_taxes_total = r2(group.collection_taxes_total + collTaxes.total)
       group.available_total = r2(group.available_total + availVal)
       group.net_payable_total = r2(group.net_payable_total + netPayVal)
       group.third_party_invoiced_total = r2(group.third_party_invoiced_total + (thirdInvVal ?? 0))
@@ -3058,6 +3162,7 @@ export class ParticipationsService {
         collected: collVal,
         cash_receipts: (row as any).cash_receipts,
         cash_receipt_date: rcDate,
+        collection_taxes: collTaxes,
         available_for_payment: availVal,
         net_payable: r2(netPayVal),
         third_party_invoice: (row as any).third_party_invoice,

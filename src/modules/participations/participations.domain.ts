@@ -38,9 +38,28 @@ export const PARTICIPATION_ACCOUNTS = {
   receivable:   '13050501',
   thirdInvoice: '2335',
   payment:      '1120|1110',       // banco: 11200501, 11200504, 1110… (RP al tercero)
+  // Anticipo de impuestos (1355…): en un RC son los impuestos que el cliente nos
+  // retuvo al pagar — 135515 retefuente, 135517 reteIVA, 135518 reteICA.
+  withholding:  '1355',
 } as const
 
-export type ParticipationAccounts = { income?: string; iva?: string; mandate?: string; receivable?: string; thirdInvoice?: string; payment?: string }
+export type ParticipationAccounts = { income?: string; iva?: string; mandate?: string; receivable?: string; thirdInvoice?: string; payment?: string; withholding?: string }
+
+/** Impuestos retenidos por el cliente en un recaudo (RC). */
+export type CollectionTaxes = { income: number; ica: number; iva: number; total: number }
+export const emptyCollectionTaxes = (): CollectionTaxes => ({ income: 0, ica: 0, iva: 0, total: 0 })
+
+/** Clasifica una línea de retención: por la descripción y, si no la nombra,
+ *  por la subcuenta PUC (135517 reteIVA, 135518 reteICA, resto retefuente). */
+export function withholdingKind(code: string, desc: string): 'income' | 'ica' | 'iva' {
+  const d = String(desc ?? '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+  if (/rete\s*-?\s*ica|industria y comercio|\bica\b/.test(d)) return 'ica'
+  if (/rete\s*-?\s*iva|\biva\b|impuesto a las ventas/.test(d)) return 'iva'
+  if (/rete\s*-?\s*fuente|renta/.test(d)) return 'income'
+  if (code.startsWith('135518')) return 'ica'
+  if (code.startsWith('135517')) return 'iva'
+  return 'income'
+}
 
 /**
  * Valor de la participación.
@@ -425,7 +444,10 @@ function mandateHeader(rows: string[][]): MandateHeader {
   })
   if (hIdx < 0) return empty
   const header = rows[hIdx]!.map(String)
-  const iVal    = headerCol(header, 'credito', 'valor', 'debito')
+  // Prioridad Crédito → Valor → Débito (aunque Débito venga antes en el reporte).
+  const iCred   = headerCol(header, 'credito')
+  const iValor  = header.findIndex(h => { const s = stripAccentsLower(h); return s.includes('valor') && !s.includes('base') })
+  const iVal    = iCred >= 0 ? iCred : iValor >= 0 ? iValor : headerCol(header, 'debito')
   // Columna "Débito" separada (para notas débito). -1 si no existe o si es la
   // misma que la de crédito/valor (reporte con una sola columna de monto).
   let iDebito   = headerCol(header, 'debito')
@@ -481,6 +503,8 @@ export type MovCollection = {
   fv: string
   collected: number
   receipts: string[]
+  /** Impuestos que el cliente retuvo en este recaudo (líneas 1355 del RC). */
+  taxes: CollectionTaxes
 }
 /** Factura de compra que envía el tercero (FC) sobre la cuenta 2335. */
 export type MovThirdInvoice = { terceroNit: string; terceroName: string; doc: string; iso: string; amount: number; fvRef: string | null }
@@ -520,6 +544,9 @@ export function parseAccountingMovement(rows: string[][], accounts?: Participati
   const thirdInvoices = new Map<string, MovThirdInvoice>()
   const payments = new Map<string, MovPayment>()
   const seenRc = new Map<string, MovCollection>()
+  // Retenciones de cada RC (cuenta 1355): se asocian al recaudo al final, porque
+  // pueden venir antes o después de la línea de cartera en el reporte.
+  const rcTaxes: { comp: string; fvRef: string | null; kind: 'income' | 'ica' | 'iva'; amount: number }[] = []
 
   const str = (r: string[], i: number) => (i >= 0 ? String(r[i] ?? '').trim() : '')
   const compType = (comp: string) => comp.slice(0, 2).toUpperCase()
@@ -588,6 +615,7 @@ export function parseAccountingMovement(rows: string[][], accounts?: Participati
           fv: fvTarget,
           collected: value,
           receipts: [comp],
+          taxes: emptyCollectionTaxes(),
         }
         seenRc.set(key, entry)
         collections.push(entry)
@@ -595,6 +623,18 @@ export function parseAccountingMovement(rows: string[][], accounts?: Participati
       continue
     }
 
+    // ── Impuestos retenidos en el recaudo (RC + 1355): el cliente paga neto y
+    //    descuenta retefuente/reteICA/reteIVA. Van por el débito; si el reporte
+    //    solo trae Crédito, se estima con "Valor base" × % de la descripción. ──
+    if (type === 'RC' && matchAcct(code, acc.withholding)) {
+      let amount = debito > 0 ? debito : value
+      if (amount <= 0 && valorBase > 0) {
+        const pct = desc.match(/(\d+(?:[.,]\d+)?)\s*%/)
+        if (pct) amount = money(valorBase * Number(pct[1]!.replace(',', '.')) / 100)
+      }
+      if (amount > 0) rcTaxes.push({ comp, fvRef: fvRefOk, kind: withholdingKind(code, desc), amount })
+      continue
+    }
 
     // ── Nota crédito (NC) sobre la cartera 13050501 → resta del neto ─────────
     if (type === 'NC' && matchAcct(code, acc.receivable) && value > 0) {
@@ -625,6 +665,16 @@ export function parseAccountingMovement(rows: string[][], accounts?: Participati
       payments.set(normalizeInvoiceNumber(comp), { terceroNit: nit, rp: comp, iso: d?.iso ?? '', amount: value, fvRef: fvRefOk })
       continue
     }
+  }
+
+  // Asocia cada retención a su recaudo: mismo RC y misma FV si la línea la nombra;
+  // si no, al primer recaudo de ese RC.
+  for (const t of rcTaxes) {
+    const sameRc = collections.filter(c => normalizeInvoiceNumber(c.receipt) === normalizeInvoiceNumber(t.comp))
+    if (!sameRc.length) continue
+    const target = (t.fvRef && sameRc.find(c => c.fvRef && normalizeInvoiceNumber(c.fvRef) === normalizeInvoiceNumber(t.fvRef!))) || sameRc[0]!
+    target.taxes[t.kind] = money(target.taxes[t.kind] + t.amount)
+    target.taxes.total   = money(target.taxes.total + t.amount)
   }
 
   return {

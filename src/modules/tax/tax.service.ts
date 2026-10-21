@@ -156,12 +156,17 @@ export class TaxService {
   }
 
   // ── Cálculo de una operación ───────────────────────────────────────────────
-  static async compute(input: ComputeInput): Promise<{ profile: TaxProfileRow; result: OperationResult }> {
-    const [row, settings] = await Promise.all([
+  static async compute(input: ComputeInput): Promise<{ profile: TaxProfileRow; result: OperationResult; contract_type: 'servicio' | 'mandato' }> {
+    const [row, settings, contractType] = await Promise.all([
       input.tax_profile_id
         ? TaxService.getProfile(input.tax_profile_id)
         : TaxService.getProfileForThirdParty(input.third_party_id!),
       TaxService.getSettings(),
+      input.contract_type
+        ? Promise.resolve(input.contract_type)
+        : input.third_party_id
+          ? TaxService.contractTypeForThirdParty(input.third_party_id)
+          : Promise.resolve('mandato' as const),
     ])
     const receiver: WithholdingAgent = input.receiver ?? {
       incomeWithholdingAgent: true, icaWithholdingAgent: true, ivaWithholdingAgent: true,
@@ -171,8 +176,22 @@ export class TaxService {
       emitter:  rowToProfile(row),
       receiver,
       settings: rowToSettings(settings),
+      withCommission: contractType === 'mandato',
     })
-    return { profile: row, result }
+    return { profile: row, result, contract_type: contractType }
+  }
+
+  /** 'mandato' si el tercero tiene alguna participación activa con contrato de
+   *  mandato (las únicas que llevan comisión); si no, 'servicio'. */
+  static async contractTypeForThirdParty(thirdPartyId: string): Promise<'servicio' | 'mandato'> {
+    const { count, error } = await supabase
+      .from('service_participations')
+      .select('id', { count: 'exact', head: true })
+      .eq('third_party_id', thirdPartyId)
+      .eq('contract_type', 'mandato')
+      .eq('active', true)
+    if (error) throw error
+    return (count ?? 0) > 0 ? 'mandato' : 'servicio'
   }
 
   // ── Matriz comparativa del catálogo de perfiles (spec §8) ──────────────────

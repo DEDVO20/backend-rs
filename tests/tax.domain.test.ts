@@ -192,3 +192,26 @@ describe('partitionInvoice — pagar / nos deben / queda en Finto', () => {
     expect(p.owedToUs).toBe(600_000)
   })
 })
+
+describe('computeOperation — comisión solo en mandato', () => {
+  const emitter: TaxProfile = {
+    personType: 'JURIDICA', taxRegime: 'ORDINARY', ivaResponsible: true, grandTaxpayer: false,
+    incomeWithholding: { subject: true }, icaWithholding: { subject: true }, ivaWithholding: { subject: false },
+    agentIncomeWithholding: true, agentIcaWithholding: true,
+  }
+
+  it('servicio (withCommission=false): sin comisión ni retenciones sobre ella; giro = pago factura', () => {
+    const r = computeOperation({ invoiceValue: BASE, emitter, receiver: FULL_AGENT, settings: SETTINGS, withCommission: false })
+    expect(r.commission).toBe(0)
+    expect(r.commissionIva).toBe(0)
+    expect(r.commissionIncomeWithholding.amount).toBe(0)
+    expect(r.commissionIcaWithholding.amount).toBe(0)
+    expect(r.commissionNet).toBe(0)
+    expect(r.finalTotal).toBe(r.invoicePayment)
+  })
+
+  it('mandato (withCommission=true): aplica la comisión', () => {
+    const r = computeOperation({ invoiceValue: BASE, emitter, receiver: FULL_AGENT, settings: SETTINGS, withCommission: true })
+    expect(r.commission).toBe(120_000)
+  })
+})

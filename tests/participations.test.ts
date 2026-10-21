@@ -619,3 +619,31 @@ describe('Edición manual de etapas y reasignación de pagos', () => {
   })
 })
 
+
+describe('parseAccountingMovement — impuestos retenidos en el recaudo (RC + 1355)', () => {
+  it('suma retefuente, reteICA y reteIVA al recaudo (columna Débito)', () => {
+    const header = ['Código cuentas contables', 'Identificación tercero', 'Comprobante', 'Fecha elaboración', 'Débito', 'Crédito', 'Descripción', 'Valor base', 'Nombre tercero']
+    const rows: string[][] = [
+      header,
+      ['13050501', '901178069', 'RC-1-60', '7/3/26', '', '2,678,350.00', 'FV-2-70 Cuota: 1', '', 'Sukot'],
+      ['13551509', '901178069', 'RC-1-60', '7/3/26', '275,000.00', '', 'Retefuente 11%', '2,500,000.00', 'Sukot'],
+      ['13551801', '901178069', 'RC-1-60', '7/3/26', '21,650.00', '', 'FV-2-70', '2,500,000.00', 'Sukot'],
+      ['13551701', '901178069', 'RC-1-60', '7/3/26', '71,250.00', '', 'Rete IVA 15%', '475,000.00', 'Sukot'],
+    ]
+    const m = parseAccountingMovement(rows)
+    expect(m.collections).toHaveLength(1)
+    expect(m.collections[0]!.collected).toBe(2_678_350)
+    expect(m.collections[0]!.taxes).toEqual({ income: 275_000, ica: 21_650, iva: 71_250, total: 367_900 })
+  })
+
+  it('sin columna Débito: estima con Valor base × % de la descripción', () => {
+    const header = ['Código cuentas contables', 'Identificación tercero', 'Comprobante', 'Fecha elaboración', 'Crédito', 'Descripción', 'Valor base', 'Nombre tercero']
+    const rows: string[][] = [
+      header,
+      ['13050501', '901178069', 'RC-1-61', '7/3/26', '1,000,000.00', 'FV-2-71', '', 'Sukot'],
+      ['13551509', '901178069', 'RC-1-61', '7/3/26', '', 'Retefuente 11%', '1,000,000.00', 'Sukot'],
+    ]
+    const m = parseAccountingMovement(rows)
+    expect(m.collections[0]!.taxes).toMatchObject({ income: 110_000, total: 110_000 })
+  })
+})

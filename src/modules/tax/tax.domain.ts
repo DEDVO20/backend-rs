@@ -79,6 +79,12 @@ export interface OperationInput {
   emitter:  TaxProfile
   receiver: WithholdingAgent
   settings: OperationSettings
+  /**
+   * ¿La firma cobra comisión? Solo los contratos de MANDATO la llevan; en los de
+   * servicio el tercero recibe su participación sin descuento de comisión.
+   * Por defecto true (matriz comparativa del catálogo).
+   */
+  withCommission?: boolean
 }
 
 /** Una línea de retención en el desglose auditable. */
@@ -205,18 +211,20 @@ export function computeOperation(input: OperationInput): OperationResult {
     invoiceTotal - incomeWithholding.amount - icaWithholding.amount - ivaWithholding.amount)
 
   // ── Comisión (spec §6) ───────────────────────────────────────────────────────
-  const commission      = money(base * settings.commissionRate)
+  // Solo los contratos de mandato llevan comisión (withCommission); servicio = 0.
+  const commissionRate  = input.withCommission === false ? 0 : settings.commissionRate
+  const commission      = money(base * commissionRate)
   const commissionIva   = money(commission * settings.commissionIvaRate)
   const commissionTotal = money(commission + commissionIva)
 
   // Retenciones sobre la comisión — dependen de si el tercero es AGENTE retenedor
   // (retiene sobre la comisión que le paga a la firma). Base = comisión.
   const commissionIncomeWithholding = evalCommissionWithholding(
-    commission, emitter.agentIncomeWithholding ?? false,
+    commission, commission > 0 && (emitter.agentIncomeWithholding ?? false),
     settings.incomeWithholdingRate, 'Retefuente comisión')
 
   const commissionIcaWithholding = evalCommissionWithholding(
-    commission, emitter.agentIcaWithholding ?? false,
+    commission, commission > 0 && (emitter.agentIcaWithholding ?? false),
     settings.icaWithholdingRate, 'ReteICA comisión')
 
   const commissionNet = money(
