@@ -316,7 +316,7 @@ export class ParticipationsService {
     let q = supabase
       .from('invoice_participations')
       .select(
-        '*, participation:service_participations(third_party:third_parties(name, identification, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)',
+        '*, participation:service_participations(contract_type, third_party:third_parties(name, identification, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)',
         { count: 'exact' },
       )
       .order('period', { ascending: true })
@@ -470,7 +470,7 @@ export class ParticipationsService {
    * contratos de mandato; en servicio el tercero recibe su participación completa.
    */
   static computePartition(
-    row: { participation_value?: number | null; finto_invoice_value?: number | null; collected?: number | null; contract_type?: string | null },
+    row: { participation_value?: number | null; finto_invoice_value?: number | null; collected?: number | null; contract_type?: string | null; participation?: any },
     profileRow: TaxProfileRow | null,
     settings: SettingsRow,
   ) {
@@ -487,7 +487,10 @@ export class ParticipationsService {
       emitter,
       receiver: { incomeWithholdingAgent: true, icaWithholdingAgent: true, ivaWithholdingAgent: true },
       settings: rowToSettings(settings),
-      withCommission: row.contract_type === 'mandato',
+      // Mandato si lo es la OC o su configuración: las OC generadas antes de
+      // marcar el contrato como mandato conservan 'servicio' en la fila.
+      withCommission: row.contract_type === 'mandato'
+        || (Array.isArray(row.participation) ? row.participation[0] : row.participation)?.contract_type === 'mandato',
     })
     const partition = partitionInvoice({
       result,
@@ -2976,6 +2979,7 @@ export class ParticipationsService {
         companies (id, name, nit),
         participation:service_participations (
           id,
+          contract_type,
           third_party_id,
           third_party:third_parties (id, name, identification, person_type, tax_profile:tax_profiles(*)),
           company_service:company_services (services (name))
