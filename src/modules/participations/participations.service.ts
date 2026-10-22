@@ -7,8 +7,9 @@ import {
   normalizeInvoiceNumber,
   normalizeSiigoInvoice, nitMatch, normalizeNit,
   parseAccountingMovement, PARTICIPATION_ACCOUNTS, billedPeriods, emptyCollectionTaxes, planMoneyDocs,
+  rateAt, monthStart,
 } from './participations.domain.js'
-import type { ParticipationAccounts, MovCollection, CollectionTaxes } from './participations.domain.js'
+import type { ParticipationAccounts, MovCollection, CollectionTaxes, ParticipationRate } from './participations.domain.js'
 import { computeOperation, partitionInvoice } from '../tax/tax.domain.js'
 import { rowToProfile, rowToSettings, type TaxProfileRow, type SettingsRow } from '../tax/tax.service.js'
 import type { z }   from 'zod'
@@ -78,7 +79,7 @@ export class ParticipationsService {
   static async listCompanyParticipations(companyId: string) {
     const { data, error } = await supabase
       .from('company_services')
-      .select('id, start_date, end_date, service_value, active, services(id, name), service_participations(*, third_parties(id, name, identification))')
+      .select('id, start_date, end_date, service_value, active, services(id, name), service_participations(*, third_parties(id, name, identification), participation_rates(percentage, valid_from))')
       .eq('company_id', companyId)
       .eq('active', true)
       .order('created_at')
@@ -95,7 +96,10 @@ export class ParticipationsService {
         end_date:           cs.end_date,
         // "Tiene tercero" es independiente del estado activo/suspendido
         has_third_party:    !!part && part.has_third_party,
-        participation:      part ?? null,
+        participation:      part ? {
+          ...part,
+          rates: [...(part.participation_rates ?? [])].sort((a: any, b: any) => String(a.valid_from).localeCompare(String(b.valid_from))),
+        } : null,
         third_party:        part ? one(part.third_parties) : null,
       }
     })
@@ -123,17 +127,18 @@ export class ParticipationsService {
       return { service_value: input.service_value, participation: data ?? null }
     }
 
-    const isMandate = input.contract_type === 'mandato'
+    // Solo porcentaje (ya no se maneja valor fijo). En mandato el % es la
+    // comisión (informativa); acepta undefined → 0.
+    const pct = input.percentage ?? 0
     const { data, error } = await supabase
       .from('service_participations')
       .upsert({
         company_service_id: input.company_service_id,
         third_party_id:     input.third_party_id!,
         contract_type:      input.contract_type,
-        participation_type: input.participation_type,
-        // En mandato el % es la comisión (informativa); acepta undefined → 0.
-        percentage:         input.participation_type === 'fixed' ? 0 : (input.percentage ?? 0),
-        fixed_value:        input.participation_type === 'fixed' && !isMandate ? input.fixed_value! : null,
+        participation_type: 'percentage',
+        percentage:         pct,
+        fixed_value:        null,
         start_date:         input.start_date!,
         end_date:           input.end_date ?? null,
         billing_day:        input.billing_day,
@@ -146,6 +151,10 @@ export class ParticipationsService {
       .single()
     if (error) throw error
 
+    // Historial del %: si cambió, rige desde el mes indicado (por defecto el mes
+    // actual); los meses anteriores conservan su %.
+    if (data?.id) await ParticipationsService.recordRate(data.id, pct, input.start_date!, input.rate_valid_from)
+
     // Backfill: al configurar el servicio se generan las OC de los meses que
     // falten desde la fecha de inicio (aunque sea de varios meses atrás).
     let backfill: Awaited<ReturnType<typeof ParticipationsService.generateMonthlyOCs>> | null = null
@@ -154,6 +163,59 @@ export class ParticipationsService {
       catch (e) { logger.error({ e }, 'backfill OC tras upsertParticipation falló') }
     }
     return { service_value: input.service_value, participation: data, oc_backfill: backfill }
+  }
+
+  /**
+   * Registra el % en el historial (participation_rates). Primera vez: rige desde
+   * el mes de inicio. Si cambió: rige desde `validFrom` (mes; por defecto el mes
+   * actual) y se recalculan las OC mensuales de ese mes en adelante que aún no
+   * tienen FV (las que ya tienen FV se recalculan al importar, con su % del mes).
+   */
+  static async recordRate(participationId: string, pct: number, startDate: string, validFrom?: string | null) {
+    try {
+      const { data: rates, error } = await supabase
+        .from('participation_rates')
+        .select('percentage, valid_from')
+        .eq('participation_id', participationId)
+      if (error) throw error
+      const list = rates ?? []
+      if (!list.length) {
+        await supabase.from('participation_rates').insert({ participation_id: participationId, percentage: pct, valid_from: monthStart(startDate) })
+        return
+      }
+      const from = monthStart(validFrom || new Date().toISOString().slice(0, 10))
+      if (rateAt(list, from, pct) === pct) return
+      const { error: upErr } = await supabase.from('participation_rates')
+        .upsert({ participation_id: participationId, percentage: pct, valid_from: from }, { onConflict: 'participation_id,valid_from' })
+      if (upErr) throw upErr
+      const updated = [...list.filter((r: any) => String(r.valid_from).slice(0, 10) !== from), { percentage: pct, valid_from: from }]
+
+      const { data: part } = await supabase
+        .from('service_participations')
+        .select('contract_type, company_service:company_services(service_value)')
+        .eq('id', participationId)
+        .maybeSingle()
+      if ((part as any)?.contract_type === 'mandato') return
+      const cs = Array.isArray((part as any)?.company_service) ? (part as any).company_service[0] : (part as any)?.company_service
+      const serviceValue = Number(cs?.service_value ?? 0)
+      const { data: ocs } = await supabase
+        .from('invoice_participations')
+        .select('id, period, proration')
+        .eq('participation_id', participationId)
+        .is('finto_invoice', null)
+        .gte('period', from.slice(0, 7))
+      for (const oc of ocs ?? []) {
+        const p = rateAt(updated, monthStart(oc.period), pct)
+        const proration = Number((oc as any).proration ?? 1)
+        await supabase.from('invoice_participations').update({
+          percentage: p,
+          participation_value: money(calcParticipation(serviceValue, p) * proration),
+          updated_at: new Date().toISOString(),
+        }).eq('id', oc.id)
+      }
+    } catch (e) {
+      logger.warn({ err: (e as any)?.message }, 'No se pudo registrar el historial de % (¿migración participation_rates aplicada?)')
+    }
   }
 
   // ── Cuentas contables del import (configurables) ─────────────────────────────
@@ -216,7 +278,7 @@ export class ParticipationsService {
 
     let q = supabase
       .from('service_participations')
-      .select('id, contract_type, participation_type, percentage, fixed_value, start_date, end_date, billing_day, billing_mode, active, has_third_party, company_service:company_services(start_date, end_date, service_value, companies(id, name, nit))')
+      .select('id, contract_type, participation_type, percentage, fixed_value, start_date, end_date, billing_day, billing_mode, active, has_third_party, participation_rates(percentage, valid_from), company_service:company_services(start_date, end_date, service_value, companies(id, name, nit))')
       .eq('has_third_party', true)
       .eq('active', true)
     if (opts?.participationId) q = q.eq('id', opts.participationId)
@@ -232,6 +294,7 @@ export class ParticipationsService {
         contract_type: (c.contract_type ?? 'servicio') as 'servicio' | 'mandato',
         type:          (c.participation_type ?? 'percentage') as 'percentage' | 'fixed',
         percentage:    Number(c.percentage),
+        rates:         (c.participation_rates ?? []) as ParticipationRate[],
         fixed_value:   c.fixed_value != null ? Number(c.fixed_value) : null,
         start_date:    (c.start_date || cs?.start_date) as string | null,
         end_date:      (c.end_date || cs?.end_date) as string | null,
@@ -289,7 +352,9 @@ export class ParticipationsService {
       const c = pl.cfg
       const isMandate = c.contract_type === 'mandato'
       const base = money(c.service_value * pl.proration)
-      const partValue = isMandate ? 0 : money(calcParticipation(c.service_value, c.percentage, { type: c.type, fixedValue: c.fixed_value }) * pl.proration)
+      // % vigente en el mes de la OC (historial), no el último configurado
+      const pct = rateAt(c.rates, monthStart(pl.period), c.percentage)
+      const partValue = isMandate ? 0 : money(calcParticipation(c.service_value, pct, { type: c.type, fixedValue: c.fixed_value }) * pl.proration)
       const oc = await nextOc(pl.period)
       rows.push({
         participation_id:      c.id,
@@ -299,7 +364,7 @@ export class ParticipationsService {
         finto_invoice_value:   isMandate ? 0 : base,
         contract_type:         c.contract_type,
         participation_type:    c.type,
-        percentage:            c.type === 'fixed' ? 0 : c.percentage,
+        percentage:            c.type === 'fixed' ? 0 : pct,
         fixed_value:           c.type === 'fixed' && !isMandate ? c.fixed_value : null,
         participation_value:   partValue,
         proration:             pl.proration,
@@ -579,7 +644,7 @@ export class ParticipationsService {
     // Configuraciones activas con tercero (servicio y mandato)
     const { data: configs, error } = await supabase
       .from('service_participations')
-      .select('id, participation_type, percentage, fixed_value, start_date, end_date, active, has_third_party, contract_type, company_service:company_services(companies(id, name, nit)), third_party:third_parties(identification, name)')
+      .select('id, participation_type, percentage, fixed_value, start_date, end_date, active, has_third_party, contract_type, participation_rates(percentage, valid_from), company_service:company_services(companies(id, name, nit)), third_party:third_parties(identification, name)')
       .eq('has_third_party', true)
       .eq('active', true)
     if (error) throw error
@@ -592,6 +657,7 @@ export class ParticipationsService {
         contract_type: (cf.contract_type ?? 'servicio') as 'servicio' | 'mandato',
         type:          (cf.participation_type ?? 'percentage') as 'percentage' | 'fixed',
         percentage:    Number(cf.percentage),
+        rates:         (cf.participation_rates ?? []) as ParticipationRate[],
         fixed_value:   cf.fixed_value != null ? Number(cf.fixed_value) : null,
         start_date:    cf.start_date as string | null,
         end_date:      cf.end_date as string | null,
@@ -655,8 +721,11 @@ export class ParticipationsService {
         const nc  = ncByFv.get(normalizeInvoiceNumber(s.fv)) ?? 0
         const nd  = ndByFv.get(normalizeInvoiceNumber(s.fv)) ?? 0
         const net = Math.max(0, money(base - nc + nd))
+        // % vigente en el mes de la FV (historial): reimportar no recalcula los
+        // meses anteriores con el % nuevo.
+        const pct = rateAt(cfg.rates, s.iso ? monthStart(s.iso) : null, cfg.percentage)
         const participationValue = isMandate ? net
-          : (cfg.type === 'fixed' ? (cfg.fixed_value ?? 0) : money(net * cfg.percentage / 100))
+          : (cfg.type === 'fixed' ? (cfg.fixed_value ?? 0) : money(net * pct / 100))
         // Valor de factura para el % de recaudo: mandato = total facturado
         // (ingreso Finto + porción del tercero); servicio = base del servicio.
         const invoiceValue = isMandate ? s.base : serviceBase
@@ -687,7 +756,7 @@ export class ParticipationsService {
           debit_note_value:      nd,
           contract_type:         cfg.contract_type,
           participation_type:    cfg.type,
-          percentage:            cfg.type === 'fixed' ? 0 : cfg.percentage,
+          percentage:            cfg.type === 'fixed' ? 0 : pct,
           fixed_value:           cfg.type === 'fixed' && !isMandate ? cfg.fixed_value : null,
           participation_value:   participationValue,
           _causado_status:       status,

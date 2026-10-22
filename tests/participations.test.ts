@@ -16,6 +16,7 @@ import {
   parseColombianNumber,
   parseAccountingMovement,
   planMoneyDocs,
+  rateAt,
   addMonths,
   billedPeriods,
 } from '../src/modules/participations/participations.domain.js'
@@ -682,5 +683,18 @@ describe('planMoneyDocs — import repetido de RC/FC/RP', () => {
     )
     expect(p.updates.map(u => u.id)).toEqual(['a'])
     expect(p.inserts).toMatchObject([{ fv_ref: 'FV-2-72', amount: 500 }])
+  })
+})
+
+describe('rateAt — % de participación vigente por mes', () => {
+  const rates = [{ percentage: 40, valid_from: '2026-01-01' }, { percentage: 50, valid_from: '2026-07-01' }]
+  it('usa el % del mes de la factura, no el último', () => {
+    expect(rateAt(rates, '2026-06-30', 0)).toBe(40)
+    expect(rateAt(rates, '2026-07-01', 0)).toBe(50)
+    expect(rateAt(rates, '2026-09-10', 0)).toBe(50)
+  })
+  it('fecha anterior a todo el historial → el más antiguo; sin historial → fallback', () => {
+    expect(rateAt(rates, '2025-12-01', 0)).toBe(40)
+    expect(rateAt([], '2026-07-01', 30)).toBe(30)
   })
 })

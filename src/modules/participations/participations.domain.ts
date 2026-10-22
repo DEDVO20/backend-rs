@@ -754,3 +754,28 @@ export function planMoneyDocs(incoming: MoneyDocRow[], existing: MoneyDocRow[]):
   }
   return { updates, inserts }
 }
+
+// ── Porcentaje de participación por vigencia ─────────────────────────────────
+
+export type ParticipationRate = { percentage: number | string; valid_from: string }
+
+/**
+ * Porcentaje vigente en una fecha: el de mayor `valid_from` que no sea posterior
+ * a `isoDate`. Si la fecha es anterior a todos, el más antiguo; sin historial (o
+ * sin fecha), `fallback` (el % actual de la configuración).
+ */
+export function rateAt(rates: ParticipationRate[] | null | undefined, isoDate: string | null | undefined, fallback: number): number {
+  const list = [...(rates ?? [])]
+    .map(r => ({ pct: Number(r.percentage), from: String(r.valid_from).slice(0, 10) }))
+    .filter(r => Number.isFinite(r.pct) && r.from)
+    .sort((a, b) => a.from.localeCompare(b.from))
+  if (!list.length) return fallback
+  if (!isoDate) return list[list.length - 1]!.pct
+  const d = String(isoDate).slice(0, 10)
+  let pick = list[0]!
+  for (const r of list) if (r.from <= d) pick = r
+  return pick.pct
+}
+
+/** Primer día del mes de una fecha o periodo ('2026-07-15' | '2026-07' → '2026-07-01'). */
+export const monthStart = (isoOrPeriod: string) => `${String(isoOrPeriod).slice(0, 7)}-01`

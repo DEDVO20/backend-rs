@@ -22,10 +22,13 @@ export const upsertParticipationSchema = z.object({
   // "Tipo" de contrato: servicio (comisión) o mandato (porción del mandante desde
   // la cuenta 28150601 en SIIGO). Ver participations.domain.ContractType.
   contract_type:      z.enum(['servicio', 'mandato']).default('servicio'),
-  participation_type: z.enum(['percentage', 'fixed']).default('percentage'),
+  // Solo porcentaje: el valor fijo ya no se maneja.
+  participation_type: z.literal('percentage', { errorMap: () => ({ message: 'La participación solo puede ser por porcentaje' }) }).default('percentage'),
   percentage:         z.number().min(0).max(100).optional(),
-  fixed_value:        z.number().nonnegative().nullable().optional(),
   start_date:         z.string().date().optional(),
+  // Mes desde el que rige el % cuando cambia (YYYY-MM-DD; se toma el mes). Los
+  // meses anteriores conservan su %. Por defecto, el mes actual.
+  rate_valid_from:    z.string().date().nullable().optional(),
   end_date:           z.string().date().nullable().optional(),
   // Facturación: día de inicio (1 o 15) y modo (vencido = mes anterior /
   // anticipado = mes actual). Ver participations.domain.billedPeriods.
@@ -33,18 +36,20 @@ export const upsertParticipationSchema = z.object({
   billing_mode:       z.enum(['vencido', 'anticipado']).default('vencido'),
   active:             z.boolean().default(true),
 }).refine(
-  v => !v.has_third_party || (!!v.third_party_id && !!v.start_date),
-  { message: 'Con tercero se requiere tercero y fecha de inicio' },
+  v => !v.has_third_party || !!v.third_party_id,
+  { message: 'Selecciona el tercero' },
+).refine(
+  v => !v.has_third_party || !!v.start_date,
+  { message: 'Indica la fecha de inicio de la participación del tercero' },
 ).refine(
   v => {
     if (!v.has_third_party) return true
     // Mandato: el monto lo aporta SIIGO (cuenta 28150601); el % es la comisión de
     // la firma, informativa, y no se exige.
     if (v.contract_type === 'mandato') return true
-    if (v.participation_type === 'fixed') return (v.fixed_value ?? 0) > 0
     return v.percentage !== undefined
   },
-  { message: 'Indica el porcentaje, o el valor fijo si el tipo es fijo' },
+  { message: 'Indica el porcentaje de participación' },
 )
 
 export const generateParticipationsSchema = z.object({
