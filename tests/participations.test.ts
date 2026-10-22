@@ -15,6 +15,7 @@ import {
   parseSiigoDate,
   parseColombianNumber,
   parseAccountingMovement,
+  planMoneyDocs,
   addMonths,
   billedPeriods,
 } from '../src/modules/participations/participations.domain.js'
@@ -645,5 +646,41 @@ describe('parseAccountingMovement — impuestos retenidos en el recaudo (RC + 13
     ]
     const m = parseAccountingMovement(rows)
     expect(m.collections[0]!.taxes).toMatchObject({ income: 110_000, total: 110_000 })
+  })
+})
+
+describe('planMoneyDocs — import repetido de RC/FC/RP', () => {
+  const rc = (fv_ref: string, amount: number, extra: Record<string, any> = {}) =>
+    ({ doc_type: 'RC', comprobante: 'RC-1-18', fv_ref, amount, ...extra })
+
+  it('documento nuevo → se inserta', () => {
+    const p = planMoneyDocs([rc('FV-2-70', 1000)], [])
+    expect(p.inserts).toHaveLength(1)
+    expect(p.updates).toHaveLength(0)
+  })
+
+  it('mismo archivo otra vez → solo actualiza la fila existente (no duplica)', () => {
+    const p = planMoneyDocs([rc('FV-2-70', 1000)], [rc('FV-2-70', 1000, { id: 'a' })])
+    expect(p.inserts).toHaveLength(0)
+    expect(p.updates).toMatchObject([{ id: 'a', fv_ref: 'FV-2-70', amount: 1000 }])
+    expect(p.updates[0]).not.toHaveProperty('applied')
+  })
+
+  it('RC reasignado a mano (fv_ref cambió) → no se vuelve a insertar', () => {
+    const p = planMoneyDocs(
+      [rc('FV-2-70', 1000, { tax_income_withholding: 110 })],
+      [rc('FV-2-71', 1000, { id: 'a' })],
+    )
+    expect(p.inserts).toHaveLength(0)
+    expect(p.updates).toMatchObject([{ id: 'a', fv_ref: 'FV-2-71', amount: 1000, tax_income_withholding: 110 }])
+  })
+
+  it('el reporte trae una porción nueva del RC → inserta solo esa porción', () => {
+    const p = planMoneyDocs(
+      [rc('FV-2-70', 1000), rc('FV-2-72', 500)],
+      [rc('FV-2-70', 1000, { id: 'a' })],
+    )
+    expect(p.updates.map(u => u.id)).toEqual(['a'])
+    expect(p.inserts).toMatchObject([{ fv_ref: 'FV-2-72', amount: 500 }])
   })
 })

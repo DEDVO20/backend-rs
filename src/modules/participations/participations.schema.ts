@@ -85,6 +85,7 @@ export const updateInvoiceParticipationSchema = z.object({
   third_party_invoice_date:  z.string().trim().nullable().optional(),
   third_party_invoice_value: z.number().min(0).nullable().optional(),
   payment_order:             z.string().trim().nullable().optional(),
+  payment_order_date:        z.string().trim().nullable().optional(),
   // Etapa 5: Pago al tercero (RP)
   egress_voucher:            z.string().trim().nullable().optional(),
   egress_voucher_date:       z.string().trim().nullable().optional(),

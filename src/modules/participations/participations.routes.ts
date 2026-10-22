@@ -298,7 +298,9 @@ app.post('/import-movimiento',
     }
 
     const user = c.get('user')
-    const result = await ParticipationsService.importMovimiento(rows, apply)
+    const result = await ParticipationsService.importMovimiento(rows, apply, undefined, {
+      fileName: file.name, importedBy: (user as any)?.email ?? null,
+    })
     if (apply) auditAsync({ action: 'update', resource: 'invoice_participations', metadata: { source: 'siigo-movimiento', ...result.summary }, user, c })
     return c.json(result)
   },

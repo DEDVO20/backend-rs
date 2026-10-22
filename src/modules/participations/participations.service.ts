@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { supabase } from '../../lib/supabase.js'
 import { logger }   from '../../lib/logger.js'
 import {
@@ -5,7 +6,7 @@ import {
   formatPurchaseOrder, formatPaymentOrder, validateThirdPartyInvoice, money,
   normalizeInvoiceNumber,
   normalizeSiigoInvoice, nitMatch, normalizeNit,
-  parseAccountingMovement, PARTICIPATION_ACCOUNTS, billedPeriods, emptyCollectionTaxes,
+  parseAccountingMovement, PARTICIPATION_ACCOUNTS, billedPeriods, emptyCollectionTaxes, planMoneyDocs,
 } from './participations.domain.js'
 import type { ParticipationAccounts, MovCollection, CollectionTaxes } from './participations.domain.js'
 import { computeOperation, partitionInvoice } from '../tax/tax.domain.js'
@@ -25,6 +26,15 @@ const toDateStr = (d: Date) => d.toISOString().split('T')[0]!
 // ── Parseo de reportes de SIIGO ──────────────────────────────────────────────
 
 const stripAccents = (s: string) => s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+
+/** Firma de los valores CAUSADOS que trae el reporte para una FV. Si un nuevo
+ *  import trae la misma firma, la OC no se toca (conserva ediciones manuales). */
+export const importSignature = (w: Record<string, any>) => JSON.stringify([
+  w.participation_id, w.finto_invoice_date ?? null, money(Number(w.finto_invoice_value ?? 0)),
+  money(Number(w.credit_note_value ?? 0)), money(Number(w.debit_note_value ?? 0)),
+  w.contract_type, w.participation_type, Number(w.percentage ?? 0), w.fixed_value ?? null,
+  money(Number(w.participation_value ?? 0)),
+])
 
 
 export class ParticipationsService {
@@ -513,7 +523,22 @@ export class ParticipationsService {
    * al tercero (RP/banco) que registra el egreso. Idempotente por FV/RC/FC/RP;
    * con apply=false solo previsualiza.
    */
-  static async importMovimiento(rows: string[][], apply: boolean, accounts?: ParticipationAccounts) {
+  static async importMovimiento(rows: string[][], apply: boolean, accounts?: ParticipationAccounts, ctx?: { fileName?: string; importedBy?: string }) {
+    // Huella del contenido (no del nombre): detecta el mismo reporte aunque se
+    // haya vuelto a guardar o renombrar. Solo para avisar; el import ya es idempotente.
+    const contentHash = createHash('sha256').update(JSON.stringify(rows)).digest('hex')
+    let alreadyImported: { imported_at: string; file_name: string | null; imported_by: string | null } | null = null
+    try {
+      const { data: prevImport } = await supabase
+        .from('participation_imports')
+        .select('imported_at, file_name, imported_by')
+        .eq('content_hash', contentHash)
+        .order('imported_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+      alreadyImported = (prevImport as any) ?? null
+    } catch { /* tabla aún sin migrar: sin aviso */ }
+
     const acc = accounts ?? await ParticipationsService.loadAccounts()
     const mov = parseAccountingMovement(rows, acc)
     if (!mov.sales.length && !mov.collections.length && !mov.thirdInvoices.length && !mov.payments.length)
@@ -673,7 +698,7 @@ export class ParticipationsService {
       results.push(res)
     }
 
-    let created = 0, updated = 0, recaudo_updated = 0, third_invoice_matched = 0, paid_matched = 0
+    let created = 0, updated = 0, unchanged = 0, recaudo_updated = 0, third_invoice_matched = 0, paid_matched = 0
     // Documentos para Cruce/Pagos (se persisten al final del apply)
     const docs: any[] = []
     // Fase 1 — conciliación manual asistida: el import NO aplica el dinero
@@ -704,6 +729,8 @@ export class ParticipationsService {
         delete w._period
         delete w._causado_status
         w.period = period
+        // Firma de lo causado que trae el archivo para esta FV (ver import_signature)
+        w.import_signature = importSignature(w)
         w.updated_at = new Date().toISOString()
 
         // Al ACTUALIZAR una OC existente solo se tocan los campos del CAUSADO; el
@@ -714,10 +741,13 @@ export class ParticipationsService {
         // 1. La FV ya existe → actualiza y conserva su OC
         const { data: byFv } = await supabase
           .from('invoice_participations')
-          .select('id')
+          .select('id, import_signature')
           .eq('finto_invoice', w.finto_invoice)
           .maybeSingle()
         if (byFv) {
+          // Mismo causado que el último import (p. ej. el archivo se subió dos
+          // veces): no se toca la OC, así se conservan las correcciones manuales.
+          if ((byFv as any).import_signature === w.import_signature) { unchanged++; continue }
           const { error: upErr } = await supabase.from('invoice_participations').update(causadoOnly).eq('id', byFv.id)
           if (upErr) throw upErr
           await ParticipationsService.recomputeOcFromAllocations(byFv.id)
@@ -1201,10 +1231,15 @@ export class ParticipationsService {
           prev.note     = prev.matched ? null : (prev.note ?? d.note)
         }
         const rows = [...merged.values()].map(d => ({ ...d, updated_at: new Date().toISOString() }))
-        const { error: docErr } = await supabase
-          .from('siigo_documents')
-          .upsert(rows, { onConflict: 'doc_type,comprobante,fv_ref' })
-        if (docErr) throw docErr
+        const isMoney = (t: string) => t === 'RC' || t === 'FC' || t === 'RP'
+        const otherRows = rows.filter(d => !isMoney(d.doc_type))
+        if (otherRows.length) {
+          const { error: docErr } = await supabase
+            .from('siigo_documents')
+            .upsert(otherRows, { onConflict: 'doc_type,comprobante,fv_ref' })
+          if (docErr) throw docErr
+        }
+        await ParticipationsService.persistMoneyDocs(rows.filter(d => isMoney(d.doc_type)))
       }
     } else {
       for (const w of toWrite) delete w._period
@@ -1227,7 +1262,7 @@ export class ParticipationsService {
       third_invoices: mov.thirdInvoices.length,
       payments:       mov.payments.length,
       participation_total: money(toWrite.reduce((a, w) => a + Number(w.participation_value ?? 0), 0)),
-      created, updated, recaudo_updated, third_invoice_matched, paid_matched,
+      created, updated, unchanged, recaudo_updated, third_invoice_matched, paid_matched,
     }
     // NC/ND: las que traen el FV en la descripción SÍ ajustan el neto (marcadas
     // con `applied`); las que no, solo se informan para revisión manual.
@@ -1237,7 +1272,13 @@ export class ParticipationsService {
     })
     const creditNotes = mov.creditNotes.map(mapNote)
     const debitNotes  = mov.debitNotes.map(mapNote)
-    return { summary, results, creditNotes, debitNotes, applied: apply }
+    if (apply) {
+      const { error: impErr } = await supabase.from('participation_imports').insert({
+        content_hash: contentHash, file_name: ctx?.fileName ?? null, imported_by: ctx?.importedBy ?? null, summary,
+      })
+      if (impErr) logger.warn({ err: impErr.message }, 'No se pudo registrar el import en participation_imports')
+    }
+    return { summary, results, creditNotes, debitNotes, applied: apply, already_imported: alreadyImported }
   }
 
   // ── Cruce y Pagos (sobre siigo_documents) ────────────────────────────────────
@@ -1410,7 +1451,7 @@ export class ParticipationsService {
   static async recomputeOcFromAllocations(id: string) {
     const { data: oc } = await supabase
       .from('invoice_participations')
-      .select('id, period, finto_invoice, finto_invoice_date, finto_invoice_value, participation_value, participation_type, payment_order, payment_order_date')
+      .select('id, period, finto_invoice, finto_invoice_date, finto_invoice_value, participation_value, participation_type, third_party_invoice_date, payment_order, payment_order_date')
       .eq('id', id)
       .maybeSingle()
     if (!oc) return
@@ -1433,6 +1474,19 @@ export class ParticipationsService {
       collected,
     })
 
+    // Fecha de la factura del tercero = la más reciente de sus FC asignadas
+    // (siigo_documents.doc_date). Sin FC asignadas se conserva la que tenga.
+    let third_party_invoice_date: string | null = fcList.length ? ((oc as any).third_party_invoice_date ?? null) : null
+    if (fcList.length) {
+      const { data: fcDocs } = await supabase
+        .from('siigo_documents')
+        .select('doc_date')
+        .eq('doc_type', 'FC')
+        .in('comprobante', fcList)
+      const dates = (fcDocs ?? []).map((d: any) => d.doc_date).filter(Boolean).sort()
+      if (dates.length) third_party_invoice_date = dates[dates.length - 1]
+    }
+
     // Fase 2 — Orden de Pago (OP): cuando la FC acumulada concilia lo causado y
     // la OC aún no tiene OP, se genera una automáticamente. Si ya no concilia
     // (se desvincularon FC) y la OP estaba pendiente, se retira. Numeración
@@ -1450,7 +1504,8 @@ export class ParticipationsService {
         .select('id', { count: 'exact', head: true })
         .ilike('payment_order', `OP-${y}${m}-%`)
       payment_order = formatPaymentOrder(Number(y), Number(m), (count ?? 0) + 1)
-      payment_order_date = (oc as any).finto_invoice_date ?? now.slice(0, 10)
+      // La OP nace al conciliar la FC: su fecha es la de la factura del tercero.
+      payment_order_date = third_party_invoice_date ?? now.slice(0, 10)
     } else if (!conciliated && payment_order && rpList.length === 0) {
       // La OP se derivó de una conciliación que ya no se cumple y aún no hay pago
       // (RP) asignado → se retira. Si ya hubo pago, se conserva.
@@ -1463,6 +1518,7 @@ export class ParticipationsService {
       cash_receipts:             rcList.length ? rcList.join(', ') : null,
       available_for_payment:     available,
       third_party_invoice:       fcList.length ? fcList.join(', ') : null,
+      third_party_invoice_date,
       third_party_invoice_value: fcList.length ? fcVal : null,
       payment_order,
       payment_order_date,
@@ -1530,6 +1586,42 @@ export class ParticipationsService {
       await supabase.from('siigo_documents')
         .update({ applied, matched: applied + 0.01 >= amt, updated_at: now })
         .eq('id', r.id)
+    }
+  }
+
+  /**
+   * Persiste los documentos de dinero (RC/FC/RP) del import sin duplicar ni
+   * reiniciar lo aplicado. Un documento se reconoce por tipo + comprobante: su
+   * factura de referencia (fv_ref) puede haber cambiado después de importar (al
+   * aplicar o reasignar un recaudo a mano), y un upsert por fv_ref crearía otra
+   * fila y contaría el valor dos veces. `applied`/`matched` de los documentos
+   * existentes no se tocan (los mantienen las asignaciones y los flujos manuales).
+   */
+  static async persistMoneyDocs(rows: any[]) {
+    if (!rows.length) return
+    const chunks = <T,>(xs: T[], n = 150) => Array.from({ length: Math.ceil(xs.length / n) }, (_, i) => xs.slice(i * n, i * n + n))
+    const types = [...new Set(rows.map(r => r.doc_type as string))]
+    const comps = [...new Set(rows.map(r => String(r.comprobante)))]
+
+    const existing: any[] = []
+    for (const cs of chunks(comps)) {
+      const { data, error } = await supabase
+        .from('siigo_documents')
+        .select('id, doc_type, comprobante, fv_ref, amount, tax_income_withholding, tax_ica_withholding, tax_iva_withholding')
+        .in('doc_type', types)
+        .in('comprobante', cs)
+      if (error) throw error
+      existing.push(...(data ?? []))
+    }
+    const { updates, inserts } = planMoneyDocs(rows, existing)
+
+    for (const part of chunks(updates)) {
+      const { error } = await supabase.from('siigo_documents').upsert(part, { onConflict: 'id' })
+      if (error) throw error
+    }
+    for (const part of chunks(inserts)) {
+      const { error } = await supabase.from('siigo_documents').insert(part.map(r => ({ ...r, applied: 0, matched: false })))
+      if (error) throw error
     }
   }
 
@@ -2194,7 +2286,8 @@ export class ParticipationsService {
           .select('id', { count: 'exact', head: true })
           .ilike('payment_order', `OP-${y}${m}-%`)
         updatePayload.payment_order = formatPaymentOrder(Number(y), Number(m), (count ?? 0) + 1)
-        updatePayload.payment_order_date = updatePayload.third_party_invoice_date ?? now.split('T')[0]
+        updatePayload.payment_order_date = updatePayload.payment_order_date
+          ?? updatePayload.third_party_invoice_date ?? current.third_party_invoice_date ?? now.split('T')[0]
       }
     }
 
@@ -2697,7 +2790,7 @@ export class ParticipationsService {
     const { data, error } = await q
     if (error) throw error
 
-    return (data ?? []).filter((d: any) => {
+    const mine = (data ?? []).filter((d: any) => {
       const dNit = normalizeNit(d.tercero_nit)
       const matchesNit = dNit && nitMatch(dNit, norm)
       if (!matchesNit) return false
@@ -2709,6 +2802,38 @@ export class ParticipationsService {
       }
       return true
     })
+
+    // Documentos de dinero (RC/FC/RP): uno por comprobante, con su saldo real
+    // = valor − Σ asignado a OC (participation_allocations). Así, al asignar una
+    // parte a una OC, la siguiente ve lo que queda disponible.
+    const isMoney = (t: string) => t === 'RC' || t === 'FC' || t === 'RP'
+    const moneyDocs = mine.filter((d: any) => isMoney(d.doc_type))
+    if (!moneyDocs.length) return mine
+    const { data: allocRows } = await supabase
+      .from('participation_allocations')
+      .select('source_doc_type, source_comprobante, amount')
+      .in('source_doc_type', [...new Set(moneyDocs.map((d: any) => d.doc_type))])
+    const allocMap = new Map<string, number>()
+    for (const a of allocRows ?? []) {
+      const k = `${a.source_doc_type}::${normalizeInvoiceNumber(a.source_comprobante)}`
+      allocMap.set(k, money((allocMap.get(k) ?? 0) + Number(a.amount ?? 0)))
+    }
+    const grouped = new Map<string, any>()
+    for (const d of moneyDocs) {
+      const k = `${d.doc_type}::${normalizeInvoiceNumber(d.comprobante)}`
+      const prev = grouped.get(k)
+      if (prev) {
+        prev.amount = money(prev.amount + Number(d.amount ?? 0))
+        if (!prev.doc_date && d.doc_date) prev.doc_date = d.doc_date
+      } else grouped.set(k, { ...d, amount: Number(d.amount ?? 0) })
+    }
+    const money_out = [...grouped.entries()].map(([k, d]) => {
+      const allocated = allocMap.get(k) ?? 0
+      const available = money(Math.max(0, d.amount - allocated))
+      return { ...d, allocated, available, matched: available <= 0.01 }
+    })
+    return [...mine.filter((d: any) => !isMoney(d.doc_type)), ...money_out]
+      .sort((a: any, b: any) => String(b.doc_date ?? '').localeCompare(String(a.doc_date ?? '')))
   }
 
 

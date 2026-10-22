@@ -687,3 +687,70 @@ export function parseAccountingMovement(rows: string[][], accounts?: Participati
     payments:     [...payments.values()],
   }
 }
+
+// ── Import idempotente de documentos de dinero (RC/FC/RP) ────────────────────
+
+type MoneyDocRow = {
+  id?: string; doc_type: string; comprobante: string; fv_ref?: string | null; amount: number
+  tax_income_withholding?: number | null; tax_ica_withholding?: number | null; tax_iva_withholding?: number | null
+  [k: string]: any
+}
+
+/**
+ * Decide qué hacer con los documentos de dinero que trae un import frente a los
+ * ya guardados (función pura). Se reconocen por tipo + comprobante:
+ *  - misma factura de referencia (fv_ref) → actualizar valor y datos, conservando
+ *    fv_ref y lo aplicado.
+ *  - fv_ref distinta pero el documento ya está registrado por el mismo valor (se
+ *    reasignó a mano) → no insertar de nuevo; sus impuestos van a la fila
+ *    reasignada.
+ *  - el documento no existe, o el reporte trae una porción nueva → insertar.
+ */
+export function planMoneyDocs(incoming: MoneyDocRow[], existing: MoneyDocRow[]): { updates: MoneyDocRow[]; inserts: MoneyDocRow[] } {
+  const keyOf = (t: string, comp: string) => `${t}::${normalizeInvoiceNumber(comp)}`
+  const group = (xs: MoneyDocRow[]) => {
+    const m = new Map<string, MoneyDocRow[]>()
+    for (const x of xs) { const k = keyOf(x.doc_type, x.comprobante); m.set(k, [...(m.get(k) ?? []), x]) }
+    return m
+  }
+  const existingBy = group(existing)
+  const taxKeys = ['tax_income_withholding', 'tax_ica_withholding', 'tax_iva_withholding'] as const
+  const meta = (r: MoneyDocRow) => ({
+    tercero_nit: r.tercero_nit, tercero_name: r.tercero_name, period: r.period, doc_date: r.doc_date,
+    tax_income_withholding: Number(r.tax_income_withholding ?? 0),
+    tax_ica_withholding:    Number(r.tax_ica_withholding ?? 0),
+    tax_iva_withholding:    Number(r.tax_iva_withholding ?? 0),
+    updated_at: r.updated_at,
+  })
+  const updates: MoneyDocRow[] = []
+  const inserts: MoneyDocRow[] = []
+  for (const [k, inc] of group(incoming)) {
+    const ex = existingBy.get(k) ?? []
+    if (!ex.length) { inserts.push(...inc); continue }
+    const usedIds = new Set<string>()
+    const unmatched: MoneyDocRow[] = []
+    for (const r of inc) {
+      const same = ex.find(e => !usedIds.has(e.id!) && String(e.fv_ref ?? '').trim() === String(r.fv_ref ?? '').trim())
+      if (same) {
+        usedIds.add(same.id!)
+        updates.push({ id: same.id, doc_type: same.doc_type, comprobante: same.comprobante, fv_ref: same.fv_ref, amount: r.amount, ...meta(r) })
+      } else unmatched.push(r)
+    }
+    if (!unmatched.length) continue
+    const exTotal  = money(ex.reduce((s, e) => s + Number(e.amount ?? 0), 0))
+    const incTotal = money(inc.reduce((s, r) => s + Number(r.amount ?? 0), 0))
+    if (exTotal + 0.01 >= incTotal) {
+      const target = ex.find(e => !usedIds.has(e.id!)) ?? ex[0]!
+      const sums = Object.fromEntries(taxKeys.map(t => [t, money(unmatched.reduce((s, r) => s + Number(r[t] ?? 0), 0))])) as Record<typeof taxKeys[number], number>
+      if (taxKeys.some(t => sums[t] > 0)) {
+        const prev = updates.find(u => u.id === target.id)
+        if (prev) for (const t of taxKeys) prev[t] = money(Number(prev[t] ?? 0) + sums[t])
+        else updates.push({
+          id: target.id, doc_type: target.doc_type, comprobante: target.comprobante, fv_ref: target.fv_ref,
+          amount: Number(target.amount ?? 0), ...sums, updated_at: unmatched[0]!.updated_at,
+        })
+      }
+    } else inserts.push(...unmatched)
+  }
+  return { updates, inserts }
+}
