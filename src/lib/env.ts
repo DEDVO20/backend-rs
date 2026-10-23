@@ -22,6 +22,15 @@ const envSchema = z.object({
   REDIS_URL:                 z.string().url(),
   PORT:                      z.coerce.number().int().positive().default(3000),
   NODE_ENV:                  z.enum(['development', 'production', 'test']).default('development'),
+  // Integración API Siigo (Consultas de ventas / facturación)
+  SIIGO_USERNAME:            z.string().optional(),
+  SIIGO_ACCESS_KEY:          z.string().optional(),
+  SIIGO_PARTNER_ID:          z.string().default('RSHUBS'),
+  SELLER_ID_FILTER:          z.string().optional(),
+  START_YEAR:                z.coerce.number().int().default(2025),
+  SIIGO_SYNC_OVERLAP_DAYS:   z.coerce.number().int().min(0).default(5),
+  SLEEP_BETWEEN_DOCS_MS:     z.coerce.number().int().default(400),
+  SLEEP_BETWEEN_PRODUCT_LOOKUPS_MS: z.coerce.number().int().default(250),
 }).superRefine((v, ctx) => {
   if (v.EMAIL_PROVIDER !== 'resend') return
   for (const key of ['RESEND_API_KEY', 'RESEND_FROM'] as const) {

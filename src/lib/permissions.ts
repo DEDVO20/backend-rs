@@ -26,6 +26,7 @@ export const MODULE_CATALOG = {
   collection:           { name: 'Cobranza',               scope: 'shared' },
   accounting:           { name: 'Contabilidad',           scope: 'internal' },
   participations:       { name: 'Participaciones',        scope: 'internal' },
+  siigo:                { name: 'Consultas Siigo',        scope: 'shared' },
   documents:            { name: 'Documentos',             scope: 'shared' },
   team_management:      { name: 'Gestión de equipo',      scope: 'shared' },
   users_admin:          { name: 'Administración usuarios', scope: 'internal' },

@@ -86,6 +86,33 @@ async function processJob(jobName: string) {
         break
       }
 
+      case 'siigo-daily-sync': {
+        const { SiigoService } = await import('../modules/siigo/siigo.service.js')
+        const { validateSiigoConfig } = await import('../modules/siigo/siigo.config.js')
+        const configErrors = validateSiigoConfig()
+        if (configErrors.length > 0) {
+          result = { skipped: true, reason: configErrors.join('. ') }
+          logger.warn({ result }, 'Cron: sync Siigo omitida por configuración incompleta')
+          break
+        }
+        try {
+          const log = await SiigoService.syncFromSiigo({ mode: 'incremental', days: 15 })
+          result = {
+            start_date:         log.start_date,
+            end_date:           log.end_date,
+            invoices_count:     log.invoices_count,
+            credit_notes_count: log.credit_notes_count,
+            lines_count:        log.lines_count,
+          }
+          logger.info({ result }, 'Cron: sync incremental de Siigo completada')
+        } catch (err: any) {
+          // Una sync manual en curso no es un fallo del cron
+          if (err?.statusCode !== 409) throw err
+          result = { skipped: true, reason: err.message }
+        }
+        break
+      }
+
       default:
         logger.warn({ jobName }, 'Cron: job desconocido')
         return
@@ -158,5 +185,10 @@ async function setupRepeatableJobs() {
     repeat: { pattern: '0 11 1 * *' },
   })
 
-  logger.info('Cron jobs registrados: generate-tasks (diario 6AM), send-reminders (diario 7AM), mark-overdue (diario 1AM), tax-calendar-tasks (diario 6:30AM), tax-calendar-reminders (diario 7:15AM), participations-monthly-oc (día 1 6AM)')
+  // Sync incremental de Siigo — diario 2:00 AM Colombia (7 UTC): solo trae desde la última sync
+  await cronQueue.add('siigo-daily-sync', {}, {
+    repeat: { pattern: '0 7 * * *' },
+  })
+
+  logger.info('Cron jobs registrados: generate-tasks (diario 6AM), send-reminders (diario 7AM), mark-overdue (diario 1AM), tax-calendar-tasks (diario 6:30AM), tax-calendar-reminders (diario 7:15AM), participations-monthly-oc (día 1 6AM), siigo-daily-sync (diario 2AM)')
 }
