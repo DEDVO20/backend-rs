@@ -11,6 +11,14 @@ export const SIIGO_CONFIG = {
   CREDIT_NOTES_URL: 'https://api.siigo.com/v1/credit-notes',
   CUSTOMERS_URL:    'https://api.siigo.com/v1/customers',
   PRODUCTS_URL:     'https://api.siigo.com/v1/products',
+  VOUCHERS_URL:     'https://api.siigo.com/v1/vouchers',
+  DOCUMENT_TYPES_URL: 'https://api.siigo.com/v1/document-types',
+
+  // Recaudo (recibos de caja): fecha inicial de la consulta y tope de peticiones por ejecución
+  get COLLECTIONS_START_DATE() { return process.env.SIIGO_COLLECTIONS_START_DATE || '2026-01-01' },
+  COLLECTIONS_MAX_REQUESTS: 4000,
+  COLLECTIONS_MAX_PAGES: 200,
+  COLLECTIONS_MAX_GAP_QUERIES: 200,
 
   get USERNAME() { return process.env.SIIGO_USERNAME || 'pblanco@raddf.com' },
   get ACCESS_KEY() { return process.env.SIIGO_ACCESS_KEY || '' },

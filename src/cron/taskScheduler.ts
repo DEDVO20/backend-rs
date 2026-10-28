@@ -113,6 +113,51 @@ async function processJob(jobName: string) {
         break
       }
 
+      case 'siigo-daily-collections': {
+        const { SiigoCollectionsService } = await import('../modules/siigo/siigo.collections.service.js')
+        const { validateSiigoConfig } = await import('../modules/siigo/siigo.config.js')
+        const configErrors = validateSiigoConfig()
+        if (configErrors.length > 0) {
+          result = { skipped: true, reason: configErrors.join('. ') }
+          break
+        }
+        try {
+          const log = await SiigoCollectionsService.syncFromSiigo()
+          result = {
+            start_date:     log.start_date,
+            end_date:       log.end_date,
+            vouchers_count: log.vouchers_count,
+            lines_count:    log.lines_count,
+            total_applied:  log.total_applied,
+          }
+          logger.info({ result }, 'Cron: recaudo Siigo actualizado')
+        } catch (err: any) {
+          if (err?.statusCode !== 409) throw err
+          result = { skipped: true, reason: err.message }
+        }
+        break
+      }
+
+      case 'siigo-daily-trial-balance': {
+        const { SiigoTrialBalanceService } = await import('../modules/siigo/siigo.trialBalance.service.js')
+        const { validateSiigoConfig } = await import('../modules/siigo/siigo.config.js')
+        const configErrors = validateSiigoConfig()
+        if (configErrors.length > 0) {
+          result = { skipped: true, reason: configErrors.join('. ') }
+          break
+        }
+        try {
+          const log = await SiigoTrialBalanceService.syncFromSiigo({ mode: 'current' })
+          result = { year: log.year, months_ok: log.months_ok, months_failed: log.months_failed, rows_count: log.rows_count }
+          if (log.status === 'failed') throw new Error(log.error_message ?? 'Balance de prueba no importado')
+          logger.info({ result }, 'Cron: balance de prueba del mes actual actualizado')
+        } catch (err: any) {
+          if (err?.statusCode !== 409) throw err
+          result = { skipped: true, reason: err.message }
+        }
+        break
+      }
+
       default:
         logger.warn({ jobName }, 'Cron: job desconocido')
         return
@@ -190,5 +235,15 @@ async function setupRepeatableJobs() {
     repeat: { pattern: '0 7 * * *' },
   })
 
-  logger.info('Cron jobs registrados: generate-tasks (diario 6AM), send-reminders (diario 7AM), mark-overdue (diario 1AM), tax-calendar-tasks (diario 6:30AM), tax-calendar-reminders (diario 7:15AM), participations-monthly-oc (día 1 6AM), siigo-daily-sync (diario 2AM)')
+  // Recaudo Siigo — diario 2:30 AM Colombia (7:30 UTC), después de la sync de facturación
+  await cronQueue.add('siigo-daily-collections', {}, {
+    repeat: { pattern: '30 7 * * *' },
+  })
+
+  // Balance de prueba por tercero — mes actual, diario 6:00 AM Colombia (11 UTC)
+  await cronQueue.add('siigo-daily-trial-balance', {}, {
+    repeat: { pattern: '0 11 * * *' },
+  })
+
+  logger.info('Cron jobs registrados: generate-tasks (diario 6AM), send-reminders (diario 7AM), mark-overdue (diario 1AM), tax-calendar-tasks (diario 6:30AM), tax-calendar-reminders (diario 7:15AM), participations-monthly-oc (día 1 6AM), siigo-daily-sync (diario 2AM), siigo-daily-collections (diario 2:30AM), siigo-daily-trial-balance (diario 6AM)')
 }

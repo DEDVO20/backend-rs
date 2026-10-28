@@ -115,6 +115,10 @@ export class SiigoService {
   private static memoryLogs: SyncLogEntry[] = []
   private static isSyncRunning = false
 
+  static get running(): boolean {
+    return this.isSyncRunning
+  }
+
   /** Listado de empresas para cruzar NIT de Siigo -> company_id */
   static async loadCompanies(): Promise<CompanyRef[]> {
     const { data, error } = await supabase
@@ -503,18 +507,13 @@ export class SiigoService {
 
       const [pageResult, reportResult] = await Promise.all([
         this.fetchLinesPage(args, from, from + limit - 1, false, true),
-        supabase.rpc('siigo_sales_report', { ...args, p_include_customers: scope.isInternal }),
+        this.fetchReport(args, scope.isInternal),
       ])
-      if (reportResult.error) {
-        throw new Error(`No se pudo calcular el resumen de Siigo: ${reportResult.error.message}`)
-      }
 
-      report = reportResult.data as SalesReport
+      report = reportResult
       rows = pageResult.rows
       total = pageResult.count ?? Number(report.summary.totalLineas)
     }
-
-    const s = report.summary
 
     return {
       data:  rows,
@@ -524,22 +523,50 @@ export class SiigoService {
       clientCompany: scope.clientCompany,
       isSyncRunning,
       lastSync: logs[0] ?? null,
-      summary: {
-        totalFacturas:     Number(s.totalFacturas),
-        totalNotasCredito: Number(s.totalNotasCredito),
-        totalDocumentos:   Number(s.totalFacturas) + Number(s.totalNotasCredito),
-        totalLineas:       Number(s.totalLineas),
-        totalBruto:        Number(s.totalBruto),
-        totalDescuento:    Number(s.totalDescuento),
-        totalSubtotal:     Number(s.totalSubtotal),
-        totalImpuestos:    Number(s.totalImpuestos),
-        totalRetenciones:  Number(s.totalRetenciones),
-        totalNeto:         Number(s.totalNeto),
-      },
+      summary:    this.toSummary(report.summary),
       monthly:    report.monthly,
       byProduct:  report.byProduct,
       byCustomer: report.byCustomer,
       catalogs:   report.catalogs,
+    }
+  }
+
+  /** Solo agregados (sin líneas): alimenta la vista de gráficas de facturación */
+  static async getReport(query: ListSiigoSalesQuery, user: AuthUser) {
+    const scope = await this.resolveScope(query, user)
+    const report = scope.denied
+      ? EMPTY_REPORT
+      : await this.fetchReport(this.filterArgs(scope, query), scope.isInternal)
+    const { logs } = await this.getSyncLogs()
+
+    return {
+      clientCompany: scope.clientCompany,
+      lastSync:      logs[0] ?? null,
+      summary:       this.toSummary(report.summary),
+      monthly:       report.monthly,
+      byProduct:     report.byProduct,
+      byCustomer:    report.byCustomer,
+    }
+  }
+
+  private static async fetchReport(args: SalesFilterArgs, includeCustomers: boolean): Promise<SalesReport> {
+    const { data, error } = await supabase.rpc('siigo_sales_report', { ...args, p_include_customers: includeCustomers })
+    if (error) throw new Error(`No se pudo calcular el resumen de Siigo: ${error.message}`)
+    return data as SalesReport
+  }
+
+  private static toSummary(s: SalesSummary) {
+    return {
+      totalFacturas:     Number(s.totalFacturas),
+      totalNotasCredito: Number(s.totalNotasCredito),
+      totalDocumentos:   Number(s.totalFacturas) + Number(s.totalNotasCredito),
+      totalLineas:       Number(s.totalLineas),
+      totalBruto:        Number(s.totalBruto),
+      totalDescuento:    Number(s.totalDescuento),
+      totalSubtotal:     Number(s.totalSubtotal),
+      totalImpuestos:    Number(s.totalImpuestos),
+      totalRetenciones:  Number(s.totalRetenciones),
+      totalNeto:         Number(s.totalNeto),
     }
   }
 

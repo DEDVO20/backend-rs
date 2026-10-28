@@ -20,9 +20,30 @@ import {
 } from './siigo.calculator.js'
 import { logger } from '../../lib/logger.js'
 
+function resultsOf(resp: any): Record<string, any>[] {
+  if (Array.isArray(resp)) return resp
+  const list = resp?.results || resp?.data || resp?.items
+  return Array.isArray(list) ? list : []
+}
+
+const compactRef = (s: unknown) =>
+  String(s ?? '').trim().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]/g, '')
+
+function invoiceMatchesReference(f: Record<string, any>, ref: string): boolean {
+  const doc = f?.document ?? {}
+  const posibles = [f.name, f.code, f.number_full, f.document_name, doc.name, doc.code, doc.number_full]
+  const prefix = firstNonEmpty([f.prefix, doc.prefix])
+  const number = firstNonEmpty([f.number, f.consecutive, doc.number, doc.consecutive])
+  if (prefix && number) posibles.push(`${prefix.replace(/-+$/, '')}-${number}`)
+  const target = compactRef(ref)
+  return posibles.some(x => x && compactRef(x) === target)
+}
+
 export class SiigoApiClient implements SiigoCatalogLookup {
   private token: string | null = null
   public urlFetchCount = 0
+  /** Tope de peticiones por ejecución para proteger la cuota de Siigo */
+  public maxRequests = Number.POSITIVE_INFINITY
 
   async getAccessToken(): Promise<string> {
     if (this.token) return this.token
@@ -63,6 +84,9 @@ export class SiigoApiClient implements SiigoCatalogLookup {
 
   private async _fetchDirect(url: string, options?: RequestInit): Promise<Response> {
     this.urlFetchCount++
+    if (this.urlFetchCount > this.maxRequests) {
+      throw new Error(`Se detuvo para proteger la cuota de Siigo. Peticiones usadas: ${this.urlFetchCount}`)
+    }
     return await fetch(url, options)
   }
 
@@ -201,6 +225,63 @@ export class SiigoApiClient implements SiigoCatalogLookup {
     }
 
     return { ids: Array.from(new Set(ids)), excluded }
+  }
+
+  /** Listado paginado de recibos de caja (vouchers) con los parámetros dados */
+  async listVouchers(params: Record<string, string>, maxPages = SIIGO_CONFIG.COLLECTIONS_MAX_PAGES): Promise<Record<string, any>[]> {
+    const out: Record<string, any>[] = []
+    for (let page = 1; page <= maxPages; page++) {
+      const resp = await this.fetchWithRetry(
+        SIIGO_CONFIG.VOUCHERS_URL + buildQueryString({ ...params, page, page_size: SIIGO_CONFIG.PAGE_SIZE }),
+      )
+      const docs = resultsOf(resp)
+      if (!docs.length) break
+      out.push(...docs)
+
+      const total = Number(resp?.pagination?.total_results || 0)
+      if (total > 0 && page * SIIGO_CONFIG.PAGE_SIZE >= total) break
+      if (docs.length < SIIGO_CONFIG.PAGE_SIZE) break
+    }
+    return out
+  }
+
+  /** Vouchers cuyo nombre coincide exactamente (p. ej. RC-1-45) */
+  async findVouchersByName(name: string): Promise<Record<string, any>[]> {
+    const resp = await this.fetchWithRetry(SIIGO_CONFIG.VOUCHERS_URL + buildQueryString({ name, page: 1, page_size: 25 }))
+    const target = name.trim().toUpperCase()
+    return resultsOf(resp).filter(v => String(v?.name || '').trim().toUpperCase() === target)
+  }
+
+  async getVoucher(id: string): Promise<Record<string, any>> {
+    return await this.fetchWithRetry(`${SIIGO_CONFIG.VOUCHERS_URL}/${encodeURIComponent(id)}`)
+  }
+
+  /** Catálogo de tipos de documento RC (incluye `consecutive` = próximo consecutivo) */
+  async getReceiptDocumentTypes(): Promise<Record<string, any>[]> {
+    return resultsOf(await this.fetchWithRetry(SIIGO_CONFIG.DOCUMENT_TYPES_URL + buildQueryString({ type: 'RC' })))
+  }
+
+  /** Busca una factura por su referencia (FV-2-43) y devuelve su detalle, o null */
+  async findInvoiceByReference(ref: string): Promise<Record<string, any> | null> {
+    const reference = ref.trim()
+    if (!reference) return null
+
+    const queries: Record<string, string | number>[] = [{ name: reference, page: 1, page_size: 25 }]
+    const consecutive = reference.match(/-(\d+)$/)?.[1]
+    if (consecutive) queries.push({ number: consecutive, page: 1, page_size: 25 })
+
+    for (const q of queries) {
+      try {
+        const facturas = resultsOf(await this.fetchWithRetry(SIIGO_CONFIG.INVOICES_URL + buildQueryString(q)))
+        const match = facturas.find(f => invoiceMatchesReference(f, reference))
+        if (!match) continue
+        const id = String(match.id || match.uuid || '').trim()
+        return id ? await this.fetchDocumentById(SIIGO_CONFIG.INVOICES_URL, id) : match
+      } catch (err: any) {
+        logger.debug({ ref: reference, err: err.message }, 'Búsqueda de factura Siigo fallida')
+      }
+    }
+    return null
   }
 
   async fetchDocumentById(baseUrl: string, id: string): Promise<Record<string, any>> {

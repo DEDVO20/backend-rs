@@ -25,5 +25,38 @@ export const syncSiigoBodySchema = z.object({
   sellerFilter: z.string().optional(),
 })
 
+export const listSiigoCollectionsQuerySchema = z.object({
+  startDate:   isoDate.optional(),
+  endDate:     isoDate.optional(),
+  companyId:   z.string().uuid().optional(),
+  customerNit: z.string().optional(),
+  search:      z.string().optional(),
+  page:        z.coerce.number().int().positive().default(1),
+  limit:       z.coerce.number().int().positive().max(500).default(50),
+})
+
+export const syncSiigoCollectionsBodySchema = z.object({
+  startDate: isoDate.optional(),
+  endDate:   isoDate.optional(),
+})
+
+export const listTrialBalanceQuerySchema = z.object({
+  period:    z.string().regex(/^\d{4}-\d{2}$/, 'Formato de periodo esperado: YYYY-MM').optional(),
+  account:   z.string().max(20).optional(), // prefijo de código contable (ej. 13, 1305)
+  companyId: z.string().uuid().optional(),
+  search:    z.string().optional(),
+  page:      z.coerce.number().int().positive().default(1),
+  limit:     z.coerce.number().int().positive().max(500).default(100),
+})
+
+export const syncTrialBalanceBodySchema = z.object({
+  mode: z.enum(['current', 'year']).default('current'),
+  year: z.coerce.number().int().min(2020).max(2035).optional(),
+})
+
 export type ListSiigoSalesQuery = z.infer<typeof listSiigoSalesQuerySchema>
+export type ListTrialBalanceQuery = z.infer<typeof listTrialBalanceQuerySchema>
+export type SyncTrialBalanceBody = z.infer<typeof syncTrialBalanceBodySchema>
+export type ListSiigoCollectionsQuery = z.infer<typeof listSiigoCollectionsQuerySchema>
+export type SyncSiigoCollectionsBody = z.infer<typeof syncSiigoCollectionsBodySchema>
 export type SyncSiigoBody       = z.infer<typeof syncSiigoBodySchema>
