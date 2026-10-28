@@ -1305,7 +1305,7 @@ export class ParticipationsService {
         if (otherRows.length) {
           const { error: docErr } = await supabase
             .from('siigo_documents')
-            .upsert(otherRows, { onConflict: 'doc_type,comprobante,fv_ref' })
+            .upsert(otherRows, { onConflict: 'doc_type,comprobante,fv_ref', defaultToNull: false })
           if (docErr) throw docErr
         }
         await ParticipationsService.persistMoneyDocs(rows.filter(d => isMoney(d.doc_type)))
@@ -1684,12 +1684,34 @@ export class ParticipationsService {
     }
     const { updates, inserts } = planMoneyDocs(rows, existing)
 
-    for (const part of chunks(updates)) {
-      const { error } = await supabase.from('siigo_documents').upsert(part, { onConflict: 'id' })
+    // Actualizaciones completas (valor + datos) en bloque; las que solo ajustan
+    // impuestos de un documento reasignado van una a una, para no dejar en NULL
+    // tercero/fecha/periodo (el upsert masivo pone NULL en lo que falta).
+    const full    = updates.filter(u => 'tercero_nit' in u)
+    const taxOnly = updates.filter(u => !('tercero_nit' in u))
+    for (const part of chunks(full)) {
+      const { error } = await supabase.from('siigo_documents').upsert(part, { onConflict: 'id', defaultToNull: false })
+      if (error) throw error
+    }
+    for (const u of taxOnly) {
+      const { error } = await supabase.from('siigo_documents').update({
+        tax_income_withholding: Number(u.tax_income_withholding ?? 0),
+        tax_ica_withholding:    Number(u.tax_ica_withholding ?? 0),
+        tax_iva_withholding:    Number(u.tax_iva_withholding ?? 0),
+        updated_at:             u.updated_at ?? new Date().toISOString(),
+      }).eq('id', u.id)
       if (error) throw error
     }
     for (const part of chunks(inserts)) {
-      const { error } = await supabase.from('siigo_documents').insert(part.map(r => ({ ...r, applied: 0, matched: false })))
+      // Todas las filas con las mismas columnas: en un insert masivo, PostgREST
+      // pone NULL en las columnas que le faltan a una fila (FC/RP no traen
+      // impuestos) y las de impuestos son NOT NULL.
+      const { error } = await supabase.from('siigo_documents').insert(part.map(r => ({
+        ...r, applied: 0, matched: false,
+        tax_income_withholding: Number(r.tax_income_withholding ?? 0),
+        tax_ica_withholding:    Number(r.tax_ica_withholding ?? 0),
+        tax_iva_withholding:    Number(r.tax_iva_withholding ?? 0),
+      })), { defaultToNull: false })
       if (error) throw error
     }
   }
