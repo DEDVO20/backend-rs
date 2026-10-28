@@ -412,9 +412,28 @@ const stripAccentsLower = (s: string) =>
 
 // El reporte "Movimiento por cuenta contable" trae los montos en formato US
 // (coma = miles, punto = decimal): "1,047,200.00". Igual que el de egresos.
-const mandateAmount = (v: unknown): number => {
+// Si la celda llega como texto puede venir en formato US ("1,400,000.00") o
+// colombiano ("1.400.000,00"); el separador decimal es el ÚLTIMO de los dos que
+// aparezca. Con un solo tipo de separador: ",dd" o ".dd" al final es decimal; si
+// no (p. ej. "1.400.000" o "500.000"), son miles.
+export const mandateAmount = (v: unknown): number => {
   if (typeof v === 'number') return Number.isFinite(v) ? money(v) : 0
-  const n = Number(String(v ?? '').replace(/[^\d.-]/g, ''))
+  let s = String(v ?? '').trim().replace(/[^\d.,-]/g, '')
+  if (!s) return 0
+  const lastDot = s.lastIndexOf('.'), lastComma = s.lastIndexOf(',')
+  if (lastDot >= 0 && lastComma >= 0) {
+    const dec = lastDot > lastComma ? '.' : ','
+    const thou = dec === '.' ? ',' : '.'
+    s = s.split(thou).join('').replace(dec, '.')
+  } else {
+    const sep = lastDot >= 0 ? '.' : lastComma >= 0 ? ',' : ''
+    if (sep) {
+      const parts = s.split(sep)
+      const isDecimal = parts.length === 2 && parts[1]!.length > 0 && parts[1]!.length <= 2
+      s = isDecimal ? `${parts[0]}.${parts[1]}` : parts.join('')
+    }
+  }
+  const n = Number(s)
   return Number.isFinite(n) ? money(n) : 0
 }
 

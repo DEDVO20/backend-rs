@@ -673,6 +673,7 @@ export class ParticipationsService {
       outcome: 'matched' | 'no_config' | 'ambiguous' | 'no_amount'
       base?: number; credit_note?: number; debit_note?: number; net?: number
       participation_value?: number; collected?: number; available?: number
+      iva?: number; withholdings?: number; net_receivable?: number
       status?: string; note?: string
     }
     const results: Res[] = []
@@ -701,6 +702,8 @@ export class ParticipationsService {
         fv: s.fv, client: s.clientName || cfg?.company_name || '—',
         tercero: cfg?.tercero_name || undefined, contract: cfg?.contract_type,
         outcome, note, base: s.base,
+        // Para revisar en la vista previa: IVA suma, retenciones restan
+        iva: s.iva, withholdings: s.withholdings.total, net_receivable: s.netReceivable,
       }
 
       if (cfg) {
@@ -726,9 +729,11 @@ export class ParticipationsService {
         const pct = rateAt(cfg.rates, s.iso ? monthStart(s.iso) : null, cfg.percentage)
         const participationValue = isMandate ? net
           : (cfg.type === 'fixed' ? (cfg.fixed_value ?? 0) : money(net * pct / 100))
-        // Valor de factura para el % de recaudo: mandato = total facturado
-        // (ingreso Finto + porción del tercero); servicio = base del servicio.
-        const invoiceValue = isMandate ? s.base : serviceBase
+        // Valor de factura para el % de recaudo = lo que el cliente debe pagar por
+        // la FV: base + IVA − retenciones que practica (retefuente, reteICA,
+        // reteIVA). Medirlo contra la base dejaba el recaudo en ~90% aunque el
+        // cliente hubiera pagado todo. Respaldo (FV sin esos datos): la base.
+        const invoiceValue = s.netReceivable > 0 ? s.netReceivable : (isMandate ? s.base : serviceBase)
         // Fase 1 (conciliación manual): la OC se crea SOLO con lo causado; el
         // recaudo/pago se asignan luego en la rejilla (participation_allocations).
         // No se auto-aplica el RC del mismo archivo.
@@ -1248,7 +1253,8 @@ export class ParticipationsService {
         const cart = cartByFv.get(fvKey)
         // amount = valor facturado al cliente (cartera); fallback a la base si no hay
         // participación creada (FV sin configuración).
-        const amount = cart && cart.invoiceValue > 0 ? cart.invoiceValue : (r.base ?? s?.base ?? 0)
+        const amount = cart && cart.invoiceValue > 0 ? cart.invoiceValue
+          : (s?.netReceivable && s.netReceivable > 0 ? s.netReceivable : (r.base ?? s?.base ?? 0))
         const applied = cart ? money(Math.min(cart.collected, amount)) : 0
         docs.push({
           doc_type: 'FV', comprobante: r.fv, fv_ref: '',
