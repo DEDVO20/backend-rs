@@ -56,6 +56,24 @@ app.use('*', cors({
   credentials:  true,
 }))
 
+// ── Errores que no son instancia de Error ─────────────────────────────────────
+// Supabase devuelve `error` como objeto plano ({ message, code, details }) y el
+// código hace `throw error`. Hono solo envía a onError las instancias de Error;
+// el resto termina en un 500 genérico SIN cabeceras CORS (el navegador lo ve como
+// "blocked by CORS policy"). Aquí se envuelven para que lleguen a onError.
+app.use('*', async (_c, next) => {
+  try {
+    await next()
+  } catch (e: any) {
+    if (e instanceof Error) throw e
+    const err = new Error(e?.message ?? String(e)) as Error & { statusCode?: number; code?: string; details?: unknown }
+    if (e?.statusCode) err.statusCode = e.statusCode
+    if (e?.code) err.code = e.code
+    if (e?.details) err.details = e.details
+    throw err
+  }
+})
+
 // ── Health check (público) ────────────────────────────────────────────────────
 app.get('/health', async (c) => {
   const checks: Record<string, { ok: boolean; latencyMs?: number; error?: string }> = {}
@@ -145,7 +163,13 @@ app.onError((err, c) => {
   if (statusCode < 500) {
     return c.json({ error: err.message }, statusCode)
   }
-  logger.error({ err: err.message, path: c.req.path }, 'Error no manejado')
+  logger.error({ err: err.message, code: (err as any).code, details: (err as any).details, path: c.req.path }, 'Error no manejado')
+  // Esquema desactualizado (tabla/columna/relación inexistente): se informa aun en
+  // producción, para saber que falta aplicar una migración.
+  const SCHEMA_CODES = ['42P01', '42703', 'PGRST200', 'PGRST204', 'PGRST205']
+  if (SCHEMA_CODES.includes(String((err as any).code ?? ''))) {
+    return c.json({ error: `Falta aplicar una migración en la base de datos: ${err.message}` }, 500)
+  }
   const message = process.env.NODE_ENV === 'production'
     ? 'Error interno del servidor'
     : err.message
