@@ -62,6 +62,32 @@ export function withholdingKind(code: string, desc: string): 'income' | 'ica' | 
 }
 
 /**
+ * Tarifa (fracción) que trae la descripción de una línea de impuesto:
+ * "IVA 19%" → 0.19 · "Retefuente 11%" → 0.11 · "ReteICA 8.66" → 0.00866.
+ * ReteICA se expresa POR MIL (8.66‰, 6.9‰, 9.66‰): un número > 1.5 (o con
+ * "mil"/"‰") se divide entre 1000; si no, entre 100. Sin número → null.
+ */
+export function taxRateFromDesc(desc: string, kind: 'income' | 'ica' | 'iva' | 'vat'): number | null {
+  const d = String(desc ?? '').toLowerCase()
+  const m = d.match(/(\d+(?:[.,]\d+)?)/)
+  if (!m) return null
+  const n = Number(m[1]!.replace(',', '.'))
+  if (!Number.isFinite(n) || n <= 0) return null
+  const perMil = /mil|‰|x\s*1\.?000/.test(d) || (kind === 'ica' && n > 1.5)
+  return perMil ? n / 1000 : n / 100
+}
+
+/** Monto de una línea de impuesto: lo que traiga (débito o crédito); si viene
+ *  vacía, "Valor base" × la tarifa de la descripción. */
+function taxLineAmount(debito: number, credito: number, valorBase: number, desc: string, kind: 'income' | 'ica' | 'iva' | 'vat'): number {
+  const direct = debito > 0 ? debito : credito
+  if (direct > 0) return direct
+  if (valorBase <= 0) return 0
+  const rate = taxRateFromDesc(desc, kind)
+  return rate ? money(valorBase * rate) : 0
+}
+
+/**
  * Valor de la participación.
  *  - percentage: valor del servicio × (porcentaje / 100)
  *  - fixed:      un monto fijo que cobra el tercero
@@ -486,6 +512,15 @@ export type MovSale = {
   fv: string; iso: string; year: number; month: number
   clientNit: string; clientName: string
   income: number; mandate: number; taxBase: number; base: number; descripcion: string
+  /** IVA facturado (cuenta 2408): SUMA a lo que paga el cliente. */
+  iva: number
+  /** Retenciones que practica el cliente (cuenta 1355): RESTAN de lo que paga. */
+  withholdings: CollectionTaxes
+  /** Débito de la cartera (13050501) en la FV, si el reporte trae columna Débito. */
+  receivableDebit: number
+  /** Lo que el cliente debe pagar por la FV = base + IVA − retenciones (o el
+   *  débito de cartera si viene). Contra esto se mide el % de recaudo. */
+  netReceivable: number
 }
 /** Nota crédito (NC) sobre la cartera 13050501 — anula/rebaja una factura. */
 export type MovCreditNote = { comprobante: string; clientNit: string; clientName: string; iso: string; amount: number; fvRef: string | null }
@@ -576,6 +611,7 @@ export function parseAccountingMovement(rows: string[][], accounts?: Participati
       const g = sales.get(fv) ?? {
         fv, iso: d?.iso ?? '', year: d?.year ?? 0, month: d?.month ?? 0,
         clientNit: nit, clientName: name, income: 0, mandate: 0, taxBase: 0, base: 0, descripcion: '',
+        iva: 0, withholdings: emptyCollectionTaxes(), receivableDebit: 0, netReceivable: 0,
       }
       if (!g.iso && d?.iso) { g.iso = d.iso; g.year = d.year; g.month = d.month }
       if (!g.clientNit && nit) g.clientNit = nit
@@ -584,8 +620,25 @@ export function parseAccountingMovement(rows: string[][], accounts?: Participati
       else if (matchAcct(code, acc.mandate)) { g.mandate = money(g.mandate + value); if (!g.descripcion) g.descripcion = desc }
       // Base gravable del servicio = "Valor base" de la línea de IVA (no la de
       // retención, que incluiría la porción de mandato). Respaldo: cuenta 41.
-      if (matchAcct(code, acc.iva) && valorBase > g.taxBase) g.taxBase = valorBase
+      if (matchAcct(code, acc.iva)) {
+        if (valorBase > g.taxBase) g.taxBase = valorBase
+        // IVA (crédito): suma a lo que paga el cliente
+        g.iva = money(g.iva + taxLineAmount(0, value, valorBase, desc, 'vat'))
+      } else if (matchAcct(code, acc.withholding)) {
+        // Retención que practica el cliente (débito 1355): resta de lo que paga.
+        // Varias líneas del mismo tipo se suman (p. ej. reteICA 8.66 y 6.9).
+        const kind = withholdingKind(code, desc)
+        const amt = taxLineAmount(debito, value, valorBase, desc, kind)
+        g.withholdings[kind] = money(g.withholdings[kind] + amt)
+        g.withholdings.total = money(g.withholdings.total + amt)
+      } else if (matchAcct(code, acc.receivable) && debito > 0) {
+        g.receivableDebit = money(g.receivableDebit + debito)
+      }
       g.base = money(g.income + g.mandate)
+      // Neto a cobrar: el débito de cartera si el reporte lo trae (exacto); si no,
+      // base + IVA − retenciones.
+      g.netReceivable = g.receivableDebit > 0 ? g.receivableDebit
+        : money(Math.max(0, g.base + g.iva - g.withholdings.total))
       sales.set(fv, g)
       continue
     }
@@ -627,12 +680,9 @@ export function parseAccountingMovement(rows: string[][], accounts?: Participati
     //    descuenta retefuente/reteICA/reteIVA. Van por el débito; si el reporte
     //    solo trae Crédito, se estima con "Valor base" × % de la descripción. ──
     if (type === 'RC' && matchAcct(code, acc.withholding)) {
-      let amount = debito > 0 ? debito : value
-      if (amount <= 0 && valorBase > 0) {
-        const pct = desc.match(/(\d+(?:[.,]\d+)?)\s*%/)
-        if (pct) amount = money(valorBase * Number(pct[1]!.replace(',', '.')) / 100)
-      }
-      if (amount > 0) rcTaxes.push({ comp, fvRef: fvRefOk, kind: withholdingKind(code, desc), amount })
+      const kind = withholdingKind(code, desc)
+      const amount = taxLineAmount(debito, value, valorBase, desc, kind)
+      if (amount > 0) rcTaxes.push({ comp, fvRef: fvRefOk, kind, amount })
       continue
     }
 
