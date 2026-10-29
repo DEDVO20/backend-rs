@@ -1847,6 +1847,29 @@ export class ParticipationsService {
 
   /** Crea (o acumula) una asignación de un documento a una OC. La OC se identifica
    *  por su NÚMERO (purchase_order, estable) o por id interno; se resuelve fresca. */
+  /**
+   * Valida un recaudo (RC) a aplicar a una OC: no puede ser mayor que el saldo
+   * disponible del recibo ni que lo que falta por recaudar de la factura
+   * (valor FV − recaudado). Lanza 400 con el máximo permitido.
+   */
+  private static async assertCollectionFits(ocId: string, comprobante: string, amount: number, rcAvailable: number) {
+    const { data: oc } = await supabase
+      .from('invoice_participations')
+      .select('purchase_order, finto_invoice, finto_invoice_value, collected')
+      .eq('id', ocId)
+      .maybeSingle()
+    if (!oc) throw Object.assign(new Error('OC no encontrada'), { statusCode: 404 })
+    const invoiceValue = Number(oc.finto_invoice_value ?? 0)
+    if (!oc.finto_invoice || invoiceValue <= 0)
+      throw Object.assign(new Error(`La OC ${oc.purchase_order} no tiene factura de venta: asígnale la FV antes del recaudo`), { statusCode: 400 })
+    const pending = money(Math.max(0, invoiceValue - Number(oc.collected ?? 0)))
+    const fmt = (n: number) => `$${n.toLocaleString('es-CO')}`
+    if (amount > rcAvailable + 0.01)
+      throw Object.assign(new Error(`El monto (${fmt(amount)}) supera el saldo disponible del recibo ${comprobante} (${fmt(rcAvailable)})`), { statusCode: 400 })
+    if (amount > pending + 0.01)
+      throw Object.assign(new Error(`El monto (${fmt(amount)}) supera lo que falta por recaudar de la factura ${oc.finto_invoice} (${fmt(pending)})`), { statusCode: 400 })
+  }
+
   static async createAllocation(input: {
     source_doc_type: 'RC' | 'FC' | 'RP'
     source_comprobante: string
@@ -1885,6 +1908,11 @@ export class ParticipationsService {
     const avail = await ParticipationsService.docAvailable(source_doc_type, comp)
     const want = money(Number(input.amount ?? 0))
     if (want <= 0) throw Object.assign(new Error('Monto inválido'), { statusCode: 400 })
+    // Recaudo (RC): no puede superar el saldo del recibo NI lo que falta por
+    // recaudar de la factura de la OC. Se rechaza (no se recorta en silencio).
+    if (source_doc_type === 'RC') {
+      await ParticipationsService.assertCollectionFits(ocId!, comp, want, avail)
+    }
     const applyAmt = money(Math.min(want, avail))
     if (applyAmt <= 0.01) throw Object.assign(new Error('El documento no tiene saldo disponible'), { statusCode: 400 })
 
@@ -2063,6 +2091,35 @@ export class ParticipationsService {
       .in('id', invoiceIds)
     if (error) throw error
 
+    // Validar ANTES de aplicar: cada monto ≤ lo que falta por recaudar de su
+    // factura, y el total ≤ saldo disponible del recibo.
+    const { data: rcRows } = await supabase
+      .from('siigo_documents')
+      .select('id, amount, applied, fv_ref')
+      .eq('doc_type', 'RC')
+      .eq('comprobante', comprobante)
+      .order('imported_at', { ascending: true })
+    const fmt = (n: number) => `$${n.toLocaleString('es-CO')}`
+    if (rcRows?.length) {
+      const legacyAvail = money(rcRows.reduce((s: number, d: any) => s + Math.max(0, Number(d.amount ?? 0) - Number(d.applied ?? 0)), 0))
+      const allocAvail = await ParticipationsService.docAvailable('RC', comprobante)
+      const rcAvail = money(Math.min(legacyAvail, allocAvail))
+      const total = money(allocations.reduce((s, a) => s + Math.max(0, Number(a.amount ?? 0)), 0))
+      if (total > rcAvail + 0.01)
+        throw Object.assign(new Error(`El total a aplicar (${fmt(total)}) supera el saldo disponible del recibo ${comprobante} (${fmt(rcAvail)})`), { statusCode: 400 })
+    }
+    for (const alloc of allocations) {
+      if (alloc.amount <= 0) continue
+      const ip = (invoices ?? []).find((i: any) => i.id === alloc.invoice_id)
+      if (!ip) continue
+      const invVal = Number((ip as any).finto_invoice_value ?? 0)
+      const pending = money(Math.max(0, invVal - Number((ip as any).collected ?? 0)))
+      if (!(ip as any).finto_invoice || invVal <= 0)
+        throw Object.assign(new Error('Una de las OC no tiene factura de venta: asígnale la FV antes del recaudo'), { statusCode: 400 })
+      if (alloc.amount > pending + 0.01)
+        throw Object.assign(new Error(`El monto (${fmt(alloc.amount)}) supera lo que falta por recaudar de la factura ${(ip as any).finto_invoice} (${fmt(pending)})`), { statusCode: 400 })
+    }
+
     let totalApplied = 0
     const appliedFvs: string[] = []
 
@@ -2102,19 +2159,19 @@ export class ParticipationsService {
       if ((ip as any).finto_invoice) appliedFvs.push((ip as any).finto_invoice)
     }
 
-    // Actualizar siigo_documents si existe el comprobante
-    const { data: doc } = await supabase
-      .from('siigo_documents')
-      .select('id, amount, applied, fv_ref')
-      .eq('doc_type', 'RC')
-      .eq('comprobante', comprobante)
-      .maybeSingle()
-
-    if (doc) {
-      const docAmount = Number((doc as any).amount ?? totalApplied)
+    // Actualizar lo aplicado del recibo, repartiéndolo entre sus filas (un RC
+    // puede tener varias, una por FV). Antes se buscaba con maybeSingle() y, con
+    // varias filas, no se actualizaba nada.
+    let toApply = totalApplied
+    for (const doc of rcRows ?? []) {
+      if (toApply <= 0.01) break
+      const docAmount = Number((doc as any).amount ?? 0)
       const prevApplied = Number((doc as any).applied ?? 0)
-      const newApplied = money(prevApplied + totalApplied)
+      const take = money(Math.min(Math.max(0, docAmount - prevApplied), toApply))
+      if (take <= 0) continue
+      const newApplied = money(prevApplied + take)
       const remaining = Math.max(0, money(docAmount - newApplied))
+      toApply = money(toApply - take)
 
       // Combinar fv_ref sin duplicar
       const existingRefs = String((doc as any).fv_ref ?? '')
@@ -2132,7 +2189,9 @@ export class ParticipationsService {
         .update({
           applied: newApplied,
           matched: remaining <= 0.01,
-          fv_ref: existingRefs.join(', '),
+          // Con varias filas no se toca fv_ref: es parte de la clave única
+          // (doc_type, comprobante, fv_ref) y podría chocar entre filas.
+          fv_ref: (rcRows ?? []).length === 1 ? existingRefs.join(', ') : (doc as any).fv_ref,
           note: remaining > 0.01 ? `Saldo restante: $${remaining.toLocaleString('es-CO')}` : null,
           updated_at: new Date().toISOString(),
         })
@@ -2393,6 +2452,10 @@ export class ParticipationsService {
     const coll = updatePayload.collected !== undefined ? Number(updatePayload.collected) : Number(current.collected ?? 0)
     const fintoVal = updatePayload.finto_invoice_value !== undefined ? Number(updatePayload.finto_invoice_value) : Number(current.finto_invoice_value ?? 0)
     const partVal = updatePayload.participation_value !== undefined ? Number(updatePayload.participation_value) : Number(current.participation_value ?? 0)
+
+    // El recaudo escrito a mano no puede superar el valor de la factura
+    if (patch.collected !== undefined && coll > fintoVal + 0.01)
+      throw Object.assign(new Error(`El recaudo ($${coll.toLocaleString('es-CO')}) no puede ser mayor que el valor de la factura ($${fintoVal.toLocaleString('es-CO')})`), { statusCode: 400 })
 
     if (updatePayload.collected !== undefined || updatePayload.finto_invoice_value !== undefined || updatePayload.participation_value !== undefined) {
       updatePayload.available_for_payment = availableParticipation({
