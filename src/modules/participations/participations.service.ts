@@ -6,7 +6,7 @@ import {
   formatPurchaseOrder, formatPaymentOrder, validateThirdPartyInvoice, money,
   normalizeInvoiceNumber,
   normalizeSiigoInvoice, nitMatch, normalizeNit,
-  parseAccountingMovement, PARTICIPATION_ACCOUNTS, billedPeriods, emptyCollectionTaxes, planMoneyDocs,
+  parseAccountingMovement, PARTICIPATION_ACCOUNTS, billedPeriods, emptyCollectionTaxes, planMoneyDocs, addMonths,
   rateAt, monthStart,
 } from './participations.domain.js'
 import type { ParticipationAccounts, MovCollection, CollectionTaxes, ParticipationRate } from './participations.domain.js'
@@ -645,7 +645,7 @@ export class ParticipationsService {
     // Configuraciones activas con tercero (servicio y mandato)
     const { data: configs, error } = await supabase
       .from('service_participations')
-      .select('id, participation_type, percentage, fixed_value, start_date, end_date, active, has_third_party, contract_type, participation_rates(percentage, valid_from), company_service:company_services(companies(id, name, nit)), third_party:third_parties(identification, name)')
+      .select('id, participation_type, percentage, fixed_value, start_date, end_date, billing_mode, active, has_third_party, contract_type, participation_rates(percentage, valid_from), company_service:company_services(companies(id, name, nit)), third_party:third_parties(identification, name)')
       .eq('has_third_party', true)
       .eq('active', true)
     if (error) throw error
@@ -662,6 +662,7 @@ export class ParticipationsService {
         fixed_value:   cf.fixed_value != null ? Number(cf.fixed_value) : null,
         start_date:    cf.start_date as string | null,
         end_date:      cf.end_date as string | null,
+        billing_mode:  (cf.billing_mode ?? 'vencido') as 'vencido' | 'anticipado',
         company_id:    co?.id ?? null,
         company_name:  co?.name ?? '—',
         nit:           co?.nit ?? '',
@@ -671,7 +672,7 @@ export class ParticipationsService {
 
     type Res = {
       fv: string; client: string; tercero?: string; contract?: string
-      outcome: 'matched' | 'no_config' | 'ambiguous' | 'no_amount'
+      outcome: 'matched' | 'no_config' | 'ambiguous' | 'no_amount' | 'existing_oc'
       base?: number; credit_note?: number; debit_note?: number; net?: number
       participation_value?: number; collected?: number; available?: number
       iva?: number; withholdings?: number; net_receivable?: number
@@ -766,14 +767,74 @@ export class ParticipationsService {
           fixed_value:           cfg.type === 'fixed' && !isMandate ? cfg.fixed_value : null,
           participation_value:   participationValue,
           _causado_status:       status,
-          _period:               s.iso ? s.iso.slice(0, 7) : null,
+          // Mes del SERVICIO (periodo de la OC): en facturación vencida la FV del
+          // mes M se emite en M+1. Se prueba también el mes de la FV.
+          _period:               s.iso ? (cfg.billing_mode === 'vencido' ? addMonths(s.iso.slice(0, 7), -1) : s.iso.slice(0, 7)) : null,
+          _fv_period:            s.iso ? s.iso.slice(0, 7) : null,
+          _res:                  res,
         })
         causadasFv.add(normalizeInvoiceNumber(s.fv))
       }
       results.push(res)
     }
 
+    // ── Destino de cada FV (se decide también en la vista previa) ─────────────
+    // Nunca se crea una OC si el servicio ya tiene una en ese mes: se pega la FV a
+    // su OC pendiente (sin FV) o, si todas tienen FV, la FV solo se registra para
+    // asignarla a mano. Se prueba el mes del servicio y el de la FV.
+    type ImportTarget = {
+      kind: 'update' | 'unchanged' | 'shared' | 'attach' | 'create' | 'existing'
+      id?: string; purchase_order?: string
+    }
+    const targets = new Map<any, ImportTarget>()
+    if (toWrite.length) {
+      const partIds = [...new Set(toWrite.map(w => w.participation_id))]
+      const fvList = [...new Set(toWrite.map(w => String(w.finto_invoice)))]
+      const cols = 'id, participation_id, period, finto_invoice, purchase_order, import_signature'
+      const { data: byPart } = await supabase.from('invoice_participations').select(cols).in('participation_id', partIds)
+      const { data: byFvRows } = await supabase.from('invoice_participations').select(cols).in('finto_invoice', fvList)
+      const ocs: any[] = [...new Map([...(byPart ?? []), ...(byFvRows ?? [])].map((o: any) => [o.id, { ...o }])).values()]
+      const isFv = (o: any, fv: string) => !!o.finto_invoice && normalizeInvoiceNumber(o.finto_invoice) === normalizeInvoiceNumber(fv)
+      for (const w of toWrite) {
+        const res = w._res as Res
+        const withFv = ocs.filter(o => isFv(o, w.finto_invoice))
+        if (withFv.length > 1) { targets.set(w, { kind: 'shared' }); continue }
+        if (withFv.length === 1) {
+          const sig = importSignature(w)
+          targets.set(w, { kind: withFv[0].import_signature === sig ? 'unchanged' : 'update', id: withFv[0].id, purchase_order: withFv[0].purchase_order })
+          continue
+        }
+        // Mes del servicio; el de la FV solo si el servicio no tiene ninguna OC en
+        // su mes (p. ej. se factura en el mismo mes aunque esté como vencido). Si el
+        // mes del servicio ya tiene OC con FV, no se ocupa la OC de otro mes.
+        const inPeriod = (p: string | null) => ocs.filter(o => o.participation_id === w.participation_id && o.period === p)
+        const svcPeriod = (w._period ?? null) as string | null
+        const lookPeriod = inPeriod(svcPeriod).length || !w._fv_period ? svcPeriod : (w._fv_period as string)
+        const periods = [lookPeriod].filter(Boolean) as string[]
+        const pending = inPeriod(lookPeriod).find(o => !o.finto_invoice) ?? null
+        if (pending) {
+          pending.finto_invoice = w.finto_invoice   // la toma esta FV (no otra del mismo archivo)
+          targets.set(w, { kind: 'attach', id: pending.id, purchase_order: pending.purchase_order })
+          res.note = `Se asigna a la OC ${pending.purchase_order} (${pending.period})`
+          continue
+        }
+        const existing = ocs.find(o => o.participation_id === w.participation_id && periods.includes(o.period))
+        if (existing) {
+          targets.set(w, { kind: 'existing', id: existing.id, purchase_order: existing.purchase_order })
+          res.outcome = 'existing_oc'
+          res.note = `Ya existe la OC ${existing.purchase_order}${existing.finto_invoice ? ` (con ${existing.finto_invoice})` : ''} para este servicio y mes: no se crea otra; la FV queda registrada para asignarla a mano.`
+          causadasFv.delete(normalizeInvoiceNumber(w.finto_invoice))
+          continue
+        }
+        // Sin OC en ese mes → se creará una (una sola por servicio y mes)
+        ocs.push({ id: `new-${ocs.length}`, participation_id: w.participation_id, period: w._period, finto_invoice: w.finto_invoice })
+        targets.set(w, { kind: 'create' })
+        res.note = `Se crea una OC nueva (${w._period}): el servicio no tiene OC ese mes`
+      }
+    }
+
     let created = 0, updated = 0, unchanged = 0, recaudo_updated = 0, third_invoice_matched = 0, paid_matched = 0
+    let existing_oc = 0
     // Documentos para Cruce/Pagos (se persisten al final del apply)
     const docs: any[] = []
     // Fase 1 — conciliación manual asistida: el import NO aplica el dinero
@@ -799,64 +860,36 @@ export class ParticipationsService {
       }
 
       for (const w of toWrite) {
+        const target = targets.get(w) ?? { kind: 'create' as const }
         const period = (w._period ?? null) as string | null
         const causadoStatus = (w._causado_status ?? 'pending_third_invoice') as string
         delete w._period
+        delete w._fv_period
         delete w._causado_status
-        w.period = period
+        delete w._res
         // Firma de lo causado que trae el archivo para esta FV (ver import_signature)
         w.import_signature = importSignature(w)
         w.updated_at = new Date().toISOString()
 
-        // Al ACTUALIZAR una OC existente solo se tocan los campos del CAUSADO; el
-        // dinero (recaudo/factura tercero/pago) y el estado se derivan de las
-        // asignaciones (recomputeOcFromAllocations), no del import.
-        const causadoOnly = { ...w }
+        // FV repartida a mano entre varias OC, o mismo causado que el último
+        // import: no se toca (conserva el reparto y las correcciones manuales).
+        if (target.kind === 'shared' || target.kind === 'unchanged') { unchanged++; continue }
+        // El servicio ya tiene OC en ese mes (con otra FV): no se crea otra OC; la
+        // FV solo queda registrada (siigo_documents) para asignarla a mano.
+        if (target.kind === 'existing') { existing_oc++; continue }
 
-        // 1. La FV ya existe → actualiza y conserva su OC
-        const { data: fvOcs } = await supabase
-          .from('invoice_participations')
-          .select('id, import_signature')
-          .eq('finto_invoice', w.finto_invoice)
-          .limit(2)
-        // FV repartida a mano entre varias OC: se respeta el reparto (no se pisa).
-        if ((fvOcs ?? []).length > 1) { unchanged++; continue }
-        const byFv = (fvOcs ?? [])[0] ?? null
-        if (byFv) {
-          // Mismo causado que el último import (p. ej. el archivo se subió dos
-          // veces): no se toca la OC, así se conservan las correcciones manuales.
-          if ((byFv as any).import_signature === w.import_signature) { unchanged++; continue }
-          const { error: upErr } = await supabase.from('invoice_participations').update(causadoOnly).eq('id', byFv.id)
+        // Al ACTUALIZAR una OC existente solo se tocan los campos del CAUSADO (no
+        // su periodo ni su número); el dinero se deriva de las asignaciones.
+        if (target.kind === 'update' || target.kind === 'attach') {
+          const { error: upErr } = await supabase.from('invoice_participations').update({ ...w }).eq('id', target.id!)
           if (upErr) throw upErr
-          await ParticipationsService.recomputeOcFromAllocations(byFv.id)
+          await ParticipationsService.recomputeOcFromAllocations(target.id!)
           updated++
           continue
         }
 
-        // 2. OC mensual pendiente (sin FV) del mismo servicio/periodo → adjunta la FV
-        let placeholder: { id: string; purchase_order: string } | null = null
-        if (period) {
-          const { data } = await supabase
-            .from('invoice_participations')
-            .select('id, purchase_order')
-            .eq('participation_id', w.participation_id)
-            .eq('period', period)
-            .is('finto_invoice', null)
-            .limit(1)
-            .maybeSingle()
-          placeholder = data as any
-        }
-        if (placeholder) {
-          causadoOnly.purchase_order = placeholder.purchase_order
-          const { error: upErr } = await supabase.from('invoice_participations').update(causadoOnly).eq('id', placeholder.id)
-          if (upErr) throw upErr
-          await ParticipationsService.recomputeOcFromAllocations(placeholder.id)
-          updated++
-          continue
-        }
-
-        // 3. Sin OC previa → nueva OC para la FV (dinero en 0, estado del causado)
-        const insertRow = { ...w, purchase_order: await nextOc(period), collected: 0, available_for_payment: 0, status: causadoStatus }
+        // Sin ninguna OC del servicio en ese mes → nueva OC (dinero en 0)
+        const insertRow = { ...w, period, purchase_order: await nextOc(period), collected: 0, available_for_payment: 0, status: causadoStatus }
         const { error: insErr } = await supabase.from('invoice_participations').insert(insertRow)
         if (insErr) throw insErr
         created++
@@ -1332,6 +1365,7 @@ export class ParticipationsService {
     const summary = {
       sales:          mov.sales.length,
       matched:        results.filter(r => r.outcome === 'matched').length,
+      existing_oc:    results.filter(r => r.outcome === 'existing_oc').length,   // FV registradas sin crear OC (ya había OC ese mes)
       no_config:      results.filter(r => r.outcome === 'no_config').length,
       ambiguous:      results.filter(r => r.outcome === 'ambiguous').length,
       no_amount:      results.filter(r => r.outcome === 'no_amount').length,
