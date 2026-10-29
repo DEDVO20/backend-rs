@@ -10,7 +10,7 @@ import {
   applyManualPaymentSchema,
   updateInvoiceParticipationSchema, reallocatePaymentSchema, unlinkPaymentSchema,
   unlinkEgressSchema, unlinkSaleInvoiceSchema,
-  linkSaleInvoiceByOrderSchema,
+  linkSaleInvoiceByOrderSchema, assignSaleInvoiceSchema,
   createAllocationSchema, applyAllocationsSchema,
 } from './participations.schema.js'
 
@@ -445,6 +445,21 @@ app.post('/link-sale-invoice',
       // DEBUG temporal: devolver el mensaje real para diagnosticar el 500 en producción.
       return c.json({ error: e?.message ?? 'Error desconocido', where: 'link-sale-invoice', stack: String(e?.stack ?? '').split('\n').slice(0, 4) }, (e?.statusCode ?? 500) as any)
     }
+  },
+)
+
+// POST /api/participations/assign-sale-invoice — asigna una PARTE de una FV a una OC
+// (la FV puede repartirse entre varias OC; responde con lo que queda por asignar)
+app.post('/assign-sale-invoice',
+  requireRole('admin', 'rs_admin', 'contador'),
+  requirePermission('participations', 'update'),
+  zValidator('json', assignSaleInvoiceSchema),
+  async (c) => {
+    const user = c.get('user')
+    const body = c.req.valid('json')
+    const result = await ParticipationsService.assignSaleInvoice(body)
+    auditAsync({ action: 'update', resource: 'invoice_participations', resource_id: result.invoice?.id, metadata: { source: 'assign-sale-invoice', ...body, applied: result.applied, remaining: result.remaining }, user, c })
+    return c.json(result)
   },
 )
 

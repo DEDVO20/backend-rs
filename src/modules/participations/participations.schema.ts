@@ -143,6 +143,13 @@ export const linkSaleInvoiceByOrderSchema = z.object({
   finto_invoice_value: z.number().nullable().optional(),
 })
 
+// Asigna una parte (o todo) de una FV a una OC; la FV puede repartirse entre varias OC.
+export const assignSaleInvoiceSchema = z.object({
+  purchase_order: z.string().trim().min(1, 'La orden de compra es obligatoria'),
+  finto_invoice:  z.string().trim().min(1, 'La factura de venta es obligatoria'),
+  amount:         z.number().positive('El monto debe ser positivo'),
+})
+
 export const unlinkEgressSchema = z.object({
   invoice_id:  z.string().uuid('ID de factura inválido'),
   amount:      z.number().positive('El monto a desvincular debe ser positivo'),

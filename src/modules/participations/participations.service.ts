@@ -813,11 +813,14 @@ export class ParticipationsService {
         const causadoOnly = { ...w }
 
         // 1. La FV ya existe → actualiza y conserva su OC
-        const { data: byFv } = await supabase
+        const { data: fvOcs } = await supabase
           .from('invoice_participations')
           .select('id, import_signature')
           .eq('finto_invoice', w.finto_invoice)
-          .maybeSingle()
+          .limit(2)
+        // FV repartida a mano entre varias OC: se respeta el reparto (no se pisa).
+        if ((fvOcs ?? []).length > 1) { unchanged++; continue }
+        const byFv = (fvOcs ?? [])[0] ?? null
         if (byFv) {
           // Mismo causado que el último import (p. ej. el archivo se subió dos
           // veces): no se toca la OC, así se conservan las correcciones manuales.
@@ -1251,16 +1254,21 @@ export class ParticipationsService {
         const s = salesByFv.get(fvKey)
         const matched = r.outcome === 'matched'
         const cart = cartByFv.get(fvKey)
-        // amount = valor facturado al cliente (cartera); fallback a la base si no hay
-        // participación creada (FV sin configuración).
-        const amount = cart && cart.invoiceValue > 0 ? cart.invoiceValue
-          : (s?.netReceivable && s.netReceivable > 0 ? s.netReceivable : (r.base ?? s?.base ?? 0))
+        // amount = lo que paga el cliente por la FV (neto a cobrar: base + IVA −
+        // retenciones). Es el total de la FV aunque se reparta entre varias OC.
+        const amount = s?.netReceivable && s.netReceivable > 0 ? s.netReceivable
+          : cart && cart.invoiceValue > 0 ? cart.invoiceValue : (r.base ?? s?.base ?? 0)
         const applied = cart ? money(Math.min(cart.collected, amount)) : 0
         docs.push({
           doc_type: 'FV', comprobante: r.fv, fv_ref: '',
           tercero_nit: s?.clientNit || null, tercero_name: r.client || s?.clientName || null,
           period: s?.iso ? s.iso.slice(0, 7) : null, doc_date: s?.iso || null,
           amount, applied, matched,
+          // Desglose de la FV (para el selector y la vista)
+          base_amount: s?.base ?? 0, vat_amount: s?.iva ?? 0,
+          tax_income_withholding: s?.withholdings.income ?? 0,
+          tax_ica_withholding:    s?.withholdings.ica ?? 0,
+          tax_iva_withholding:    s?.withholdings.iva ?? 0,
           note: matched
             ? (money(amount - applied) > 0.01 ? 'Pendiente de recaudo' : null)
             : (r.note ?? r.outcome),
@@ -2754,6 +2762,86 @@ export class ParticipationsService {
   }
 
   /**
+   * Asigna a una OC una PARTE (o todo) de una factura de venta (FV). Una FV puede
+   * repartirse entre varias OC: su saldo por asignar = valor de la FV (neto a
+   * cobrar) − Σ finto_invoice_value de las OC que ya la tienen. A diferencia de
+   * vincular, NO se la quita a las otras OC. Si la OC ya tiene esta FV, suma.
+   */
+  static async assignSaleInvoice(input: { purchase_order: string; finto_invoice: string; amount: number }) {
+    const po = String(input.purchase_order ?? '').trim()
+    const fv = String(input.finto_invoice ?? '').trim()
+    const want = money(Number(input.amount ?? 0))
+    if (!po || !fv) throw Object.assign(new Error('Se requiere la OC y la factura de venta'), { statusCode: 400 })
+    if (want <= 0) throw Object.assign(new Error('Monto inválido'), { statusCode: 400 })
+
+    const { data: ocs, error } = await supabase
+      .from('invoice_participations')
+      .select('id, finto_invoice, finto_invoice_value, collected, participation_value, participation_type')
+      .eq('purchase_order', po)
+    if (error) throw error
+    if (!ocs?.length) throw Object.assign(new Error(`No existe la OC ${po}`), { statusCode: 404 })
+    if (ocs.length > 1) throw Object.assign(new Error(`Hay ${ocs.length} OC con el número ${po}; corrige el duplicado`), { statusCode: 409 })
+    const oc = ocs[0]!
+    const fvNorm = normalizeInvoiceNumber(fv)
+    const sameFv = !!oc.finto_invoice && normalizeInvoiceNumber(oc.finto_invoice) === fvNorm
+    if (oc.finto_invoice && !sameFv)
+      throw Object.assign(new Error(`La OC ${po} ya tiene la factura ${oc.finto_invoice}; desvincúlala primero`), { statusCode: 409 })
+
+    const { available, total, doc } = await ParticipationsService.saleInvoiceAvailable(fv)
+    if (!doc) throw Object.assign(new Error(`La factura ${fv} no está en los documentos importados`), { statusCode: 404 })
+    const applyAmt = money(Math.min(want, available))
+    if (applyAmt <= 0.01) throw Object.assign(new Error(`La factura ${fv} no tiene saldo por asignar`), { statusCode: 400 })
+
+    const invoiceValue = money((sameFv ? Number(oc.finto_invoice_value ?? 0) : 0) + applyAmt)
+    const collected = Number(oc.collected ?? 0)
+    const now = new Date().toISOString()
+    const { error: upErr } = await supabase.from('invoice_participations').update({
+      finto_invoice:         doc.comprobante,
+      finto_invoice_date:    doc.doc_date ?? null,
+      finto_invoice_value:   invoiceValue,
+      available_for_payment: availableParticipation({
+        type: (oc.participation_type || 'percentage') as any,
+        participationValue: Number(oc.participation_value ?? 0),
+        invoiceValue, collected,
+      }),
+      updated_at: now,
+    }).eq('id', oc.id)
+    if (upErr) throw upErr
+    await supabase.from('siigo_documents').update({ matched: true, note: null, updated_at: now }).eq('id', doc.id)
+    await ParticipationsService.recomputeStatus(oc.id)
+
+    const remaining = money(available - applyAmt)
+    const { data: updated } = await supabase
+      .from('invoice_participations')
+      .select('*, participation:service_participations(third_party:third_parties(name, identification, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)')
+      .eq('id', oc.id)
+      .single()
+    return { invoice: updated, applied: applyAmt, remaining, total }
+  }
+
+  /** Saldo por asignar de una FV = valor (neto a cobrar) − Σ lo asignado a las OC. */
+  static async saleInvoiceAvailable(fv: string) {
+    const fvNorm = normalizeInvoiceNumber(fv)
+    const { data: docs } = await supabase
+      .from('siigo_documents')
+      .select('id, comprobante, doc_date, amount')
+      .eq('doc_type', 'FV')
+      .ilike('comprobante', `%${fv.replace(/[%_]/g, '')}%`)
+    const doc = (docs ?? []).find((d: any) => normalizeInvoiceNumber(d.comprobante) === fvNorm) ?? null
+    if (!doc) return { doc: null, total: 0, assigned: 0, available: 0 }
+    const { data: ocs } = await supabase
+      .from('invoice_participations')
+      .select('finto_invoice, finto_invoice_value')
+      .not('finto_invoice', 'is', null)
+      .ilike('finto_invoice', `%${fv.replace(/[%_]/g, '')}%`)
+    const assigned = money((ocs ?? [])
+      .filter((o: any) => normalizeInvoiceNumber(o.finto_invoice) === fvNorm)
+      .reduce((s: number, o: any) => s + Number(o.finto_invoice_value ?? 0), 0))
+    const total = Number(doc.amount ?? 0)
+    return { doc, total, assigned, available: money(Math.max(0, total - assigned)) }
+  }
+
+  /**
    * Desvincula la factura de venta (FV) asignada a una orden de compra (OC).
    * Deja la OC en estado 'pending_invoice', resetea valores de factura y disponible,
    * y libera la FV en siigo_documents para que pueda asignarse a otra OC.
@@ -2816,17 +2904,21 @@ export class ParticipationsService {
       .eq('id', invoice_id)
     if (upErr) throw upErr
 
-    // Liberar la FV en siigo_documents
+    // Liberar la FV en siigo_documents (solo si ya ninguna otra OC la tiene: una FV
+    // puede estar repartida entre varias OC)
     if (oldFv) {
-      await supabase
-        .from('siigo_documents')
-        .update({
-          matched: false,
-          note: 'Desvinculada manualmente de OC',
-          updated_at: now,
-        })
-        .eq('doc_type', 'FV')
-        .eq('comprobante', oldFv)
+      const { assigned } = await ParticipationsService.saleInvoiceAvailable(oldFv)
+      if (assigned <= 0.01) {
+        await supabase
+          .from('siigo_documents')
+          .update({
+            matched: false,
+            note: 'Desvinculada manualmente de OC',
+            updated_at: now,
+          })
+          .eq('doc_type', 'FV')
+          .eq('comprobante', oldFv)
+      }
     }
 
     await ParticipationsService.recomputeStatus(invoice_id)
@@ -2876,7 +2968,7 @@ export class ParticipationsService {
 
     let q = supabase
       .from('siigo_documents')
-      .select('id, doc_type, comprobante, doc_date, amount, applied, saldo, matched, note, period, fv_ref, tercero_name, tercero_nit')
+      .select('*')   // incluye el desglose de la FV (base, IVA, retenciones)
       .order('doc_date', { ascending: false })
       .limit(300)
 
@@ -2903,6 +2995,28 @@ export class ParticipationsService {
     // Documentos de dinero (RC/FC/RP): uno por comprobante, con su saldo real
     // = valor − Σ asignado a OC (participation_allocations). Así, al asignar una
     // parte a una OC, la siguiente ve lo que queda disponible.
+    // FV: saldo por asignar = valor (neto a cobrar) − Σ finto_invoice_value de las
+    // OC que la tienen (una FV puede repartirse entre varias OC).
+    const fvDocs = mine.filter((d: any) => d.doc_type === 'FV')
+    if (fvDocs.length) {
+      const { data: ocs } = await supabase
+        .from('invoice_participations')
+        .select('finto_invoice, finto_invoice_value')
+        .not('finto_invoice', 'is', null)
+        .in('finto_invoice', [...new Set(fvDocs.map((d: any) => String(d.comprobante)))])
+      const assignedBy = new Map<string, number>()
+      for (const o of ocs ?? []) {
+        const k = normalizeInvoiceNumber(o.finto_invoice)
+        assignedBy.set(k, money((assignedBy.get(k) ?? 0) + Number(o.finto_invoice_value ?? 0)))
+      }
+      for (const d of fvDocs) {
+        const total = Number(d.amount ?? 0)
+        const allocated = assignedBy.get(normalizeInvoiceNumber(d.comprobante)) ?? 0
+        d.allocated = allocated
+        d.available = money(Math.max(0, total - allocated))
+      }
+    }
+
     const isMoney = (t: string) => t === 'RC' || t === 'FC' || t === 'RP'
     const moneyDocs = mine.filter((d: any) => isMoney(d.doc_type))
     if (!moneyDocs.length) return mine
