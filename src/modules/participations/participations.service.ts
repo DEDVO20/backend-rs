@@ -1984,6 +1984,38 @@ export class ParticipationsService {
   }
 
   /**
+   * Lo que se le debe al tercero en una OC = giro neto total (participación + IVA
+   * − retenciones − comisión si es mandato, con recaudo al 100%) − lo ya pagado.
+   */
+  static async thirdPartyOwed(ocId: string) {
+    const { data: oc } = await supabase
+      .from('invoice_participations')
+      .select('id, purchase_order, participation_value, finto_invoice_value, collected, contract_type, egress_voucher_value, participation:service_participations(contract_type, third_party:third_parties(tax_profile:tax_profiles(*)))')
+      .eq('id', ocId)
+      .maybeSingle()
+    if (!oc) throw Object.assign(new Error('OC no encontrada'), { statusCode: 404 })
+    const one = (v: any) => Array.isArray(v) ? v[0] : v
+    const profile = one(one(one((oc as any).participation)?.third_party)?.tax_profile) ?? null
+    const settings = await ParticipationsService.loadTaxSettings()
+    const partition = ParticipationsService.computePartition(oc as any, profile, settings)
+    const netTotal = money(Number(partition.breakdown.finalTotal ?? 0))
+    const paid = money(Number((oc as any).egress_voucher_value ?? 0))
+    return { purchase_order: oc.purchase_order as string, netTotal, paid, owed: money(Math.max(0, netTotal - paid)) }
+  }
+
+  /** Valida un pago (RP) a una OC: ≤ saldo disponible del RP y ≤ lo que se le debe al tercero. */
+  private static async assertPaymentFits(ocId: string, comprobante: string, amount: number, rpAvailable: number) {
+    const { purchase_order, netTotal, owed } = await ParticipationsService.thirdPartyOwed(ocId)
+    const fmt = (n: number) => `$${n.toLocaleString('es-CO')}`
+    if (amount > rpAvailable + 0.01)
+      throw Object.assign(new Error(`El monto (${fmt(amount)}) supera el saldo disponible del pago ${comprobante} (${fmt(rpAvailable)})`), { statusCode: 400 })
+    if (netTotal <= 0)
+      throw Object.assign(new Error(`La OC ${purchase_order} no tiene participación por pagar`), { statusCode: 400 })
+    if (amount > owed + 0.01)
+      throw Object.assign(new Error(`El monto (${fmt(amount)}) supera lo que se le debe al tercero en la OC ${purchase_order} (${fmt(owed)} de un giro neto de ${fmt(netTotal)})`), { statusCode: 400 })
+  }
+
+  /**
    * Valida un recaudo (RC) a aplicar a una OC: no puede ser mayor que el saldo
    * disponible del recibo ni que lo que falta por recaudar de la factura
    * (valor FV − recaudado). Lanza 400 con el máximo permitido.
@@ -2052,6 +2084,10 @@ export class ParticipationsService {
     // recaudar de la factura de la OC. Se rechaza (no se recorta en silencio).
     if (source_doc_type === 'RC') {
       await ParticipationsService.assertCollectionFits(ocId!, comp, want, avail)
+    }
+    // Pago al tercero (RP): no más que el saldo del RP ni que lo que se le debe.
+    if (source_doc_type === 'RP') {
+      await ParticipationsService.assertPaymentFits(ocId!, comp, want, avail)
     }
     const applyAmt = money(Math.min(want, avail))
     if (applyAmt <= 0.01) throw Object.assign(new Error('El documento no tiene saldo disponible'), { statusCode: 400 })
@@ -2316,7 +2352,9 @@ export class ParticipationsService {
       .single()
     if (error && (error as any).code !== 'PGRST116') throw Object.assign(new Error(`Error al leer la OC: ${error.message}`), { statusCode: 500 })
     if (!data) throw Object.assign(new Error('Factura de participación no encontrada'), { statusCode: 404 })
-    return data
+    // Lo que falta por pagarle al tercero (giro neto − pagado): tope de los RP
+    const { netTotal, owed } = await ParticipationsService.thirdPartyOwed(id).catch(() => ({ netTotal: null, owed: null }))
+    return { ...data, net_payable_total: netTotal, pay_pending: owed }
   }
 
   /**
@@ -2533,6 +2571,14 @@ export class ParticipationsService {
     const coll = updatePayload.collected !== undefined ? Number(updatePayload.collected) : Number(current.collected ?? 0)
     const fintoVal = updatePayload.finto_invoice_value !== undefined ? Number(updatePayload.finto_invoice_value) : Number(current.finto_invoice_value ?? 0)
     const partVal = updatePayload.participation_value !== undefined ? Number(updatePayload.participation_value) : Number(current.participation_value ?? 0)
+
+    // El pago escrito a mano no puede superar el giro neto que se le debe al tercero
+    if (patch.egress_voucher_value !== undefined && patch.egress_voucher_value !== null) {
+      const { netTotal } = await ParticipationsService.thirdPartyOwed(id)
+      const paidNew = Number(patch.egress_voucher_value)
+      if (paidNew > netTotal + 0.01)
+        throw Object.assign(new Error(`El pago ($${paidNew.toLocaleString('es-CO')}) no puede ser mayor que el giro neto al tercero ($${netTotal.toLocaleString('es-CO')})`), { statusCode: 400 })
+    }
 
     // El recaudo escrito a mano no puede superar el valor de la factura
     if (patch.collected !== undefined && coll > fintoVal + 0.01)
