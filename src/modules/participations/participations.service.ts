@@ -2000,7 +2000,7 @@ export class ParticipationsService {
     const partition = ParticipationsService.computePartition(oc as any, profile, settings)
     const netTotal = money(Number(partition.breakdown.finalTotal ?? 0))
     const paid = money(Number((oc as any).egress_voucher_value ?? 0))
-    return { purchase_order: oc.purchase_order as string, netTotal, paid, owed: money(Math.max(0, netTotal - paid)) }
+    return { purchase_order: oc.purchase_order as string, partition, netTotal, paid, owed: money(Math.max(0, netTotal - paid)) }
   }
 
   /** Valida un pago (RP) a una OC: ≤ saldo disponible del RP y ≤ lo que se le debe al tercero. */
@@ -2353,8 +2353,19 @@ export class ParticipationsService {
     if (error && (error as any).code !== 'PGRST116') throw Object.assign(new Error(`Error al leer la OC: ${error.message}`), { statusCode: 500 })
     if (!data) throw Object.assign(new Error('Factura de participación no encontrada'), { statusCode: 404 })
     // Lo que falta por pagarle al tercero (giro neto − pagado): tope de los RP
-    const { netTotal, owed } = await ParticipationsService.thirdPartyOwed(id).catch(() => ({ netTotal: null, owed: null }))
-    return { ...data, net_payable_total: netTotal, pay_pending: owed }
+    // y la partición tributaria + impuestos del RC, igual que en el listado (el
+    // detalle reemplaza la fila con esta respuesta al recargar).
+    const [owedInfo, rcTaxes] = await Promise.all([
+      ParticipationsService.thirdPartyOwed(id).catch(() => null),
+      ParticipationsService.loadCollectionTaxes([data as any]).catch(() => new Map<string, CollectionTaxes>()),
+    ])
+    return {
+      ...data,
+      tax_partition: owedInfo?.partition ?? null,
+      collection_taxes: rcTaxes.get(id) ?? emptyCollectionTaxes(),
+      net_payable_total: owedInfo?.netTotal ?? null,
+      pay_pending: owedInfo?.owed ?? null,
+    }
   }
 
   /**
