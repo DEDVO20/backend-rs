@@ -197,6 +197,21 @@ app.post('/allocations',
   },
 )
 
+// POST /api/participations/repair-money-docs — repara saldos de RC/FC/RP: convierte
+// el dinero registrado a mano en asignaciones y recalcula lo aplicado de cada
+// documento (libera lo "huérfano"). { apply: false } = solo vista previa.
+app.post('/repair-money-docs',
+  requireRole('admin', 'rs_admin'),
+  requirePermission('participations', 'update'),
+  async (c) => {
+    const user = c.get('user')
+    const body = await c.req.json().catch(() => ({})) as { apply?: boolean }
+    const result = await ParticipationsService.repairMoneyDocs(!body.apply)
+    if (body.apply) auditAsync({ action: 'update', resource: 'siigo_documents', metadata: { source: 'repair-money-docs', adopted: result.adopted.length, changes: result.changes.length }, user, c })
+    return c.json(result)
+  },
+)
+
 // POST /api/participations/allocations/apply — aplica una lista de sugerencias FIFO
 app.post('/allocations/apply',
   requirePermission('participations', 'update'),

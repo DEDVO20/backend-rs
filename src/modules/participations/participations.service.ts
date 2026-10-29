@@ -883,6 +883,7 @@ export class ParticipationsService {
         if (target.kind === 'update' || target.kind === 'attach') {
           const { error: upErr } = await supabase.from('invoice_participations').update({ ...w }).eq('id', target.id!)
           if (upErr) throw upErr
+          await ParticipationsService.adoptLegacyMoney(target.id!)   // no perder dinero manual
           await ParticipationsService.recomputeOcFromAllocations(target.id!)
           updated++
           continue
@@ -1882,6 +1883,107 @@ export class ParticipationsService {
   /** Crea (o acumula) una asignación de un documento a una OC. La OC se identifica
    *  por su NÚMERO (purchase_order, estable) o por id interno; se resuelve fresca. */
   /**
+   * Convierte en asignaciones el dinero registrado A MANO en una OC (recaudo,
+   * factura del tercero o pago sin fila en participation_allocations). Hace falta
+   * antes de crear una asignación o de recalcular la OC desde sus asignaciones:
+   * si no, ese dinero manual se borraba de la OC y lo aplicado del documento
+   * quedaba huérfano. Con varios comprobantes en el campo, el monto se reparte en
+   * orden, sin pasar del valor de cada documento (el último toma el resto).
+   * `dryRun` solo informa. Devuelve lo que (se) crearía.
+   */
+  static async adoptLegacyMoney(ocId: string, dryRun = false) {
+    const { data: oc } = await supabase
+      .from('invoice_participations')
+      .select('id, purchase_order, collected, cash_receipts, third_party_invoice, third_party_invoice_value, egress_voucher, egress_voucher_value')
+      .eq('id', ocId)
+      .maybeSingle()
+    if (!oc) return [] as { purchase_order: string; doc_type: string; comprobante: string; amount: number }[]
+    const { data: allocs } = await supabase
+      .from('participation_allocations')
+      .select('source_doc_type')
+      .eq('invoice_participation_id', ocId)
+    const hasType = new Set((allocs ?? []).map((a: any) => a.source_doc_type))
+    const specs: ['RC' | 'FC' | 'RP', string | null, number][] = [
+      ['RC', oc.cash_receipts, Number(oc.collected ?? 0)],
+      ['FC', oc.third_party_invoice, Number(oc.third_party_invoice_value ?? 0)],
+      ['RP', oc.egress_voucher, Number(oc.egress_voucher_value ?? 0)],
+    ]
+    const out: { purchase_order: string; doc_type: string; comprobante: string; amount: number }[] = []
+    for (const [t, list, total] of specs) {
+      if (hasType.has(t)) continue
+      const comps = String(list ?? '').split(',').map(s => s.trim()).filter(Boolean)
+      let left = money(total)
+      if (!comps.length || left <= 0.01) continue
+      for (let i = 0; i < comps.length && left > 0.01; i++) {
+        const comp = comps[i]!
+        let take = left
+        if (i < comps.length - 1) {
+          const { data: rows } = await supabase.from('siigo_documents').select('amount').eq('doc_type', t).eq('comprobante', comp)
+          const docTotal = money((rows ?? []).reduce((s: number, r: any) => s + Number(r.amount ?? 0), 0))
+          if (docTotal > 0) take = money(Math.min(left, docTotal))
+        }
+        out.push({ purchase_order: oc.purchase_order, doc_type: t, comprobante: comp, amount: take })
+        if (!dryRun) {
+          const { error } = await supabase.from('participation_allocations').insert({
+            source_doc_type: t, source_comprobante: comp, invoice_participation_id: ocId,
+            amount: take, origin: 'manual', note: 'Convertido de registro manual',
+          })
+          if (error) throw error
+        }
+        left = money(left - take)
+      }
+    }
+    return out
+  }
+
+  /**
+   * Repara saldos de RC/FC/RP: (1) convierte en asignaciones el dinero manual de
+   * todas las OC y (2) recalcula `applied` de cada documento desde las
+   * asignaciones. Libera lo aplicado "huérfano" (sin OC que lo tenga). `dryRun`
+   * solo informa qué cambiaría.
+   */
+  static async repairMoneyDocs(dryRun = true) {
+    const { data: ocs, error } = await supabase
+      .from('invoice_participations')
+      .select('id')
+      .or('cash_receipts.not.is.null,third_party_invoice.not.is.null,egress_voucher.not.is.null')
+    if (error) throw error
+    const adopted: Awaited<ReturnType<typeof ParticipationsService.adoptLegacyMoney>> = []
+    for (const o of ocs ?? []) adopted.push(...await ParticipationsService.adoptLegacyMoney(o.id, dryRun))
+
+    const { data: docs } = await supabase
+      .from('siigo_documents')
+      .select('id, doc_type, comprobante, amount, applied, matched')
+      .in('doc_type', ['RC', 'FC', 'RP'])
+      .order('imported_at', { ascending: true })
+    const { data: allocRows } = await supabase
+      .from('participation_allocations')
+      .select('source_doc_type, source_comprobante, amount')
+    const key = (t: string, c: string) => `${t}::${normalizeInvoiceNumber(c)}`
+    const allocated = new Map<string, number>()
+    for (const a of allocRows ?? []) allocated.set(key(a.source_doc_type, a.source_comprobante), money((allocated.get(key(a.source_doc_type, a.source_comprobante)) ?? 0) + Number(a.amount ?? 0)))
+    // En dryRun, sumar también lo que se adoptaría
+    if (dryRun) for (const a of adopted) allocated.set(key(a.doc_type, a.comprobante), money((allocated.get(key(a.doc_type, a.comprobante)) ?? 0) + a.amount))
+
+    const changes: { doc_type: string; comprobante: string; applied_before: number; applied_after: number }[] = []
+    const remaining = new Map(allocated)
+    const now = new Date().toISOString()
+    for (const d of docs ?? []) {
+      const k = key(d.doc_type, d.comprobante)
+      const amt = Number(d.amount ?? 0)
+      const rem = remaining.get(k) ?? 0
+      const applied = money(Math.min(amt, Math.max(0, rem)))
+      remaining.set(k, money(rem - applied))
+      if (Math.abs(applied - Number(d.applied ?? 0)) <= 0.01) continue
+      changes.push({ doc_type: d.doc_type, comprobante: d.comprobante, applied_before: Number(d.applied ?? 0), applied_after: applied })
+      if (!dryRun) await supabase.from('siigo_documents')
+        .update({ applied, matched: applied + 0.01 >= amt && amt > 0, note: null, updated_at: now })
+        .eq('id', d.id)
+    }
+    return { dry_run: dryRun, adopted, changes }
+  }
+
+  /**
    * Valida un recaudo (RC) a aplicar a una OC: no puede ser mayor que el saldo
    * disponible del recibo ni que lo que falta por recaudar de la factura
    * (valor FV − recaudado). Lanza 400 con el máximo permitido.
@@ -1938,6 +2040,10 @@ export class ParticipationsService {
     } else {
       throw Object.assign(new Error('Se requiere el número de OC o su id'), { statusCode: 400 })
     }
+
+    // El dinero registrado a mano en la OC pasa primero a asignaciones; si no, el
+    // recálculo de la OC lo borraría y dejaría saldos huérfanos en los documentos.
+    await ParticipationsService.adoptLegacyMoney(ocId!)
 
     const avail = await ParticipationsService.docAvailable(source_doc_type, comp)
     const want = money(Number(input.amount ?? 0))
@@ -2135,9 +2241,9 @@ export class ParticipationsService {
       .order('imported_at', { ascending: true })
     const fmt = (n: number) => `$${n.toLocaleString('es-CO')}`
     if (rcRows?.length) {
-      const legacyAvail = money(rcRows.reduce((s: number, d: any) => s + Math.max(0, Number(d.amount ?? 0) - Number(d.applied ?? 0)), 0))
-      const allocAvail = await ParticipationsService.docAvailable('RC', comprobante)
-      const rcAvail = money(Math.min(legacyAvail, allocAvail))
+      // Saldo del recibo según las asignaciones (fuente única; `applied` puede
+      // tener restos huérfanos de la ruta antigua)
+      const rcAvail = await ParticipationsService.docAvailable('RC', comprobante)
       const total = money(allocations.reduce((s, a) => s + Math.max(0, Number(a.amount ?? 0)), 0))
       if (total > rcAvail + 0.01)
         throw Object.assign(new Error(`El total a aplicar (${fmt(total)}) supera el saldo disponible del recibo ${comprobante} (${fmt(rcAvail)})`), { statusCode: 400 })
@@ -2154,82 +2260,23 @@ export class ParticipationsService {
         throw Object.assign(new Error(`El monto (${fmt(alloc.amount)}) supera lo que falta por recaudar de la factura ${(ip as any).finto_invoice} (${fmt(pending)})`), { statusCode: 400 })
     }
 
+    // Se aplica como ASIGNACIONES (participation_allocations), igual que "Asignar":
+    // así el recaudo de la OC y el saldo del recibo salen de la misma fuente. Antes
+    // se escribían a mano y, al recalcular la OC desde sus asignaciones, el
+    // recaudo se borraba y lo aplicado del recibo quedaba huérfano.
     let totalApplied = 0
     const appliedFvs: string[] = []
-
     for (const alloc of allocations) {
       if (alloc.amount <= 0) continue
       const ip = (invoices ?? []).find((i: any) => i.id === alloc.invoice_id)
       if (!ip) continue
-      const currentColl = Number((ip as any).collected ?? 0)
-      const newColl = money(currentColl + alloc.amount)
-      const existingReceipts = String((ip as any).cash_receipts ?? '').split(',').map(s => s.trim()).filter(Boolean)
-      if (!existingReceipts.some(r => normalizeInvoiceNumber(r) === normalizeInvoiceNumber(comprobante))) {
-        existingReceipts.push(comprobante)
-      }
-
-      const invVal = Number((ip as any).finto_invoice_value ?? 0)
-      const partVal = Number((ip as any).participation_value ?? 0)
-      const available = availableParticipation({
-        type: (ip as any).participation_type || 'percentage',
-        participationValue: partVal,
-        invoiceValue: invVal,
-        collected: newColl,
+      const r = await ParticipationsService.createAllocation({
+        source_doc_type: 'RC', source_comprobante: comprobante,
+        invoice_participation_id: (ip as any).id, amount: alloc.amount,
+        source_nit: input.client_nit || undefined, origin: 'manual',
       })
-
-      const { error: upErr } = await supabase
-        .from('invoice_participations')
-        .update({
-          collected: newColl,
-          cash_receipts: existingReceipts.join(', '),
-          available_for_payment: available,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', (ip as any).id)
-      if (upErr) throw upErr
-      await ParticipationsService.recomputeStatus((ip as any).id)
-
-      totalApplied = money(totalApplied + alloc.amount)
+      totalApplied = money(totalApplied + Number(r.applied ?? 0))
       if ((ip as any).finto_invoice) appliedFvs.push((ip as any).finto_invoice)
-    }
-
-    // Actualizar lo aplicado del recibo, repartiéndolo entre sus filas (un RC
-    // puede tener varias, una por FV). Antes se buscaba con maybeSingle() y, con
-    // varias filas, no se actualizaba nada.
-    let toApply = totalApplied
-    for (const doc of rcRows ?? []) {
-      if (toApply <= 0.01) break
-      const docAmount = Number((doc as any).amount ?? 0)
-      const prevApplied = Number((doc as any).applied ?? 0)
-      const take = money(Math.min(Math.max(0, docAmount - prevApplied), toApply))
-      if (take <= 0) continue
-      const newApplied = money(prevApplied + take)
-      const remaining = Math.max(0, money(docAmount - newApplied))
-      toApply = money(toApply - take)
-
-      // Combinar fv_ref sin duplicar
-      const existingRefs = String((doc as any).fv_ref ?? '')
-        .split(',')
-        .map(s => s.trim())
-        .filter(Boolean)
-      for (const fv of appliedFvs) {
-        if (!existingRefs.some(r => normalizeInvoiceNumber(r) === normalizeInvoiceNumber(fv))) {
-          existingRefs.push(fv)
-        }
-      }
-
-      await supabase
-        .from('siigo_documents')
-        .update({
-          applied: newApplied,
-          matched: remaining <= 0.01,
-          // Con varias filas no se toca fv_ref: es parte de la clave única
-          // (doc_type, comprobante, fv_ref) y podría chocar entre filas.
-          fv_ref: (rcRows ?? []).length === 1 ? existingRefs.join(', ') : (doc as any).fv_ref,
-          note: remaining > 0.01 ? `Saldo restante: $${remaining.toLocaleString('es-CO')}` : null,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', (doc as any).id)
     }
 
     return { success: true, applied: totalApplied, invoices: appliedFvs }
