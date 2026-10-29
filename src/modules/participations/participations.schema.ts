@@ -77,6 +77,9 @@ export const applyManualPaymentSchema = z.object({
 })
 
 export const updateInvoiceParticipationSchema = z.object({
+  // Etapa 1: OC — participación causada corregida a mano (queda fija: el import
+  // y los cambios de % ya no la recalculan)
+  participation_value:       z.number().min(0, 'La participación no puede ser negativa').optional(),
   // Etapa 2: Venta
   finto_invoice:             z.string().trim().nullable().optional(),
   finto_invoice_date:        z.string().trim().nullable().optional(),

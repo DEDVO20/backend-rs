@@ -200,11 +200,13 @@ export class ParticipationsService {
       const serviceValue = Number(cs?.service_value ?? 0)
       const { data: ocs } = await supabase
         .from('invoice_participations')
-        .select('id, period, proration')
+        .select('*')
         .eq('participation_id', participationId)
         .is('finto_invoice', null)
         .gte('period', from.slice(0, 7))
       for (const oc of ocs ?? []) {
+        if ((oc as any).participation_value_manual) continue   // corregida a mano
+
         const p = rateAt(updated, monthStart(oc.period), pct)
         const proration = Number((oc as any).proration ?? 1)
         await supabase.from('invoice_participations').update({
@@ -787,13 +789,17 @@ export class ParticipationsService {
       id?: string; purchase_order?: string
     }
     const targets = new Map<any, ImportTarget>()
+    // OC con la participación corregida a mano: el import no la recalcula
+    const manualValue = new Set<string>()
     if (toWrite.length) {
       const partIds = [...new Set(toWrite.map(w => w.participation_id))]
       const fvList = [...new Set(toWrite.map(w => String(w.finto_invoice)))]
-      const cols = 'id, participation_id, period, finto_invoice, purchase_order, import_signature'
+      // '*' para leer participation_value_manual sin romper si falta la migración
+      const cols = '*'
       const { data: byPart } = await supabase.from('invoice_participations').select(cols).in('participation_id', partIds)
       const { data: byFvRows } = await supabase.from('invoice_participations').select(cols).in('finto_invoice', fvList)
       const ocs: any[] = [...new Map([...(byPart ?? []), ...(byFvRows ?? [])].map((o: any) => [o.id, { ...o }])).values()]
+      for (const o of ocs) if (o.participation_value_manual) manualValue.add(o.id)
       const isFv = (o: any, fv: string) => !!o.finto_invoice && normalizeInvoiceNumber(o.finto_invoice) === normalizeInvoiceNumber(fv)
       for (const w of toWrite) {
         const res = w._res as Res
@@ -881,6 +887,7 @@ export class ParticipationsService {
         // Al ACTUALIZAR una OC existente solo se tocan los campos del CAUSADO (no
         // su periodo ni su número); el dinero se deriva de las asignaciones.
         if (target.kind === 'update' || target.kind === 'attach') {
+          if (manualValue.has(target.id!)) { delete w.participation_value; delete w.percentage }
           const { error: upErr } = await supabase.from('invoice_participations').update({ ...w }).eq('id', target.id!)
           if (upErr) throw upErr
           await ParticipationsService.adoptLegacyMoney(target.id!)   // no perder dinero manual
@@ -1987,7 +1994,7 @@ export class ParticipationsService {
    * Lo que se le debe al tercero en una OC = giro neto total (participación + IVA
    * − retenciones − comisión si es mandato, con recaudo al 100%) − lo ya pagado.
    */
-  static async thirdPartyOwed(ocId: string) {
+  static async thirdPartyOwed(ocId: string, override?: { participation_value?: number }) {
     const { data: oc } = await supabase
       .from('invoice_participations')
       .select('id, purchase_order, participation_value, finto_invoice_value, collected, contract_type, egress_voucher_value, participation:service_participations(contract_type, third_party:third_parties(tax_profile:tax_profiles(*)))')
@@ -1997,7 +2004,7 @@ export class ParticipationsService {
     const one = (v: any) => Array.isArray(v) ? v[0] : v
     const profile = one(one(one((oc as any).participation)?.third_party)?.tax_profile) ?? null
     const settings = await ParticipationsService.loadTaxSettings()
-    const partition = ParticipationsService.computePartition(oc as any, profile, settings)
+    const partition = ParticipationsService.computePartition({ ...(oc as any), ...override }, profile, settings)
     const netTotal = money(Number(partition.breakdown.finalTotal ?? 0))
     const paid = money(Number((oc as any).egress_voucher_value ?? 0))
     return { purchase_order: oc.purchase_order as string, partition, netTotal, paid, owed: money(Math.max(0, netTotal - paid)) }
@@ -2583,12 +2590,25 @@ export class ParticipationsService {
     const fintoVal = updatePayload.finto_invoice_value !== undefined ? Number(updatePayload.finto_invoice_value) : Number(current.finto_invoice_value ?? 0)
     const partVal = updatePayload.participation_value !== undefined ? Number(updatePayload.participation_value) : Number(current.participation_value ?? 0)
 
-    // El pago escrito a mano no puede superar el giro neto que se le debe al tercero
-    if (patch.egress_voucher_value !== undefined && patch.egress_voucher_value !== null) {
-      const { netTotal } = await ParticipationsService.thirdPartyOwed(id)
-      const paidNew = Number(patch.egress_voucher_value)
-      if (paidNew > netTotal + 0.01)
-        throw Object.assign(new Error(`El pago ($${paidNew.toLocaleString('es-CO')}) no puede ser mayor que el giro neto al tercero ($${netTotal.toLocaleString('es-CO')})`), { statusCode: 400 })
+    // Participación corregida a mano: queda marcada para que el import y los
+    // cambios de % no la pisen.
+    if (patch.participation_value !== undefined) {
+      updatePayload.participation_value = money(Number(patch.participation_value))
+      updatePayload.participation_value_manual = true
+    }
+
+    // El pago (escrito a mano o el ya registrado, si cambia la participación) no
+    // puede superar el giro neto que se le debe al tercero
+    const paidCheck = patch.egress_voucher_value ?? (patch.participation_value !== undefined ? current.egress_voucher_value : null)
+    if (paidCheck !== undefined && paidCheck !== null) {
+      const { netTotal } = await ParticipationsService.thirdPartyOwed(id, { participation_value: partVal })
+      const paidNew = Number(paidCheck)
+      if (paidNew > netTotal + 0.01) {
+        const fmt = (n: number) => `$${n.toLocaleString('es-CO')}`
+        throw Object.assign(new Error(patch.egress_voucher_value != null
+          ? `El pago (${fmt(paidNew)}) no puede ser mayor que el giro neto al tercero (${fmt(netTotal)})`
+          : `Con esa participación el giro neto al tercero sería ${fmt(netTotal)}, menor que lo ya pagado (${fmt(paidNew)}). Desvincula o ajusta el pago primero.`), { statusCode: 400 })
+      }
     }
 
     // El recaudo escrito a mano no puede superar el valor de la factura
@@ -2653,15 +2673,8 @@ export class ParticipationsService {
     // Recalcular estado de la factura derivado de los nuevos datos
     await ParticipationsService.recomputeStatus(id)
 
-    // Devolver el registro completo actualizado
-    const { data: updated, error: fetchErr } = await supabase
-      .from('invoice_participations')
-      .select('*, participation:service_participations(third_party:third_parties(name, identification, tax_profile:tax_profiles(*)), company_service:company_services(services(name))), companies(name, nit)')
-      .eq('id', id)
-      .single()
-    if (fetchErr) throw fetchErr
-
-    return updated
+    // Devolver el registro completo actualizado (con la partición recalculada)
+    return ParticipationsService.getInvoiceParticipation(id)
   }
 
   /**
