@@ -2204,6 +2204,7 @@ export class ParticipationsService {
 
     // ── Si se está quitando la FV (finto_invoice === null o '') ──
     if (patch.finto_invoice === null || (patch.finto_invoice !== undefined && !String(patch.finto_invoice).trim())) {
+      if (oldFv) await ParticipationsService.releasePendingSlot(id)
       updatePayload.finto_invoice = null
       updatePayload.finto_invoice_date = null
       updatePayload.finto_invoice_value = 0
@@ -2255,7 +2256,8 @@ export class ParticipationsService {
 
       if (otherInv) {
         // "quitar las vinculaciones a las que tenia antes de los rp":
-        // Limpiar la OC anterior completamente
+        // Limpiar la OC anterior completamente (queda pendiente: liberar su cupo)
+        await ParticipationsService.releasePendingSlot(otherInv.id)
         await supabase
           .from('invoice_participations')
           .update({
@@ -2842,6 +2844,43 @@ export class ParticipationsService {
   }
 
   /**
+   * Antes de dejar una OC sin FV: solo puede haber UNA OC pendiente (sin FV) por
+   * servicio y mes (índice invoice_participations_pending_uq). Si ya existe otra
+   * —típicamente la OC mensual automática, vacía— se elimina y esta OC toma su
+   * lugar. Si la otra tiene movimientos (recaudo, factura tercero, pago o
+   * asignaciones) no se toca nada y se informa.
+   */
+  private static async releasePendingSlot(ocId: string) {
+    const { data: oc } = await supabase
+      .from('invoice_participations')
+      .select('participation_id, period')
+      .eq('id', ocId)
+      .maybeSingle()
+    if (!oc?.participation_id || !oc.period) return
+    const { data: others } = await supabase
+      .from('invoice_participations')
+      .select('id, purchase_order, collected, cash_receipts, third_party_invoice, egress_voucher')
+      .eq('participation_id', oc.participation_id)
+      .eq('period', oc.period)
+      .is('finto_invoice', null)
+      .neq('id', ocId)
+    for (const o of others ?? []) {
+      const { count } = await supabase
+        .from('participation_allocations')
+        .select('id', { count: 'exact', head: true })
+        .eq('invoice_participation_id', o.id)
+      const empty = !Number(o.collected ?? 0) && !o.cash_receipts && !o.third_party_invoice && !o.egress_voucher && !count
+      if (!empty) throw Object.assign(
+        new Error(`Ya existe la OC pendiente ${o.purchase_order} del mismo servicio y mes, con movimientos. Asígnale una factura o desvincula sus movimientos antes de dejar esta OC sin factura.`),
+        { statusCode: 409 },
+      )
+      const { error } = await supabase.from('invoice_participations').delete().eq('id', o.id)
+      if (error) throw error
+      logger.info({ removed: o.purchase_order, keeps: ocId }, 'OC pendiente vacía duplicada eliminada al desvincular FV')
+    }
+  }
+
+  /**
    * Desvincula la factura de venta (FV) asignada a una orden de compra (OC).
    * Deja la OC en estado 'pending_invoice', resetea valores de factura y disponible,
    * y libera la FV en siigo_documents para que pueda asignarse a otra OC.
@@ -2858,6 +2897,7 @@ export class ParticipationsService {
 
     const oldFv = inv.finto_invoice
     const now = new Date().toISOString()
+    await ParticipationsService.releasePendingSlot(invoice_id)
 
     const updatePayload: Record<string, any> = {
       finto_invoice: null,
