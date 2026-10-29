@@ -351,7 +351,6 @@ export class ParticipationsService {
       has.add(key)
       const c = pl.cfg
       const isMandate = c.contract_type === 'mandato'
-      const base = money(c.service_value * pl.proration)
       // % vigente en el mes de la OC (historial), no el último configurado
       const pct = rateAt(c.rates, monthStart(pl.period), c.percentage)
       const partValue = isMandate ? 0 : money(calcParticipation(c.service_value, pct, { type: c.type, fixedValue: c.fixed_value }) * pl.proration)
@@ -361,7 +360,9 @@ export class ParticipationsService {
         company_id:            c.company_id,
         finto_invoice:         null,
         finto_invoice_date:    null,
-        finto_invoice_value:   isMandate ? 0 : base,
+        // Sin FV no hay valor de factura (si no, figuraba "por cobrar" lo que aún
+        // no se ha facturado). Lo pone la FV al asignarse/importarse.
+        finto_invoice_value:   0,
         contract_type:         c.contract_type,
         participation_type:    c.type,
         percentage:            c.type === 'fixed' ? 0 : pct,
