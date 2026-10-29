@@ -2598,6 +2598,37 @@ export class ParticipationsService {
   }
 
   /**
+   * Si el documento (RC/FC/RP) está asignado a la OC en participation_allocations
+   * —la fuente del saldo disponible—, desvincular es reducir (o borrar) esa
+   * asignación y recalcular la OC y el documento desde ahí. Devuelve false si no
+   * había asignación (recaudo/pago registrado a mano: se usa la ruta antigua).
+   */
+  private static async unlinkFromAllocation(docType: 'RC' | 'FC' | 'RP', comprobante: string, ocId: string, amount: number): Promise<boolean> {
+    const compNorm = normalizeInvoiceNumber(comprobante)
+    const { data: allocs } = await supabase
+      .from('participation_allocations')
+      .select('id, amount, source_comprobante')
+      .eq('source_doc_type', docType)
+      .eq('invoice_participation_id', ocId)
+    const mine = (allocs ?? []).filter((a: any) => normalizeInvoiceNumber(a.source_comprobante) === compNorm)
+    if (!mine.length) return false
+    let toRemove = money(amount)
+    const now = new Date().toISOString()
+    for (const a of mine) {
+      if (toRemove <= 0.01) break
+      const cur = Number(a.amount ?? 0)
+      const take = money(Math.min(cur, toRemove))
+      const left = money(cur - take)
+      if (left <= 0.01) await supabase.from('participation_allocations').delete().eq('id', a.id)
+      else await supabase.from('participation_allocations').update({ amount: left, updated_at: now }).eq('id', a.id)
+      toRemove = money(toRemove - take)
+    }
+    await ParticipationsService.recomputeOcFromAllocations(ocId)
+    await ParticipationsService.syncSiigoApplied(docType, mine[0]!.source_comprobante)
+    return true
+  }
+
+  /**
    * Desvincula un comprobante o monto de recaudo de una factura, liberándolo en siigo_documents.
    */
   static async unlinkPayment(input: {
@@ -2606,6 +2637,12 @@ export class ParticipationsService {
     comprobante: string
   }) {
     const { invoice_id, amount, comprobante } = input
+
+    // Asignado desde la rejilla/etapas → se quita la asignación (actualiza el disponible)
+    if (await ParticipationsService.unlinkFromAllocation('RC', comprobante, invoice_id, amount)) {
+      const { data: oc } = await supabase.from('invoice_participations').select('collected').eq('id', invoice_id).single()
+      return { success: true, collected: Number(oc?.collected ?? 0) }
+    }
 
     const { data: inv, error: invErr } = await supabase
       .from('invoice_participations')
@@ -2680,6 +2717,12 @@ export class ParticipationsService {
     comprobante: string
   }) {
     const { invoice_id, amount, comprobante } = input
+
+    // Asignado desde la rejilla/etapas → se quita la asignación (actualiza el disponible)
+    if (await ParticipationsService.unlinkFromAllocation('RP', comprobante, invoice_id, amount)) {
+      const { data: oc } = await supabase.from('invoice_participations').select('egress_voucher_value').eq('id', invoice_id).single()
+      return { success: true, egress_voucher_value: Number(oc?.egress_voucher_value ?? 0) }
+    }
 
     const { data: inv, error: invErr } = await supabase
       .from('invoice_participations')
