@@ -2219,29 +2219,13 @@ export class ParticipationsService {
           .eq('comprobante', oldFv)
       }
 
-      // Liberar en siigo_documents los recibos que estaban aplicados a esta factura
-      const receipts = String(current.cash_receipts ?? '').split(',').map(s => s.trim()).filter(Boolean)
-      for (const r of receipts) {
-        const { data: rcDoc } = await supabase
-          .from('siigo_documents')
-          .select('id, amount, applied')
-          .eq('doc_type', 'RC')
-          .eq('comprobante', r)
-          .maybeSingle()
-        if (rcDoc) {
-          const curApplied = Number(rcDoc.applied ?? 0)
-          const newApplied = Math.max(0, money(curApplied - Number(current.collected ?? 0)))
-          await supabase
-            .from('siigo_documents')
-            .update({
-              applied: newApplied,
-              matched: newApplied > 0.01,
-              note: 'Desvinculado por remoción de FV',
-              updated_at: now,
-            })
-            .eq('id', rcDoc.id)
-        }
-      }
+      // Soltar los recibos (RC) de esta OC: quedan libres para otras OC y la OC
+      // queda sin recaudo (antes se liberaba el recibo pero la asignación seguía
+      // viva y el RC quedaba "pegado" sin saldo).
+      await ParticipationsService.releaseOcReceipts({ id, cash_receipts: current.cash_receipts, collected: current.collected })
+      updatePayload.collected = 0
+      updatePayload.cash_receipts = null
+      updatePayload.cash_receipt_date = null
     }
     // ── Si se está asignando o cambiando a una nueva FV ──
     else if (newFv && (!oldFv || normalizeInvoiceNumber(oldFv) !== normalizeInvoiceNumber(newFv))) {
@@ -2280,6 +2264,10 @@ export class ParticipationsService {
             updated_at: now,
           })
           .eq('id', otherInv.id)
+
+        // Sus asignaciones (RC/FC/RP) se van con la FV a la nueva OC; si no, los
+        // documentos quedaban asignados a una OC sin FV ("pegados").
+        await ParticipationsService.moveAllocations(otherInv.id, id)
 
         await ParticipationsService.recomputeStatus(otherInv.id)
 
@@ -2888,6 +2876,66 @@ export class ParticipationsService {
   }
 
   /**
+   * Suelta los recibos de caja (RC) de una OC al quitarle su FV: borra sus
+   * asignaciones RC (fuente del saldo disponible del recibo) y recalcula lo
+   * aplicado de cada recibo, para que quede libre para otras OC. Si el recaudo se
+   * había registrado a mano (sin asignación), descuenta lo recaudado de lo
+   * aplicado del recibo, repartiéndolo entre sus filas (un RC puede tener varias).
+   * Quien llama deja la OC en collected = 0 y sin cash_receipts.
+   */
+  private static async releaseOcReceipts(oc: { id: string; cash_receipts?: string | null; collected?: number | null }) {
+    const { data: allocs } = await supabase
+      .from('participation_allocations')
+      .select('id, source_comprobante')
+      .eq('source_doc_type', 'RC')
+      .eq('invoice_participation_id', oc.id)
+    if (allocs?.length) {
+      await supabase.from('participation_allocations').delete().eq('source_doc_type', 'RC').eq('invoice_participation_id', oc.id)
+      for (const comp of new Set(allocs.map((a: any) => String(a.source_comprobante))))
+        await ParticipationsService.syncSiigoApplied('RC', comp)
+      return
+    }
+    // Recaudo registrado a mano: descontar de lo aplicado del/los recibo(s)
+    let toRelease = money(Number(oc.collected ?? 0))
+    const now = new Date().toISOString()
+    for (const r of String(oc.cash_receipts ?? '').split(',').map(s => s.trim()).filter(Boolean)) {
+      if (toRelease <= 0.01) break
+      const { data: rows } = await supabase
+        .from('siigo_documents')
+        .select('id, applied')
+        .eq('doc_type', 'RC')
+        .eq('comprobante', r)
+      for (const d of rows ?? []) {
+        if (toRelease <= 0.01) break
+        const cur = Number(d.applied ?? 0)
+        const take = money(Math.min(cur, toRelease))
+        const left = money(cur - take)
+        await supabase.from('siigo_documents')
+          .update({ applied: left, matched: left > 0.01, note: 'Liberado al quitar la FV de la OC', updated_at: now })
+          .eq('id', d.id)
+        toRelease = money(toRelease - take)
+      }
+    }
+  }
+
+  /** Pasa las asignaciones (RC/FC/RP) de una OC a otra (al mover una FV completa). */
+  private static async moveAllocations(fromId: string, toId: string) {
+    const { data: from } = await supabase.from('participation_allocations').select('*').eq('invoice_participation_id', fromId)
+    if (!from?.length) return
+    const { data: to } = await supabase.from('participation_allocations').select('*').eq('invoice_participation_id', toId)
+    const now = new Date().toISOString()
+    for (const a of from) {
+      const same = (to ?? []).find((t: any) => t.source_doc_type === a.source_doc_type && normalizeInvoiceNumber(t.source_comprobante) === normalizeInvoiceNumber(a.source_comprobante))
+      if (same) {
+        await supabase.from('participation_allocations').update({ amount: money(Number(same.amount) + Number(a.amount)), updated_at: now }).eq('id', same.id)
+        await supabase.from('participation_allocations').delete().eq('id', a.id)
+      } else {
+        await supabase.from('participation_allocations').update({ invoice_participation_id: toId, updated_at: now }).eq('id', a.id)
+      }
+    }
+  }
+
+  /**
    * Antes de dejar una OC sin FV: solo puede haber UNA OC pendiente (sin FV) por
    * servicio y mes (índice invoice_participations_pending_uq). Si ya existe otra
    * —típicamente la OC mensual automática, vacía— se elimina y esta OC toma su
@@ -2957,29 +3005,8 @@ export class ParticipationsService {
       updatePayload.cash_receipts = null
       updatePayload.cash_receipt_date = null
 
-      // Liberar en siigo_documents los recibos que estaban aplicados
-      const receipts = String(inv.cash_receipts ?? '').split(',').map(s => s.trim()).filter(Boolean)
-      for (const r of receipts) {
-        const { data: rcDoc } = await supabase
-          .from('siigo_documents')
-          .select('id, amount, applied')
-          .eq('doc_type', 'RC')
-          .eq('comprobante', r)
-          .maybeSingle()
-        if (rcDoc) {
-          const curApplied = Number(rcDoc.applied ?? 0)
-          const newApplied = Math.max(0, money(curApplied - Number(inv.collected ?? 0)))
-          await supabase
-            .from('siigo_documents')
-            .update({
-              applied: newApplied,
-              matched: newApplied > 0.01,
-              note: 'Desvinculado por desvinculación de FV de OC',
-              updated_at: now,
-            })
-            .eq('id', rcDoc.id)
-        }
-      }
+      // Soltar los recibos: borra sus asignaciones y recalcula lo aplicado
+      await ParticipationsService.releaseOcReceipts(inv)
     }
 
     const { error: upErr } = await supabase
@@ -3106,12 +3133,30 @@ export class ParticipationsService {
     if (!moneyDocs.length) return mine
     const { data: allocRows } = await supabase
       .from('participation_allocations')
-      .select('source_doc_type, source_comprobante, amount')
+      .select('source_doc_type, source_comprobante, amount, invoice_participation_id')
       .in('source_doc_type', [...new Set(moneyDocs.map((d: any) => d.doc_type))])
     const allocMap = new Map<string, number>()
     for (const a of allocRows ?? []) {
       const k = `${a.source_doc_type}::${normalizeInvoiceNumber(a.source_comprobante)}`
       allocMap.set(k, money((allocMap.get(k) ?? 0) + Number(a.amount ?? 0)))
+    }
+    // A qué OC está asignado cada documento (para encontrar dónde quedó "pegado")
+    const myKeys = new Set(moneyDocs.map((d: any) => `${d.doc_type}::${normalizeInvoiceNumber(d.comprobante)}`))
+    const myAllocs = (allocRows ?? []).filter((a: any) => myKeys.has(`${a.source_doc_type}::${normalizeInvoiceNumber(a.source_comprobante)}`))
+    const ocById = new Map<string, any>()
+    const ocIds = [...new Set(myAllocs.map((a: any) => a.invoice_participation_id))]
+    for (let i = 0; i < ocIds.length; i += 150) {
+      const { data: ocs } = await supabase.from('invoice_participations')
+        .select('id, purchase_order, finto_invoice').in('id', ocIds.slice(i, i + 150))
+      for (const o of ocs ?? []) ocById.set(o.id, o)
+    }
+    const holdersBy = new Map<string, { purchase_order: string; finto_invoice: string | null; amount: number }[]>()
+    for (const a of myAllocs) {
+      const k = `${a.source_doc_type}::${normalizeInvoiceNumber(a.source_comprobante)}`
+      const oc = ocById.get(a.invoice_participation_id)
+      holdersBy.set(k, [...(holdersBy.get(k) ?? []), {
+        purchase_order: oc?.purchase_order ?? '—', finto_invoice: oc?.finto_invoice ?? null, amount: Number(a.amount ?? 0),
+      }])
     }
     const grouped = new Map<string, any>()
     for (const d of moneyDocs) {
@@ -3125,7 +3170,7 @@ export class ParticipationsService {
     const money_out = [...grouped.entries()].map(([k, d]) => {
       const allocated = allocMap.get(k) ?? 0
       const available = money(Math.max(0, d.amount - allocated))
-      return { ...d, allocated, available, matched: available <= 0.01 }
+      return { ...d, allocated, available, matched: available <= 0.01, holders: holdersBy.get(k) ?? [] }
     })
     return [...mine.filter((d: any) => !isMoney(d.doc_type)), ...money_out]
       .sort((a: any, b: any) => String(b.doc_date ?? '').localeCompare(String(a.doc_date ?? '')))
