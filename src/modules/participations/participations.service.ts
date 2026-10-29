@@ -1376,6 +1376,8 @@ export class ParticipationsService {
       .from('siigo_documents')
       .select('*')
       .eq('matched', false)
+      // Las notas crédito (NC) no se asignan a OC: no son "pendientes de cruzar".
+      .neq('doc_type', 'NC')
       .order('doc_date', { ascending: false })
       .limit(1000)
     if (f.doc_type) q = q.eq('doc_type', f.doc_type)
