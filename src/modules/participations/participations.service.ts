@@ -205,7 +205,7 @@ export class ParticipationsService {
         .eq('id', participationId)
         .maybeSingle()
       const isMandate = (part as any)?.contract_type === 'mandato'
-      const recalcFrom = validFrom || isNewRate ? from : list.length > 1 || isMandate ? currentRateStart(list) : null
+      const recalcFrom = validFrom || isNewRate ? from : list.length > 1 ? currentRateStart(list) : null
       if (!recalcFrom) return { ...out, reason: 'single_rate' as const }
 
       const cs = Array.isArray((part as any)?.company_service) ? (part as any).company_service[0] : (part as any)?.company_service
