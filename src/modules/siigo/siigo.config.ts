@@ -20,11 +20,14 @@ export const SIIGO_CONFIG = {
   COLLECTIONS_MAX_PAGES: 200,
   COLLECTIONS_MAX_GAP_QUERIES: 200,
 
-  get USERNAME() { return process.env.SIIGO_USERNAME || 'pblanco@raddf.com' },
+  // Credenciales de la cuenta de Finto (conexión de plataforma) cuando no hay otras guardadas en la base.
+  // Las de cada empresa cliente viven cifradas en siigo_connections.
+  get USERNAME() { return process.env.SIIGO_USERNAME || '' },
   get ACCESS_KEY() { return process.env.SIIGO_ACCESS_KEY || '' },
   get PARTNER_ID() { return process.env.SIIGO_PARTNER_ID || 'RSHUBS' },
 
-  get SELLER_ID_FILTER() { return process.env.SELLER_ID_FILTER ?? '689' }, // 689 = Paola Blanco
+  // Vendedor por defecto en los libros de Finto (689 = Paola Blanco); no aplica a otras cuentas
+  get SELLER_ID_FILTER() { return process.env.SELLER_ID_FILTER ?? '689' },
   get START_YEAR() { return parseInt(process.env.START_YEAR || '2025', 10) },
   // Días que la sync incremental vuelve a revisar antes de la última sync (anulaciones y ediciones tardías)
   get SYNC_OVERLAP_DAYS() { return parseInt(process.env.SIIGO_SYNC_OVERLAP_DAYS || '5', 10) },
@@ -42,12 +45,4 @@ export const SIIGO_CONFIG = {
     'annulled', 'anulada', 'anulado',
     'void', 'cancelled', 'canceled', 'cancelada', 'cancelado',
   ]),
-}
-
-export function validateSiigoConfig(): string[] {
-  const errors: string[] = []
-  if (!SIIGO_CONFIG.USERNAME)   errors.push('Falta SIIGO_USERNAME en las variables de entorno (.env)')
-  if (!SIIGO_CONFIG.ACCESS_KEY) errors.push('Falta SIIGO_ACCESS_KEY en las variables de entorno (.env)')
-  if (!SIIGO_CONFIG.PARTNER_ID) errors.push('Falta SIIGO_PARTNER_ID en las variables de entorno (.env)')
-  return errors
 }

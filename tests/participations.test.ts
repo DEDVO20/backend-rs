@@ -17,6 +17,8 @@ import {
   parseAccountingMovement,
   planMoneyDocs,
   rateAt,
+  taxRateFromDesc,
+  mandateAmount,
   addMonths,
   billedPeriods,
 } from '../src/modules/participations/participations.domain.js'
@@ -696,5 +698,98 @@ describe('rateAt — % de participación vigente por mes', () => {
   it('fecha anterior a todo el historial → el más antiguo; sin historial → fallback', () => {
     expect(rateAt(rates, '2025-12-01', 0)).toBe(40)
     expect(rateAt([], '2026-07-01', 30)).toBe(30)
+  })
+})
+
+describe('FV: neto a cobrar = base + IVA − retenciones (para el % de recaudo)', () => {
+  const header = ['Código cuentas contables', 'Identificación tercero', 'Comprobante', 'Fecha elaboración', 'Crédito', 'Descripción', 'Valor base', 'Nombre tercero']
+
+  it('tarifas de la descripción: IVA y retefuente en %, reteICA por mil', () => {
+    expect(taxRateFromDesc('IVA 19%', 'vat')).toBe(0.19)
+    expect(taxRateFromDesc('Retefuente 11%', 'income')).toBe(0.11)
+    expect(taxRateFromDesc('ReteICA 8.66', 'ica')).toBeCloseTo(0.00866, 6)
+    expect(taxRateFromDesc('Rete ICA 6,9 x mil', 'ica')).toBeCloseTo(0.0069, 6)
+    expect(taxRateFromDesc('ReteICA 0.966%', 'ica')).toBeCloseTo(0.00966, 6)
+    expect(taxRateFromDesc('Retención', 'income')).toBeNull()
+  })
+
+  it('IVA 19% suma; retefuente 11%, reteICA 8.66 y 6.9 restan', () => {
+    const rows: string[][] = [
+      header,
+      ['41800101', '901769961', 'FV-2-90', '7/6/26', '1,000,000.00', 'Servicio', '', 'WIP'],
+      ['24080601', '901769961', 'FV-2-90', '7/6/26', '190,000.00', 'IVA 19%', '1,000,000.00', 'WIP'],
+      ['13551509', '901769961', 'FV-2-90', '7/6/26', '', 'Retefuente 11%', '1,000,000.00', 'WIP'],
+      ['13551801', '901769961', 'FV-2-90', '7/6/26', '', 'ReteICA 8.66', '1,000,000.00', 'WIP'],
+      ['13551802', '901769961', 'FV-2-90', '7/6/26', '', 'ReteICA 6.9', '1,000,000.00', 'WIP'],
+    ]
+    const s = parseAccountingMovement(rows).sales.find(x => x.fv === 'FV-2-90')!
+    expect(s.base).toBe(1_000_000)
+    expect(s.iva).toBe(190_000)
+    expect(s.withholdings).toEqual({ income: 110_000, ica: 15_560, iva: 0, total: 125_560 })
+    expect(s.netReceivable).toBe(1_064_440)
+  })
+
+  it('FV con retenciones y sin IVA: el neto queda por debajo de la base', () => {
+    const rows: string[][] = [
+      header,
+      ['41800101', '901769961', 'FV-2-91', '7/6/26', '500,000.00', 'Servicio', '', 'WIP'],
+      ['13551509', '901769961', 'FV-2-91', '7/6/26', '', 'Retefuente 11%', '500,000.00', 'WIP'],
+      ['13551801', '901769961', 'FV-2-91', '7/6/26', '', 'ReteICA 8.66', '500,000.00', 'WIP'],
+    ]
+    const s = parseAccountingMovement(rows).sales.find(x => x.fv === 'FV-2-91')!
+    expect(s.iva).toBe(0)
+    expect(s.netReceivable).toBe(440_670)
+  })
+
+  it('con columna Débito: usa el débito de cartera (13050501) tal cual', () => {
+    const h = ['Código cuentas contables', 'Identificación tercero', 'Comprobante', 'Fecha elaboración', 'Débito', 'Crédito', 'Descripción', 'Valor base', 'Nombre tercero']
+    const rows: string[][] = [
+      h,
+      ['41800101', '901769961', 'FV-2-92', '7/6/26', '', '1,000,000.00', 'Servicio', '', 'WIP'],
+      ['24080601', '901769961', 'FV-2-92', '7/6/26', '', '190,000.00', 'IVA 19%', '1,000,000.00', 'WIP'],
+      ['13551509', '901769961', 'FV-2-92', '7/6/26', '110,000.00', '', 'Retefuente 11%', '1,000,000.00', 'WIP'],
+      ['13050501', '901769961', 'FV-2-92', '7/6/26', '1,080,000.00', '', 'Clientes nacionales', '', 'WIP'],
+    ]
+    const s = parseAccountingMovement(rows).sales.find(x => x.fv === 'FV-2-92')!
+    expect(s.withholdings.income).toBe(110_000)
+    expect(s.netReceivable).toBe(1_080_000)
+  })
+})
+
+describe('Ejemplo real FV-2-22 / FV-2-23 (dic 2025): recaudo al 100%', () => {
+  it('montos en texto: formato US y colombiano', () => {
+    expect(mandateAmount('1,047,200.00')).toBe(1_047_200)
+    expect(mandateAmount('1.400.000,00')).toBe(1_400_000)
+    expect(mandateAmount('2.472.680,00')).toBe(2_472_680)
+    expect(mandateAmount('1.400.000')).toBe(1_400_000)
+    expect(mandateAmount('213,835.98')).toBe(213_835.98)
+    expect(mandateAmount('0,00')).toBe(0)
+  })
+
+  it('a cobrar = base + IVA − retefuente − reteICA (por mil) y cuadra con el RC', () => {
+    const h = ['Código cuentas contables', 'Identificación tercero', 'Comprobante', 'Fecha elaboración', 'Crédito', 'Descripción', 'Valor base', 'Nombre tercero']
+    const rows: string[][] = [h,
+      ['41555005', '901769961', 'FV-2-22', '15/12/2025', '1.400.000,00', 'Contrato de Mandato Freddy Leon', '', 'WIP COLOMBIA'],
+      ['28051001', '901769961', 'FV-2-22', '15/12/2025', '1.400.000,00', 'Contrato de Mandato Freddy Leon', '', 'WIP COLOMBIA'],
+      ['13050501', '901769961', 'FV-2-22', '15/12/2025', '', 'Clientes nacionales', '', 'WIP COLOMBIA'],
+      ['13551509', '901769961', 'FV-2-22', '15/12/2025', '', 'Retefuente 11%', '2.800.000,00', 'WIP COLOMBIA'],
+      ['13551801', '901769961', 'FV-2-22', '15/12/2025', '', 'ReteICA 6.9', '2.800.000,00', 'WIP COLOMBIA'],
+      ['41555005', '900000001', 'FV-2-23', '15/12/2025', '500.000,00', 'Controller financiero', '', 'S-CORE SAS'],
+      ['41555005', '900000001', 'FV-2-23', '15/12/2025', '600.000,00', 'Contrato de Mandato Freddy Leon', '', 'S-CORE SAS'],
+      ['28051001', '900000001', 'FV-2-23', '15/12/2025', '600.000,00', 'Contrato de Mandato Freddy Leon', '', 'S-CORE SAS'],
+      ['24080601', '900000001', 'FV-2-23', '15/12/2025', '95.000,00', 'IVA 19%', '500.000,00', 'S-CORE SAS'],
+      ['13551509', '900000001', 'FV-2-23', '15/12/2025', '', 'Retefuente 11%', '1.700.000,00', 'S-CORE SAS'],
+      ['13551801', '900000001', 'FV-2-23', '15/12/2025', '', 'ReteICA 8,66', '1.700.000,00', 'S-CORE SAS'],
+      ['13050501', '901769961', 'RC-1-15', '18/12/2025', '2.472.680,00', 'FV-2-22 Cuota: 1  Date: 30/12/2025', '', 'WIP COLOMBIA'],
+    ]
+    const m = parseAccountingMovement(rows)
+    const fv22 = m.sales.find(s => s.fv === 'FV-2-22')!
+    const fv23 = m.sales.find(s => s.fv === 'FV-2-23')!
+    expect(fv22.withholdings).toEqual({ income: 308_000, ica: 19_320, iva: 0, total: 327_320 })
+    expect(fv22.netReceivable).toBe(2_472_680)
+    expect(m.collections[0]!.collected).toBe(fv22.netReceivable)   // recaudo al 100%
+    expect(fv23.iva).toBe(95_000)
+    expect(fv23.withholdings.total).toBe(201_722)
+    expect(fv23.netReceivable).toBe(1_593_278)
   })
 })

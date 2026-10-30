@@ -413,7 +413,7 @@ export async function buildVentaLinesPorProducto(
   apiHelper: SiigoCatalogLookup,
   startDate: string,
   endDate: string,
-  sellerFilter: string = SIIGO_CONFIG.SELLER_ID_FILTER,
+  sellerFilter = '',
 ): Promise<Omit<SiigoSalesLineInput, 'normalized_nit' | 'company_id'>[]> {
   const status = normalizeStatus(doc.status || doc.state)
   if (SIIGO_CONFIG.STATUS_EXCLUDE.has(status)) return []

@@ -30,6 +30,9 @@ const envSchema = z.object({
   START_YEAR:                z.coerce.number().int().default(2025),
   SIIGO_SYNC_OVERLAP_DAYS:   z.coerce.number().int().min(0).default(5),
   SIIGO_COLLECTIONS_START_DATE: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  // Clave AES-256 (32 bytes, base64 o hex) para cifrar credenciales guardadas en la base
+  // (access keys de Siigo de cada empresa). Generar con: openssl rand -base64 32
+  SECRETS_ENCRYPTION_KEY:    z.string().optional(),
   SLEEP_BETWEEN_DOCS_MS:     z.coerce.number().int().default(400),
   SLEEP_BETWEEN_PRODUCT_LOOKUPS_MS: z.coerce.number().int().default(250),
 }).superRefine((v, ctx) => {

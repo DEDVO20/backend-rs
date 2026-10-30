@@ -2,12 +2,12 @@ import { supabase } from '../../lib/supabase.js'
 import { logger } from '../../lib/logger.js'
 import type { AuthUser } from '../../middleware/auth.js'
 import { normalizeNit } from '../participations/participations.domain.js'
-import { SIIGO_CONFIG, validateSiigoConfig } from './siigo.config.js'
+import { SIIGO_CONFIG } from './siigo.config.js'
 import { matchCompanyByNit, round2, sleep } from './siigo.helpers.js'
 import { getCodigoProductoFromItem } from './siigo.calculator.js'
-import { SiigoApiClient } from './siigo.client.js'
-import { siigoCatalogCache } from './siigo.cache.js'
-import { SiigoService } from './siigo.service.js'
+import type { SiigoApiClient } from './siigo.client.js'
+import { SiigoConnections } from './siigo.connections.js'
+import { SiigoService, type SalesScope } from './siigo.service.js'
 import {
   TOLERANCIA,
   consecutivosFaltantesRC,
@@ -56,6 +56,7 @@ export interface CollectionLine {
 
 export interface CollectionSyncLog {
   id: string
+  connection_id: string
   started_at: string
   finished_at: string | null
   status: 'running' | 'completed' | 'failed'
@@ -72,6 +73,7 @@ export interface CollectionSyncLog {
 }
 
 type CollectionFilterArgs = {
+  p_connection: string
   p_company_id: string | null
   p_start:      string | null
   p_end:        string | null
@@ -156,10 +158,11 @@ class InvoiceCache implements CollectionInvoiceLookup {
 }
 
 export class SiigoCollectionsService {
-  private static isSyncRunning = false
+  /** Conexiones con una sincronización de recaudo en curso */
+  private static runningSyncs = new Set<string>()
 
-  static get running(): boolean {
-    return this.isSyncRunning
+  static isRunning(connectionId: string): boolean {
+    return this.runningSyncs.has(connectionId)
   }
 
   /* ─────────────── sincronización ─────────────── */
@@ -252,24 +255,21 @@ export class SiigoCollectionsService {
     return out
   }
 
-  /** Sincroniza el recaudo desde Siigo reprocesando el periodo completo en orden cronológico */
+  /** Sincroniza el recaudo de UNA cuenta de Siigo reprocesando el periodo completo en orden cronológico */
   static async syncFromSiigo(input: SyncSiigoCollectionsBody = {}, triggeredBy?: string): Promise<CollectionSyncLog> {
-    if (this.isSyncRunning) {
-      throw Object.assign(new Error('Ya hay una sincronización de recaudo en curso. Espera a que termine.'), { statusCode: 409 })
+    const conn = await SiigoService.connectionFor(input.connectionId)
+    if (this.runningSyncs.has(conn.id)) {
+      throw Object.assign(new Error(`Ya hay una sincronización de recaudo en curso para ${conn.label}. Espera a que termine.`), { statusCode: 409 })
     }
-    const configErrors = validateSiigoConfig()
-    if (configErrors.length) {
-      throw Object.assign(new Error(configErrors.join('. ')), { statusCode: 400 })
-    }
+    const api = SiigoConnections.client(conn)
+    api.maxRequests = SIIGO_CONFIG.COLLECTIONS_MAX_REQUESTS
 
-    const startDate = input.startDate || SIIGO_CONFIG.COLLECTIONS_START_DATE
+    const startDate = input.startDate || SiigoConnections.settings(conn).collectionsStartDate
     const endDate = input.endDate || endOfCurrentMonthBogota()
     const startTime = Date.now()
     const details: Record<string, number | string> = {}
-    this.isSyncRunning = true
+    this.runningSyncs.add(conn.id)
 
-    const api = new SiigoApiClient()
-    api.maxRequests = SIIGO_CONFIG.COLLECTIONS_MAX_REQUESTS
     const invoices = new InvoiceCache(api)
 
     try {
@@ -366,8 +366,9 @@ export class SiigoCollectionsService {
         }
       }
 
-      await siigoCatalogCache.flushToDatabase()
+      await api.catalog.flushToDatabase()
       const { data, error } = await supabase.rpc('siigo_replace_collection_lines', {
+        p_connection: conn.id,
         p_start: startDate,
         p_end:   endDate,
         p_lines: lines,
@@ -380,6 +381,7 @@ export class SiigoCollectionsService {
 
       const log: CollectionSyncLog = {
         id:                  crypto.randomUUID(),
+        connection_id:       conn.id,
         started_at:          new Date(startTime).toISOString(),
         finished_at:         new Date().toISOString(),
         status:              'completed',
@@ -398,6 +400,7 @@ export class SiigoCollectionsService {
     } catch (err: any) {
       await this.saveSyncLog({
         id:                  crypto.randomUUID(),
+        connection_id:       conn.id,
         started_at:          new Date(startTime).toISOString(),
         finished_at:         new Date().toISOString(),
         status:              'failed',
@@ -414,7 +417,7 @@ export class SiigoCollectionsService {
       })
       throw err
     } finally {
-      this.isSyncRunning = false
+      this.runningSyncs.delete(conn.id)
     }
   }
 
@@ -423,21 +426,23 @@ export class SiigoCollectionsService {
     if (error) logger.warn({ err: error.message }, 'No se pudo guardar el log de sync de recaudo')
   }
 
-  static async getSyncLogs(): Promise<{ isSyncRunning: boolean; logs: CollectionSyncLog[] }> {
+  static async getSyncLogs(connectionId: string): Promise<{ isSyncRunning: boolean; logs: CollectionSyncLog[] }> {
     const { data, error } = await supabase
       .from('siigo_collection_sync_logs')
       .select('*')
+      .eq('connection_id', connectionId)
       .order('started_at', { ascending: false })
       .limit(20)
     if (error) throw new Error(`No se pudieron consultar los logs de recaudo: ${error.message}`)
-    return { isSyncRunning: this.isSyncRunning, logs: (data ?? []) as CollectionSyncLog[] }
+    return { isSyncRunning: this.isRunning(connectionId), logs: (data ?? []) as CollectionSyncLog[] }
   }
 
   /* ─────────────── consultas ─────────────── */
 
-  private static filterArgs(companyId: string | null, query: ListSiigoCollectionsQuery): CollectionFilterArgs {
+  private static filterArgs(scope: SalesScope, query: ListSiigoCollectionsQuery): CollectionFilterArgs {
     return {
-      p_company_id: companyId,
+      p_connection: scope.books!.connectionId,
+      p_company_id: scope.companyId,
       p_start:      query.startDate || null,
       p_end:        query.endDate || null,
       p_nit:        (query.customerNit && normalizeNit(query.customerNit)) || null,
@@ -445,8 +450,9 @@ export class SiigoCollectionsService {
     }
   }
 
-  private static async fetchReport(args: CollectionFilterArgs, includeCustomers: boolean): Promise<CollectionReport> {
-    const { data, error } = await supabase.rpc('siigo_collection_report', { ...args, p_include_customers: includeCustomers })
+  /** El dueño de los libros siempre ve el desglose por cliente de SUS libros */
+  private static async fetchReport(args: CollectionFilterArgs): Promise<CollectionReport> {
+    const { data, error } = await supabase.rpc('siigo_collection_report', { ...args, p_include_customers: true })
     if (error) throw new Error(`No se pudo calcular el resumen de recaudo: ${error.message}`)
     return data as CollectionReport
   }
@@ -485,18 +491,20 @@ export class SiigoCollectionsService {
     const scope = await SiigoService.resolveScope(query, user)
     const page = query.page || 1
     const limit = query.limit || 50
-    const { logs, isSyncRunning } = await this.getSyncLogs()
+    const { logs, isSyncRunning } = scope.books
+      ? await this.getSyncLogs(scope.books.connectionId)
+      : { logs: [], isSyncRunning: false }
 
     let rows: CollectionLine[] = []
     let total = 0
     let report = EMPTY_REPORT
 
     if (!scope.denied) {
-      const args = this.filterArgs(scope.companyId, query)
+      const args = this.filterArgs(scope, query)
       const from = (page - 1) * limit
       const [pageResult, reportResult] = await Promise.all([
         this.fetchPage(args, from, from + limit - 1, true),
-        this.fetchReport(args, scope.isInternal),
+        this.fetchReport(args),
       ])
       rows = pageResult.rows
       report = reportResult
@@ -508,6 +516,8 @@ export class SiigoCollectionsService {
       total,
       page,
       limit,
+      books: scope.books,
+      notConnected: scope.notConnected,
       clientCompany: scope.clientCompany,
       isSyncRunning,
       lastSync: logs[0] ?? null,
@@ -521,9 +531,11 @@ export class SiigoCollectionsService {
   /** Solo agregados de recaudo (pestaña de gráficas) */
   static async getReport(query: ListSiigoCollectionsQuery, user: AuthUser) {
     const scope = await SiigoService.resolveScope(query, user)
-    const report = scope.denied ? EMPTY_REPORT : await this.fetchReport(this.filterArgs(scope.companyId, query), scope.isInternal)
-    const { logs } = await this.getSyncLogs()
+    const report = scope.denied ? EMPTY_REPORT : await this.fetchReport(this.filterArgs(scope, query))
+    const { logs } = scope.books ? await this.getSyncLogs(scope.books.connectionId) : { logs: [] }
     return {
+      books:         scope.books,
+      notConnected:  scope.notConnected,
       clientCompany: scope.clientCompany,
       lastSync:      logs[0] ?? null,
       summary:       this.toSummary(report.summary),

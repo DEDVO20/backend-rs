@@ -1,9 +1,10 @@
 import { supabase } from '../../lib/supabase.js'
 import { logger } from '../../lib/logger.js'
 import { normalizeNit } from '../participations/participations.domain.js'
-import { SIIGO_CONFIG, validateSiigoConfig } from './siigo.config.js'
+import { SIIGO_CONFIG } from './siigo.config.js'
 import { matchCompanyByNit, sleep } from './siigo.helpers.js'
-import { SiigoApiClient } from './siigo.client.js'
+import type { SiigoApiClient } from './siigo.client.js'
+import { SiigoConnections } from './siigo.connections.js'
 import { SiigoService } from './siigo.service.js'
 import {
   MESES,
@@ -23,6 +24,7 @@ type Obj = Record<string, any>
 
 export interface TrialBalanceSyncLog {
   id: string
+  connection_id: string
   started_at: string
   finished_at: string | null
   status: 'running' | 'completed' | 'failed'
@@ -68,10 +70,11 @@ function fileUrlOf(resp: unknown): string {
 }
 
 export class SiigoTrialBalanceService {
-  private static isSyncRunning = false
+  /** Conexiones con una importación del balance en curso */
+  private static runningSyncs = new Set<string>()
 
-  static get running(): boolean {
-    return this.isSyncRunning
+  static isRunning(connectionId: string): boolean {
+    return this.runningSyncs.has(connectionId)
   }
 
   /** Último mes a importar del año (mes actual si es el año en curso) */
@@ -84,6 +87,7 @@ export class SiigoTrialBalanceService {
 
   /** Importa un mes: genera el reporte, descarga el XLSX y reemplaza el mes completo */
   private static async importPeriod(
+    connectionId: string,
     api: SiigoApiClient,
     companies: Awaited<ReturnType<typeof SiigoService.loadCompanies>>,
     year: number,
@@ -115,12 +119,17 @@ export class SiigoTrialBalanceService {
         return { ...l, normalized_nit: normalizeNit(l.identification), company_id: company?.id ?? null }
       })
 
-      const { data, error } = await supabase.rpc('siigo_replace_trial_balance_period', { p_period: per, p_lines: rows })
+      const { data, error } = await supabase.rpc('siigo_replace_trial_balance_period', {
+        p_connection: connectionId,
+        p_period:     per,
+        p_lines:      rows,
+      })
       if (error) throw new Error(`No se pudo guardar el balance de ${per}: ${error.message}`)
 
       const count = Number(data ?? rows.length)
       const now = new Date().toISOString()
       await supabase.from('siigo_trial_balance_periods').upsert({
+        connection_id:   connectionId,
         period:          per,
         status:          'OK',
         rows_count:      count,
@@ -129,17 +138,18 @@ export class SiigoTrialBalanceService {
         last_success_at: now,
         detail:          `Actualizado correctamente. Rango: ${MESES[month - 1]} a ${MESES[month - 1]}`,
         diagnostics,
-      })
+      }, { onConflict: 'connection_id,period' })
       return count
     } catch (err: any) {
       // Se conservan los datos anteriores del mes; solo se registra el error
       await supabase.from('siigo_trial_balance_periods').upsert({
+        connection_id:   connectionId,
         period:          per,
         status:          'ERROR',
         last_attempt_at: new Date().toISOString(),
         detail:          String(err?.message ?? err).slice(0, 2000),
         diagnostics,
-      })
+      }, { onConflict: 'connection_id,period' })
       throw err
     }
   }
@@ -150,11 +160,11 @@ export class SiigoTrialBalanceService {
    * - mode 'year': de enero al mes actual (o diciembre si es un año cerrado).
    */
   static async syncFromSiigo(input: SyncTrialBalanceBody = { mode: 'current' }, triggeredBy?: string): Promise<TrialBalanceSyncLog> {
-    if (this.isSyncRunning) {
-      throw Object.assign(new Error('Ya hay una importación del balance de prueba en curso.'), { statusCode: 409 })
+    const conn = await SiigoService.connectionFor(input.connectionId)
+    if (this.runningSyncs.has(conn.id)) {
+      throw Object.assign(new Error(`Ya hay una importación del balance de prueba en curso para ${conn.label}.`), { statusCode: 409 })
     }
-    const configErrors = validateSiigoConfig()
-    if (configErrors.length) throw Object.assign(new Error(configErrors.join('. ')), { statusCode: 400 })
+    const api = SiigoConnections.client(conn)
 
     const today = todayBogota()
     const year = input.year ?? Number(today.slice(0, 4))
@@ -166,9 +176,8 @@ export class SiigoTrialBalanceService {
     const details: Record<string, string> = {}
     let monthsOk = 0
     let rows = 0
-    this.isSyncRunning = true
+    this.runningSyncs.add(conn.id)
 
-    const api = new SiigoApiClient()
     try {
       await api.getAccessToken()
       const companies = await SiigoService.loadCompanies()
@@ -176,7 +185,7 @@ export class SiigoTrialBalanceService {
       for (const month of months) {
         const per = periodo(year, month)
         try {
-          const count = await this.importPeriod(api, companies, year, month, today)
+          const count = await this.importPeriod(conn.id, api, companies, year, month, today)
           rows += count
           monthsOk++
           details[per] = `OK · ${count} filas`
@@ -189,6 +198,7 @@ export class SiigoTrialBalanceService {
       const failed = months.length - monthsOk
       const log: TrialBalanceSyncLog = {
         id:                  crypto.randomUUID(),
+        connection_id:       conn.id,
         started_at:          new Date(startTime).toISOString(),
         finished_at:         new Date().toISOString(),
         status:              monthsOk > 0 ? 'completed' : 'failed',
@@ -208,6 +218,7 @@ export class SiigoTrialBalanceService {
     } catch (err: any) {
       await this.saveSyncLog({
         id:                  crypto.randomUUID(),
+        connection_id:       conn.id,
         started_at:          new Date(startTime).toISOString(),
         finished_at:         new Date().toISOString(),
         status:              'failed',
@@ -224,7 +235,7 @@ export class SiigoTrialBalanceService {
       })
       throw err
     } finally {
-      this.isSyncRunning = false
+      this.runningSyncs.delete(conn.id)
     }
   }
 
@@ -233,27 +244,36 @@ export class SiigoTrialBalanceService {
     if (error) logger.warn({ err: error.message }, 'No se pudo guardar el log del balance de prueba')
   }
 
-  static async getSyncLogs(): Promise<{ isSyncRunning: boolean; logs: TrialBalanceSyncLog[] }> {
+  static async getSyncLogs(connectionId: string): Promise<{ isSyncRunning: boolean; logs: TrialBalanceSyncLog[] }> {
     const { data, error } = await supabase
       .from('siigo_trial_balance_sync_logs')
       .select('*')
+      .eq('connection_id', connectionId)
       .order('started_at', { ascending: false })
       .limit(20)
     if (error) throw new Error(`No se pudieron consultar los logs del balance de prueba: ${error.message}`)
-    return { isSyncRunning: this.isSyncRunning, logs: (data ?? []) as TrialBalanceSyncLog[] }
+    return { isSyncRunning: this.isRunning(connectionId), logs: (data ?? []) as TrialBalanceSyncLog[] }
   }
 
   /**
-   * Series para las gráficas del balance. Los clientes solo ven las filas donde su empresa
-   * es el tercero; los internos ven el balance global o el de una empresa (companyId).
+   * Series para las gráficas del balance de los libros consultados.
+   * - 'global': el balance completo del dueño de los libros (lo que ve un cliente de su empresa).
+   * - 'company': solo internos, las cuentas de un tercero dentro de esos libros (p. ej. un cliente en los libros de Finto).
    */
   static async getChartsReport(query: ListSiigoCollectionsQuery, user: AuthUser) {
     const scope = await SiigoService.resolveScope(query, user)
-    const { logs } = await this.getSyncLogs()
-    const base = { scope: scope.companyId ? 'company' : 'global', clientCompany: scope.clientCompany, lastSync: logs[0] ?? null }
+    const { logs } = scope.books ? await this.getSyncLogs(scope.books.connectionId) : { logs: [] }
+    const base = {
+      scope:         scope.companyId ? 'company' : 'global',
+      books:         scope.books,
+      notConnected:  scope.notConnected,
+      clientCompany: scope.clientCompany,
+      lastSync:      logs[0] ?? null,
+    }
     if (scope.denied) return { ...base, latestPeriod: null, monthly: [], byAccount: [], topCartera: [] }
 
     const { data, error } = await supabase.rpc('siigo_trial_balance_series', {
+      p_connection: scope.books!.connectionId,
       p_from:       query.startDate?.slice(0, 7) ?? null,
       p_to:         query.endDate?.slice(0, 7) ?? null,
       p_company_id: scope.companyId,
@@ -269,23 +289,31 @@ export class SiigoTrialBalanceService {
     }
   }
 
-  /** Consulta de un mes: filas paginadas, totales por clase, cuadre y control de periodos */
-  static async list(query: ListTrialBalanceQuery) {
+  /** Consulta de un mes de los libros consultados: filas paginadas, totales por clase, cuadre y control de periodos */
+  static async list(query: ListTrialBalanceQuery, user: AuthUser) {
+    const scope = await SiigoService.resolveScope(query, user)
+    const empty = { data: [], total: 0, page: 1, limit: query.limit, totals: null, byClass: [] }
+    if (scope.denied || !scope.books) {
+      return { period: null, periods: [], isSyncRunning: false, lastSync: null, books: null, notConnected: scope.notConnected, ...empty }
+    }
+    const connectionId = scope.books.connectionId
+
     const [{ data: periods, error: pErr }, { logs, isSyncRunning }] = await Promise.all([
-      supabase.from('siigo_trial_balance_periods').select('*').order('period', { ascending: false }),
-      this.getSyncLogs(),
+      supabase.from('siigo_trial_balance_periods').select('*').eq('connection_id', connectionId).order('period', { ascending: false }),
+      this.getSyncLogs(connectionId),
     ])
     if (pErr) throw new Error(`No se pudo consultar el control de periodos: ${pErr.message}`)
 
     // Por defecto, el último mes importado correctamente
     const period = query.period ?? periods?.find(p => p.status === 'OK' || p.last_success_at)?.period ?? null
-    const base = { period, periods: periods ?? [], isSyncRunning, lastSync: logs[0] ?? null }
-    if (!period) return { ...base, data: [], total: 0, page: 1, limit: query.limit, totals: null, byClass: [] }
+    const base = { period, periods: periods ?? [], isSyncRunning, lastSync: logs[0] ?? null, books: scope.books, notConnected: false }
+    if (!period) return { ...base, ...empty }
 
     const args = {
+      p_connection: connectionId,
       p_period:     period,
       p_account:    query.account?.replace(/\D/g, '') || null,
-      p_company_id: query.companyId ?? null,
+      p_company_id: scope.companyId,
       p_search:     query.search?.trim() || null,
     }
     const from = (query.page - 1) * query.limit

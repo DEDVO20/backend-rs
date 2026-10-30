@@ -1,5 +1,5 @@
 import { SIIGO_CONFIG } from './siigo.config.js'
-import { getCachedSiigoToken, setCachedSiigoToken, siigoCatalogCache } from './siigo.cache.js'
+import { clearCachedSiigoToken, getCachedSiigoToken, getCatalogCache, setCachedSiigoToken } from './siigo.cache.js'
 import {
   sleep,
   buildQueryString,
@@ -39,31 +39,46 @@ function invoiceMatchesReference(f: Record<string, any>, ref: string): boolean {
   return posibles.some(x => x && compactRef(x) === target)
 }
 
+/** Credenciales de una cuenta de Siigo (una por conexión) */
+export interface SiigoCredentials {
+  connectionId: string
+  isPlatform: boolean
+  username: string
+  accessKey: string
+  partnerId: string
+}
+
 export class SiigoApiClient implements SiigoCatalogLookup {
   private token: string | null = null
   public urlFetchCount = 0
   /** Tope de peticiones por ejecución para proteger la cuota de Siigo */
   public maxRequests = Number.POSITIVE_INFINITY
+  /** Catálogos (clientes / productos) de esta cuenta de Siigo */
+  readonly catalog: ReturnType<typeof getCatalogCache>
+
+  constructor(private creds: SiigoCredentials) {
+    this.catalog = getCatalogCache(creds.connectionId, creds.isPlatform)
+  }
 
   async getAccessToken(): Promise<string> {
     if (this.token) return this.token
 
-    const cached = await getCachedSiigoToken()
+    const cached = await getCachedSiigoToken(this.creds.connectionId)
     if (cached) {
       this.token = cached
       return this.token
     }
 
-    logger.info('Solicitando nuevo token a Siigo API...')
+    logger.info({ connectionId: this.creds.connectionId }, 'Solicitando nuevo token a Siigo API...')
     const resp = await this._fetchDirect(SIIGO_CONFIG.TOKEN_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Partner-Id': SIIGO_CONFIG.PARTNER_ID,
+        'Partner-Id': this.creds.partnerId,
       },
       body: JSON.stringify({
-        username:   SIIGO_CONFIG.USERNAME,
-        access_key: SIIGO_CONFIG.ACCESS_KEY,
+        username:   this.creds.username,
+        access_key: this.creds.accessKey,
       }),
     })
 
@@ -78,8 +93,14 @@ export class SiigoApiClient implements SiigoCatalogLookup {
     }
 
     this.token = data.access_token
-    await setCachedSiigoToken(this.token)
+    await setCachedSiigoToken(this.creds.connectionId, this.token)
     return this.token
+  }
+
+  /** Descarta el token (vencido o revocado) para pedir uno nuevo en la siguiente petición */
+  private async _resetToken() {
+    this.token = null
+    await clearCachedSiigoToken(this.creds.connectionId)
   }
 
   private async _fetchDirect(url: string, options?: RequestInit): Promise<Response> {
@@ -93,19 +114,28 @@ export class SiigoApiClient implements SiigoCatalogLookup {
   async fetchWithRetry(url: string, options: RequestInit = {}): Promise<any> {
     const maxTries = 8
     let waitMs = 3000
-    const token = await this.getAccessToken()
+    let tokenRenewed = false
 
-    const headers: Record<string, string> = {
+    const buildHeaders = (token: string): Record<string, string> => ({
       'Authorization': `Bearer ${token}`,
       'Content-Type':  'application/json',
-      'Partner-Id':    SIIGO_CONFIG.PARTNER_ID,
+      'Partner-Id':    this.creds.partnerId,
       ...((options.headers as Record<string, string>) || {}),
-    }
+    })
+    let headers = buildHeaders(await this.getAccessToken())
 
     for (let i = 1; i <= maxTries; i++) {
       try {
         const resp = await this._fetchDirect(url, { ...options, headers })
         const bodyText = await resp.text()
+
+        // Token vencido o revocado (p. ej. caché de 50 min desfasada): se renueva una sola vez
+        if (resp.status === 401 && !tokenRenewed) {
+          tokenRenewed = true
+          await this._resetToken()
+          headers = buildHeaders(await this.getAccessToken())
+          continue
+        }
 
         if (resp.status === 429) {
           const waitSecs = this._extractWaitSecondsFrom429(bodyText)
@@ -162,7 +192,7 @@ export class SiigoApiClient implements SiigoCatalogLookup {
     startDate: string,
     endDate: string,
     docTypeName = 'documentos',
-    sellerFilter: string = SIIGO_CONFIG.SELLER_ID_FILTER,
+    sellerFilter = '',
   ): Promise<{ ids: string[]; excluded: { id: string; comprobante: string }[] }> {
     const ids: string[] = []
     // Documentos anulados/borrador: sus líneas previas deben eliminarse al re-sincronizar
@@ -291,11 +321,11 @@ export class SiigoApiClient implements SiigoCatalogLookup {
 
   async getCustomerName(customerKey: string, sucursal: string): Promise<string> {
     const cacheKey = `${customerKey}|${String(sucursal || '')}`
-    const cached = await siigoCatalogCache.getCustomer(cacheKey)
+    const cached = await this.catalog.getCustomer(cacheKey)
     if (cached !== undefined && cached !== '') {
       return cached
     }
-    const cachedNoBranch = await siigoCatalogCache.getCustomer(`${customerKey}|`)
+    const cachedNoBranch = await this.catalog.getCustomer(`${customerKey}|`)
     if (cachedNoBranch !== undefined && cachedNoBranch !== '') {
       return cachedNoBranch
     }
@@ -340,7 +370,7 @@ export class SiigoApiClient implements SiigoCatalogLookup {
     }
 
     if (name) {
-      await siigoCatalogCache.setCustomer(cacheKey, name)
+      await this.catalog.setCustomer(cacheKey, name)
     }
     return name || ''
   }
@@ -351,11 +381,11 @@ export class SiigoApiClient implements SiigoCatalogLookup {
     const cacheKey = productId ? `ID:${productId}` : `COD:${codigo}`
 
     if (cacheKey) {
-      const cached = await siigoCatalogCache.getProduct(cacheKey)
+      const cached = await this.catalog.getProduct(cacheKey)
       if (cached !== undefined && cached !== '') return cached
     }
     if (codigo) {
-      const cachedByCode = await siigoCatalogCache.getProduct(`COD:${codigo}`)
+      const cachedByCode = await this.catalog.getProduct(`COD:${codigo}`)
       if (cachedByCode !== undefined && cachedByCode !== '') return cachedByCode
     }
 
@@ -404,7 +434,7 @@ export class SiigoApiClient implements SiigoCatalogLookup {
     }
 
     if (cacheKey) {
-      await siigoCatalogCache.setProduct(cacheKey, desc)
+      await this.catalog.setProduct(cacheKey, desc)
     }
 
     return desc

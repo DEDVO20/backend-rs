@@ -5,9 +5,10 @@ import { supabase } from '../../lib/supabase.js'
 import { logger } from '../../lib/logger.js'
 import { SIIGO_CONFIG } from './siigo.config.js'
 
-const TOKEN_REDIS_KEY = 'siigo:auth:token'
+const TOKEN_REDIS_PREFIX = 'siigo:auth:token:'
 const TOKEN_TTL_SECONDS = 50 * 60 // 50 minutos
 
+/** Caché de nombres de clientes y descripciones de productos de UNA cuenta de Siigo */
 class SiigoCatalogMemoryCache {
   private customerMap = new Map<string, string>()
   private productMap = new Map<string, string>()
@@ -15,47 +16,36 @@ class SiigoCatalogMemoryCache {
   private dirtyProducts = new Map<string, string>()
   private initialized = false
 
+  constructor(private connectionId: string, private seedFromLegacy: boolean) {}
+
   async init(): Promise<void> {
     if (this.initialized) return
     this.initialized = true
 
-    // 1. Cargar semilla inicial desde la carpeta legacy "consultas sigo/cache" si existe
-    try {
-      const legacyCustomersFile = path.join(SIIGO_CONFIG.LEGACY_DIR, 'cache', 'customers.json')
-      if (fs.existsSync(legacyCustomersFile)) {
-        const raw = JSON.parse(fs.readFileSync(legacyCustomersFile, 'utf-8')) as Record<string, string>
-        for (const [k, v] of Object.entries(raw)) {
-          if (v) this.customerMap.set(k, v)
+    // 1. Semilla legacy "consultas sigo/cache" (solo la cuenta de Finto)
+    if (this.seedFromLegacy) {
+      try {
+        for (const [file, map] of [['customers.json', this.customerMap], ['products.json', this.productMap]] as const) {
+          const full = path.join(SIIGO_CONFIG.LEGACY_DIR, 'cache', file)
+          if (!fs.existsSync(full)) continue
+          const raw = JSON.parse(fs.readFileSync(full, 'utf-8')) as Record<string, string>
+          for (const [k, v] of Object.entries(raw)) if (v) map.set(k, v)
         }
+      } catch (err: any) {
+        logger.debug({ err: err.message }, 'No se pudo leer caché legacy de consultas sigo')
       }
-      const legacyProductsFile = path.join(SIIGO_CONFIG.LEGACY_DIR, 'cache', 'products.json')
-      if (fs.existsSync(legacyProductsFile)) {
-        const raw = JSON.parse(fs.readFileSync(legacyProductsFile, 'utf-8')) as Record<string, string>
-        for (const [k, v] of Object.entries(raw)) {
-          if (v) this.productMap.set(k, v)
-        }
-      }
-    } catch (err: any) {
-      logger.debug({ err: err.message }, 'No se pudo leer caché legacy de consultas sigo')
     }
 
-    // 2. Cargar desde Supabase (siigo_catalog_cache) si la tabla está disponible
-    try {
-      const { data, error } = await supabase
-        .from('siigo_catalog_cache')
-        .select('cache_type, cache_key, value')
-
-      if (!error && Array.isArray(data)) {
-        for (const row of data) {
-          if (row.cache_type === 'customer') {
-            this.customerMap.set(row.cache_key, row.value)
-          } else if (row.cache_type === 'product') {
-            this.productMap.set(row.cache_key, row.value)
-          }
-        }
+    // 2. Caché persistida de esta conexión
+    const { data, error } = await supabase
+      .from('siigo_catalog_cache')
+      .select('cache_type, cache_key, value')
+      .eq('connection_id', this.connectionId)
+    if (!error) {
+      for (const row of data ?? []) {
+        if (row.cache_type === 'customer') this.customerMap.set(row.cache_key, row.value)
+        else if (row.cache_type === 'product') this.productMap.set(row.cache_key, row.value)
       }
-    } catch {
-      // Ignorar si la tabla aún no existe
     }
   }
 
@@ -82,53 +72,58 @@ class SiigoCatalogMemoryCache {
   }
 
   getStats() {
-    return {
-      customersCount: this.customerMap.size,
-      productsCount:  this.productMap.size,
-    }
+    return { customersCount: this.customerMap.size, productsCount: this.productMap.size }
   }
 
   async flushToDatabase(): Promise<void> {
-    const rows: { cache_type: 'customer' | 'product'; cache_key: string; value: string; updated_at: string }[] = []
     const now = new Date().toISOString()
-
-    for (const [k, v] of this.dirtyCustomers.entries()) {
-      rows.push({ cache_type: 'customer', cache_key: k, value: v, updated_at: now })
-    }
-    for (const [k, v] of this.dirtyProducts.entries()) {
-      rows.push({ cache_type: 'product', cache_key: k, value: v, updated_at: now })
-    }
+    const rows = [
+      ...[...this.dirtyCustomers].map(([k, v]) => ({ cache_type: 'customer', cache_key: k, value: v })),
+      ...[...this.dirtyProducts].map(([k, v]) => ({ cache_type: 'product', cache_key: k, value: v })),
+    ].map(r => ({ ...r, connection_id: this.connectionId, updated_at: now }))
 
     this.dirtyCustomers.clear()
     this.dirtyProducts.clear()
-
     if (!rows.length) return
 
-    try {
-      await supabase
-        .from('siigo_catalog_cache')
-        .upsert(rows, { onConflict: 'cache_type,cache_key' })
-    } catch (err: any) {
-      logger.warn({ err: err.message }, 'No se pudo persistir siigo_catalog_cache en Supabase')
-    }
+    const { error } = await supabase
+      .from('siigo_catalog_cache')
+      .upsert(rows, { onConflict: 'connection_id,cache_type,cache_key' })
+    if (error) logger.warn({ err: error.message }, 'No se pudo persistir siigo_catalog_cache en Supabase')
   }
 }
 
-export const siigoCatalogCache = new SiigoCatalogMemoryCache()
+const catalogs = new Map<string, SiigoCatalogMemoryCache>()
 
-export async function getCachedSiigoToken(): Promise<string | null> {
+/** Caché de catálogos de una conexión (cada cuenta de Siigo tiene sus propios clientes y productos) */
+export function getCatalogCache(connectionId: string, isPlatform: boolean): SiigoCatalogMemoryCache {
+  let cache = catalogs.get(connectionId)
+  if (!cache) {
+    cache = new SiigoCatalogMemoryCache(connectionId, isPlatform)
+    catalogs.set(connectionId, cache)
+  }
+  return cache
+}
+
+export async function getCachedSiigoToken(connectionId: string): Promise<string | null> {
   try {
-    const token = await redis.get(TOKEN_REDIS_KEY)
-    if (token) return token
+    return (await redis.get(TOKEN_REDIS_PREFIX + connectionId)) || null
   } catch {
-    // Fallback si Redis falla
+    return null // Fallback si Redis falla
   }
-  return null
 }
 
-export async function setCachedSiigoToken(token: string): Promise<void> {
+export async function setCachedSiigoToken(connectionId: string, token: string): Promise<void> {
   try {
-    await redis.set(TOKEN_REDIS_KEY, token, 'EX', TOKEN_TTL_SECONDS)
+    await redis.set(TOKEN_REDIS_PREFIX + connectionId, token, 'EX', TOKEN_TTL_SECONDS)
+  } catch {
+    // Ignorar error de Redis
+  }
+}
+
+export async function clearCachedSiigoToken(connectionId: string): Promise<void> {
+  try {
+    await redis.del(TOKEN_REDIS_PREFIX + connectionId)
   } catch {
     // Ignorar error de Redis
   }

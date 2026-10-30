@@ -28,6 +28,39 @@ async function logCronExecution(jobName: string, status: string, result: Record<
   }
 }
 
+/**
+ * Ejecuta una sincronización de Siigo para cada cuenta conectada (Finto y empresas), una tras otra.
+ * Un fallo en una cuenta no detiene las demás; el job falla solo si fallaron todas.
+ */
+async function forEachSiigoConnection(
+  label: string,
+  run: (connectionId: string) => Promise<Record<string, unknown>>,
+): Promise<Record<string, unknown>> {
+  const { SiigoConnections } = await import('../modules/siigo/siigo.connections.js')
+  const targets = await SiigoConnections.syncTargets()
+  if (!targets.length) return { skipped: true, reason: 'No hay conexiones de Siigo activas con credenciales' }
+
+  const results: Record<string, unknown> = {}
+  let failed = 0
+  for (const conn of targets) {
+    try {
+      results[conn.label] = await run(conn.id)
+    } catch (err: any) {
+      // Una sync manual en curso no es un fallo del cron
+      if (err?.statusCode === 409) {
+        results[conn.label] = { skipped: true, reason: err.message }
+        continue
+      }
+      failed++
+      results[conn.label] = { error: err.message }
+      logger.error({ connection: conn.label, err: err.message }, `Cron: ${label} de Siigo fallido`)
+    }
+  }
+  logger.info({ results }, `Cron: ${label} de Siigo procesado en ${targets.length} cuenta(s)`)
+  if (failed === targets.length) throw new Error(`${label} de Siigo falló en todas las cuentas`)
+  return results
+}
+
 async function processJob(jobName: string) {
   const TasksService = await getTasksService()
   const supabase     = await getSupabase()
@@ -88,73 +121,29 @@ async function processJob(jobName: string) {
 
       case 'siigo-daily-sync': {
         const { SiigoService } = await import('../modules/siigo/siigo.service.js')
-        const { validateSiigoConfig } = await import('../modules/siigo/siigo.config.js')
-        const configErrors = validateSiigoConfig()
-        if (configErrors.length > 0) {
-          result = { skipped: true, reason: configErrors.join('. ') }
-          logger.warn({ result }, 'Cron: sync Siigo omitida por configuración incompleta')
-          break
-        }
-        try {
-          const log = await SiigoService.syncFromSiigo({ mode: 'incremental', days: 15 })
-          result = {
-            start_date:         log.start_date,
-            end_date:           log.end_date,
-            invoices_count:     log.invoices_count,
-            credit_notes_count: log.credit_notes_count,
-            lines_count:        log.lines_count,
-          }
-          logger.info({ result }, 'Cron: sync incremental de Siigo completada')
-        } catch (err: any) {
-          // Una sync manual en curso no es un fallo del cron
-          if (err?.statusCode !== 409) throw err
-          result = { skipped: true, reason: err.message }
-        }
+        result = await forEachSiigoConnection('facturación', async id => {
+          const log = await SiigoService.syncFromSiigo({ connectionId: id, mode: 'incremental', days: 15 })
+          return { start_date: log.start_date, end_date: log.end_date, invoices: log.invoices_count, credit_notes: log.credit_notes_count, lines: log.lines_count }
+        })
         break
       }
 
       case 'siigo-daily-collections': {
         const { SiigoCollectionsService } = await import('../modules/siigo/siigo.collections.service.js')
-        const { validateSiigoConfig } = await import('../modules/siigo/siigo.config.js')
-        const configErrors = validateSiigoConfig()
-        if (configErrors.length > 0) {
-          result = { skipped: true, reason: configErrors.join('. ') }
-          break
-        }
-        try {
-          const log = await SiigoCollectionsService.syncFromSiigo()
-          result = {
-            start_date:     log.start_date,
-            end_date:       log.end_date,
-            vouchers_count: log.vouchers_count,
-            lines_count:    log.lines_count,
-            total_applied:  log.total_applied,
-          }
-          logger.info({ result }, 'Cron: recaudo Siigo actualizado')
-        } catch (err: any) {
-          if (err?.statusCode !== 409) throw err
-          result = { skipped: true, reason: err.message }
-        }
+        result = await forEachSiigoConnection('recaudo', async id => {
+          const log = await SiigoCollectionsService.syncFromSiigo({ connectionId: id })
+          return { start_date: log.start_date, end_date: log.end_date, vouchers: log.vouchers_count, lines: log.lines_count, total_applied: log.total_applied }
+        })
         break
       }
 
       case 'siigo-daily-trial-balance': {
         const { SiigoTrialBalanceService } = await import('../modules/siigo/siigo.trialBalance.service.js')
-        const { validateSiigoConfig } = await import('../modules/siigo/siigo.config.js')
-        const configErrors = validateSiigoConfig()
-        if (configErrors.length > 0) {
-          result = { skipped: true, reason: configErrors.join('. ') }
-          break
-        }
-        try {
-          const log = await SiigoTrialBalanceService.syncFromSiigo({ mode: 'current' })
-          result = { year: log.year, months_ok: log.months_ok, months_failed: log.months_failed, rows_count: log.rows_count }
+        result = await forEachSiigoConnection('balance de prueba', async id => {
+          const log = await SiigoTrialBalanceService.syncFromSiigo({ connectionId: id, mode: 'current' })
           if (log.status === 'failed') throw new Error(log.error_message ?? 'Balance de prueba no importado')
-          logger.info({ result }, 'Cron: balance de prueba del mes actual actualizado')
-        } catch (err: any) {
-          if (err?.statusCode !== 409) throw err
-          result = { skipped: true, reason: err.message }
-        }
+          return { year: log.year, months_ok: log.months_ok, months_failed: log.months_failed, rows: log.rows_count }
+        })
         break
       }
 
