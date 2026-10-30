@@ -847,6 +847,12 @@ export function currentRateStart(rates: ParticipationRate[]): string | null {
   return list[i]!.from
 }
 
+/** Comisión de una OC de mandato: el % de su mes (0–100); sin él, la general (0–1). */
+export function mandateCommissionRate(percentage: number | null | undefined, generalRate: number): number {
+  const pct = Number(percentage ?? 0)
+  return pct > 0 ? pct / 100 : generalRate
+}
+
 /** Mes del servicio de una FV: en facturación vencida, el mes anterior a la FV. */
 export function servicePeriod(isoDate: string, billingMode: BillingMode): string {
   const month = isoDate.slice(0, 7)

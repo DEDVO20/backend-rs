@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { servicePeriod, rescaleParticipation, rateAt, currentRateStart } from '../src/modules/participations/participations.domain.js'
+import { servicePeriod, rescaleParticipation, rateAt, currentRateStart, mandateCommissionRate } from '../src/modules/participations/participations.domain.js'
 import {
   calcParticipation,
   availableParticipation,
@@ -814,6 +814,11 @@ describe('% vigente por mes del servicio', () => {
     ])).toBe('2026-08-01')
     expect(currentRateStart(rates)).toBe('2026-08-01')
     expect(currentRateStart([])).toBeNull()
+  })
+  it('la comisión de mandato usa el % del mes de la OC; sin él, la general', () => {
+    expect(mandateCommissionRate(15, 0.2)).toBe(0.15)
+    expect(mandateCommissionRate(0, 0.2)).toBe(0.2)
+    expect(mandateCommissionRate(null, 0.2)).toBe(0.2)
   })
   it('reescala lo causado al nuevo % y no adivina sin % original', () => {
     expect(rescaleParticipation(400000, 40, 30)).toBe(300000)

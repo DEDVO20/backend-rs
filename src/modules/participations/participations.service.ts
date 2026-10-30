@@ -7,7 +7,7 @@ import {
   normalizeInvoiceNumber,
   normalizeSiigoInvoice, nitMatch, normalizeNit,
   parseAccountingMovement, PARTICIPATION_ACCOUNTS, billedPeriods, emptyCollectionTaxes, planMoneyDocs, addMonths,
-  rateAt, monthStart, servicePeriod, rescaleParticipation, currentRateStart,
+  rateAt, monthStart, servicePeriod, rescaleParticipation, currentRateStart, mandateCommissionRate,
 } from './participations.domain.js'
 import type { ParticipationAccounts, MovCollection, CollectionTaxes, ParticipationRate } from './participations.domain.js'
 import { computeOperation, partitionInvoice } from '../tax/tax.domain.js'
@@ -128,7 +128,7 @@ export class ParticipationsService {
     }
 
     // Solo porcentaje (ya no se maneja valor fijo). En mandato el % es la
-    // comisión (informativa); acepta undefined → 0.
+    // comisión de la firma; acepta undefined → 0 (usa la comisión general).
     const pct = input.percentage ?? 0
     const { data, error } = await supabase
       .from('service_participations')
@@ -177,7 +177,7 @@ export class ParticipationsService {
    */
   static async recordRate(participationId: string, pct: number, startDate: string, validFrom?: string | null) {
     // Qué pasó con las OC, para explicarlo al guardar
-    const out = { updated: 0, manual: 0, no_base: 0, reason: null as 'mandato' | 'single_rate' | null }
+    const out = { updated: 0, manual: 0, no_base: 0, reason: null as 'single_rate' | null }
     try {
       const { data: rates, error } = await supabase
         .from('participation_rates')
@@ -199,15 +199,15 @@ export class ParticipationsService {
       const updated = isNewRate
         ? [...list.filter((r: any) => String(r.valid_from).slice(0, 10) !== from), { percentage: pct, valid_from: from }]
         : list
-      const recalcFrom = validFrom || isNewRate ? from : list.length > 1 ? currentRateStart(list) : null
-      if (!recalcFrom) return { ...out, reason: 'single_rate' as const }
-
       const { data: part } = await supabase
         .from('service_participations')
         .select('contract_type, company_service:company_services(service_value)')
         .eq('id', participationId)
         .maybeSingle()
-      if ((part as any)?.contract_type === 'mandato') return { ...out, reason: 'mandato' as const }
+      const isMandate = (part as any)?.contract_type === 'mandato'
+      const recalcFrom = validFrom || isNewRate ? from : list.length > 1 || isMandate ? currentRateStart(list) : null
+      if (!recalcFrom) return { ...out, reason: 'single_rate' as const }
+
       const cs = Array.isArray((part as any)?.company_service) ? (part as any).company_service[0] : (part as any)?.company_service
       const serviceValue = Number(cs?.service_value ?? 0)
       const { data: ocs } = await supabase
@@ -218,6 +218,13 @@ export class ParticipationsService {
       for (const oc of ocs ?? []) {
         const p = rateAt(updated, monthStart(oc.period), pct)
         if (Number((oc as any).percentage ?? 0) === p) continue
+        // Mandato: el valor viene del informe; el % de la OC es su comisión del mes
+        if (isMandate) {
+          await supabase.from('invoice_participations')
+            .update({ percentage: p, updated_at: new Date().toISOString() }).eq('id', oc.id)
+          out.updated++
+          continue
+        }
         if ((oc as any).participation_value_manual) { out.manual++; continue }   // corregida a mano
         // Sin FV: valor del servicio × %. Con FV: se escala lo causado (conserva
         // notas crédito y el reparto de una FV entre varias OC).
@@ -570,7 +577,7 @@ export class ParticipationsService {
    * contratos de mandato; en servicio el tercero recibe su participación completa.
    */
   static computePartition(
-    row: { participation_value?: number | null; finto_invoice_value?: number | null; collected?: number | null; contract_type?: string | null; participation?: any },
+    row: { participation_value?: number | null; finto_invoice_value?: number | null; collected?: number | null; contract_type?: string | null; percentage?: number | null; participation?: any },
     profileRow: TaxProfileRow | null,
     settings: SettingsRow,
   ) {
@@ -581,16 +588,19 @@ export class ParticipationsService {
       incomeWithholding: { subject: false }, icaWithholding: { subject: false }, ivaWithholding: { subject: false },
       agentIncomeWithholding: false, agentIcaWithholding: false,
     }
+    // Mandato si lo es la OC o su configuración: las OC generadas antes de
+    // marcar el contrato como mandato conservan 'servicio' en la fila.
+    const isMandate = row.contract_type === 'mandato'
+      || (Array.isArray(row.participation) ? row.participation[0] : row.participation)?.contract_type === 'mandato'
+    const opSettings = rowToSettings(settings)
+    if (isMandate) opSettings.commissionRate = mandateCommissionRate(row.percentage, opSettings.commissionRate)
     // El receptor (Finto) actúa como agente de todas las retenciones.
     const result = computeOperation({
       invoiceValue: participation,
       emitter,
       receiver: { incomeWithholdingAgent: true, icaWithholdingAgent: true, ivaWithholdingAgent: true },
-      settings: rowToSettings(settings),
-      // Mandato si lo es la OC o su configuración: las OC generadas antes de
-      // marcar el contrato como mandato conservan 'servicio' en la fila.
-      withCommission: row.contract_type === 'mandato'
-        || (Array.isArray(row.participation) ? row.participation[0] : row.participation)?.contract_type === 'mandato',
+      settings: opSettings,
+      withCommission: isMandate,
     })
     const partition = partitionInvoice({
       result,
@@ -798,9 +808,10 @@ export class ParticipationsService {
           _fv_period:            s.iso ? s.iso.slice(0, 7) : null,
           _res:                  res,
           // Si la FV cae en una OC de otro mes, vale el % del periodo de esa OC
-          _reprice: isMandate || cfg.type === 'fixed' ? null : (period: string, w: any) => {
+          _reprice: cfg.type === 'fixed' ? null : (period: string, w: any) => {
             const p = rateAt(cfg!.rates, monthStart(period), cfg!.percentage)
             w.percentage = p
+            if (isMandate) return   // el valor viene del informe; el % es la comisión
             w.participation_value = money(net * p / 100)
             res.participation_value = w.participation_value
           },
@@ -2030,7 +2041,7 @@ export class ParticipationsService {
   static async thirdPartyOwed(ocId: string, override?: { participation_value?: number }) {
     const { data: oc } = await supabase
       .from('invoice_participations')
-      .select('id, purchase_order, participation_value, finto_invoice_value, collected, contract_type, egress_voucher_value, participation:service_participations(contract_type, third_party:third_parties(tax_profile:tax_profiles(*)))')
+      .select('id, purchase_order, participation_value, finto_invoice_value, collected, contract_type, percentage, egress_voucher_value, participation:service_participations(contract_type, third_party:third_parties(tax_profile:tax_profiles(*)))')
       .eq('id', ocId)
       .maybeSingle()
     if (!oc) throw Object.assign(new Error('OC no encontrada'), { statusCode: 404 })
@@ -3672,6 +3683,7 @@ export class ParticipationsService {
         purchase_order,
         period,
         contract_type,
+        percentage,
         finto_invoice,
         finto_invoice_date,
         finto_invoice_value,

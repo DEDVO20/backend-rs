@@ -45,7 +45,7 @@ export const upsertParticipationSchema = z.object({
   v => {
     if (!v.has_third_party) return true
     // Mandato: el monto lo aporta SIIGO (cuenta 28150601); el % es la comisión de
-    // la firma, informativa, y no se exige.
+    // la firma y no se exige (sin él se usa la comisión general).
     if (v.contract_type === 'mandato') return true
     return v.percentage !== undefined
   },
