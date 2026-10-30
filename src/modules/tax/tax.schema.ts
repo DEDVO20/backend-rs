@@ -63,6 +63,9 @@ export const computeSchema = z.object({
   // Solo mandato lleva comisión. Si no viene, con tercero se deduce de sus
   // participaciones (¿tiene algún contrato de mandato?); con perfil suelto, sí.
   contract_type:  z.enum(['servicio', 'mandato']).optional(),
+  // % de comisión de la firma (0–100) para simular. Si no viene: el del contrato
+  // de mandato del tercero (Empresas → Comisión de la firma) o, sin él, el general.
+  commission_percentage: z.number().min(0).max(100).optional(),
 }).refine(v => v.third_party_id || v.tax_profile_id, {
   message: 'Indica un tercero o un perfil tributario',
 })

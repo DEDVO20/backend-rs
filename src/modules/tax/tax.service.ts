@@ -156,8 +156,8 @@ export class TaxService {
   }
 
   // ── Cálculo de una operación ───────────────────────────────────────────────
-  static async compute(input: ComputeInput): Promise<{ profile: TaxProfileRow; result: OperationResult; contract_type: 'servicio' | 'mandato' }> {
-    const [row, settings, contractType] = await Promise.all([
+  static async compute(input: ComputeInput) {
+    const [row, settings, contractType, mandates] = await Promise.all([
       input.tax_profile_id
         ? TaxService.getProfile(input.tax_profile_id)
         : TaxService.getProfileForThirdParty(input.third_party_id!),
@@ -167,18 +167,54 @@ export class TaxService {
         : input.third_party_id
           ? TaxService.contractTypeForThirdParty(input.third_party_id)
           : Promise.resolve('mandato' as const),
+      input.third_party_id ? TaxService.mandateContracts(input.third_party_id) : Promise.resolve([]),
     ])
     const receiver: WithholdingAgent = input.receiver ?? {
       incomeWithholdingAgent: true, icaWithholdingAgent: true, ivaWithholdingAgent: true,
     }
+    // % de comisión: el escrito en la calculadora; si no, el del contrato de
+    // mandato (Empresas → Comisión de la firma); si no tiene, el general.
+    const fromContract = mandates.find(m => m.percentage > 0)
+    const commissionSource: 'manual' | 'contrato' | 'general' =
+      input.commission_percentage !== undefined ? 'manual' : fromContract ? 'contrato' : 'general'
+    const opSettings = rowToSettings(settings)
+    if (commissionSource === 'manual') opSettings.commissionRate = input.commission_percentage! / 100
+    else if (commissionSource === 'contrato') opSettings.commissionRate = fromContract!.percentage / 100
     const result = computeOperation({
       invoiceValue: input.invoice_value,
       emitter:  rowToProfile(row),
       receiver,
-      settings: rowToSettings(settings),
+      settings: opSettings,
       withCommission: contractType === 'mandato',
     })
-    return { profile: row, result, contract_type: contractType }
+    return {
+      profile: row, result, contract_type: contractType,
+      commission_percentage: money(opSettings.commissionRate * 100),
+      commission_source: commissionSource,
+      general_commission_percentage: money(Number(settings.commission_rate) * 100),
+      mandate_contracts: mandates,
+    }
+  }
+
+  /** Contratos de mandato activos del tercero con su % de comisión (Empresas). */
+  static async mandateContracts(thirdPartyId: string) {
+    const { data, error } = await supabase
+      .from('service_participations')
+      .select('id, percentage, company_service:company_services(services(name), companies(name))')
+      .eq('third_party_id', thirdPartyId)
+      .eq('contract_type', 'mandato')
+      .eq('active', true)
+    if (error) throw error
+    const one = (v: any) => Array.isArray(v) ? v[0] : v
+    return (data ?? []).map((p: any) => {
+      const cs = one(p.company_service)
+      return {
+        id: p.id as string,
+        percentage: Number(p.percentage ?? 0),
+        company: (one(cs?.companies)?.name ?? null) as string | null,
+        service: (one(cs?.services)?.name ?? null) as string | null,
+      }
+    })
   }
 
   /** 'mandato' si el tercero tiene alguna participación activa con contrato de
