@@ -7,7 +7,7 @@ import {
   normalizeInvoiceNumber,
   normalizeSiigoInvoice, nitMatch, normalizeNit,
   parseAccountingMovement, PARTICIPATION_ACCOUNTS, billedPeriods, emptyCollectionTaxes, planMoneyDocs, addMonths,
-  rateAt, monthStart,
+  rateAt, monthStart, servicePeriod, rescaleParticipation,
 } from './participations.domain.js'
 import type { ParticipationAccounts, MovCollection, CollectionTaxes, ParticipationRate } from './participations.domain.js'
 import { computeOperation, partitionInvoice } from '../tax/tax.domain.js'
@@ -153,7 +153,9 @@ export class ParticipationsService {
 
     // Historial del %: si cambió, rige desde el mes indicado (por defecto el mes
     // actual); los meses anteriores conservan su %.
-    if (data?.id) await ParticipationsService.recordRate(data.id, pct, input.start_date!, input.rate_valid_from)
+    const rateRecalculated = data?.id
+      ? await ParticipationsService.recordRate(data.id, pct, input.start_date!, input.rate_valid_from)
+      : 0
 
     // Backfill: al configurar el servicio se generan las OC de los meses que
     // falten desde la fecha de inicio (aunque sea de varios meses atrás).
@@ -162,16 +164,19 @@ export class ParticipationsService {
       try { backfill = await ParticipationsService.generateMonthlyOCs({ participationId: data.id }) }
       catch (e) { logger.error({ e }, 'backfill OC tras upsertParticipation falló') }
     }
-    return { service_value: input.service_value, participation: data, oc_backfill: backfill }
+    return { service_value: input.service_value, participation: data, oc_backfill: backfill, rate_recalculated: rateRecalculated }
   }
 
   /**
    * Registra el % en el historial (participation_rates). Primera vez: rige desde
    * el mes de inicio. Si cambió: rige desde `validFrom` (mes; por defecto el mes
-   * actual) y se recalculan las OC mensuales de ese mes en adelante que aún no
-   * tienen FV (las que ya tienen FV se recalculan al importar, con su % del mes).
+   * actual). Devuelve cuántas OC se recalcularon: las de ese mes en adelante, con
+   * el % de SU periodo, tengan o no FV. Las corregidas a mano no se tocan.
+   * Guardar sin cambios con varios % registrados vuelve a cuadrar las OC del
+   * último tramo (por si el cambio se registró sin recalcularlas).
    */
-  static async recordRate(participationId: string, pct: number, startDate: string, validFrom?: string | null) {
+  static async recordRate(participationId: string, pct: number, startDate: string, validFrom?: string | null): Promise<number> {
+    let recalculated = 0
     try {
       const { data: rates, error } = await supabase
         .from('participation_rates')
@@ -181,43 +186,60 @@ export class ParticipationsService {
       const list = rates ?? []
       if (!list.length) {
         await supabase.from('participation_rates').insert({ participation_id: participationId, percentage: pct, valid_from: monthStart(startDate) })
-        return
+        return 0
       }
       const from = monthStart(validFrom || new Date().toISOString().slice(0, 10))
-      if (rateAt(list, from, pct) === pct) return
-      const { error: upErr } = await supabase.from('participation_rates')
-        .upsert({ participation_id: participationId, percentage: pct, valid_from: from }, { onConflict: 'participation_id,valid_from' })
-      if (upErr) throw upErr
-      const updated = [...list.filter((r: any) => String(r.valid_from).slice(0, 10) !== from), { percentage: pct, valid_from: from }]
+      const isNewRate = rateAt(list, from, pct) !== pct
+      if (isNewRate) {
+        const { error: upErr } = await supabase.from('participation_rates')
+          .upsert({ participation_id: participationId, percentage: pct, valid_from: from }, { onConflict: 'participation_id,valid_from' })
+        if (upErr) throw upErr
+      }
+      const updated = isNewRate
+        ? [...list.filter((r: any) => String(r.valid_from).slice(0, 10) !== from), { percentage: pct, valid_from: from }]
+        : list
+      const latest = list.map((r: any) => String(r.valid_from).slice(0, 10)).sort().pop()!
+      const recalcFrom = validFrom || isNewRate ? from : list.length > 1 ? latest : null
+      if (!recalcFrom) return 0
 
       const { data: part } = await supabase
         .from('service_participations')
         .select('contract_type, company_service:company_services(service_value)')
         .eq('id', participationId)
         .maybeSingle()
-      if ((part as any)?.contract_type === 'mandato') return
+      if ((part as any)?.contract_type === 'mandato') return 0
       const cs = Array.isArray((part as any)?.company_service) ? (part as any).company_service[0] : (part as any)?.company_service
       const serviceValue = Number(cs?.service_value ?? 0)
       const { data: ocs } = await supabase
         .from('invoice_participations')
         .select('*')
         .eq('participation_id', participationId)
-        .is('finto_invoice', null)
-        .gte('period', from.slice(0, 7))
+        .gte('period', recalcFrom.slice(0, 7))
       for (const oc of ocs ?? []) {
         if ((oc as any).participation_value_manual) continue   // corregida a mano
-
         const p = rateAt(updated, monthStart(oc.period), pct)
-        const proration = Number((oc as any).proration ?? 1)
+        if (Number((oc as any).percentage ?? 0) === p) continue
+        // Sin FV: valor del servicio × %. Con FV: se escala lo causado (conserva
+        // notas crédito y el reparto de una FV entre varias OC).
+        const value = oc.finto_invoice
+          ? rescaleParticipation(Number(oc.participation_value ?? 0), Number((oc as any).percentage ?? 0), p)
+          : money(calcParticipation(serviceValue, p) * Number((oc as any).proration ?? 1))
+        if (value === null) continue
         await supabase.from('invoice_participations').update({
           percentage: p,
-          participation_value: money(calcParticipation(serviceValue, p) * proration),
+          participation_value: value,
           updated_at: new Date().toISOString(),
         }).eq('id', oc.id)
+        if (oc.finto_invoice) {
+          await ParticipationsService.adoptLegacyMoney(oc.id)   // no perder dinero manual
+          await ParticipationsService.recomputeOcFromAllocations(oc.id)
+        }
+        recalculated++
       }
     } catch (e) {
       logger.warn({ err: (e as any)?.message }, 'No se pudo registrar el historial de % (¿migración participation_rates aplicada?)')
     }
+    return recalculated
   }
 
   // ── Cuentas contables del import (configurables) ─────────────────────────────
@@ -728,9 +750,10 @@ export class ParticipationsService {
         const nc  = ncByFv.get(normalizeInvoiceNumber(s.fv)) ?? 0
         const nd  = ndByFv.get(normalizeInvoiceNumber(s.fv)) ?? 0
         const net = Math.max(0, money(base - nc + nd))
-        // % vigente en el mes de la FV (historial): reimportar no recalcula los
-        // meses anteriores con el % nuevo.
-        const pct = rateAt(cfg.rates, s.iso ? monthStart(s.iso) : null, cfg.percentage)
+        // % vigente en el mes del SERVICIO (periodo de la OC), no en el de la FV: en
+        // facturación vencida la FV de septiembre es del servicio de agosto.
+        const svcPeriod = s.iso ? servicePeriod(s.iso, cfg.billing_mode) : null
+        const pct = rateAt(cfg.rates, svcPeriod ? monthStart(svcPeriod) : null, cfg.percentage)
         const participationValue = isMandate ? net
           : (cfg.type === 'fixed' ? (cfg.fixed_value ?? 0) : money(net * pct / 100))
         // Valor de factura para el % de recaudo = lo que el cliente debe pagar por
@@ -771,9 +794,16 @@ export class ParticipationsService {
           _causado_status:       status,
           // Mes del SERVICIO (periodo de la OC): en facturación vencida la FV del
           // mes M se emite en M+1. Se prueba también el mes de la FV.
-          _period:               s.iso ? (cfg.billing_mode === 'vencido' ? addMonths(s.iso.slice(0, 7), -1) : s.iso.slice(0, 7)) : null,
+          _period:               svcPeriod,
           _fv_period:            s.iso ? s.iso.slice(0, 7) : null,
           _res:                  res,
+          // Si la FV cae en una OC de otro mes, vale el % del periodo de esa OC
+          _reprice: isMandate || cfg.type === 'fixed' ? null : (period: string, w: any) => {
+            const p = rateAt(cfg!.rates, monthStart(period), cfg!.percentage)
+            w.percentage = p
+            w.participation_value = money(net * p / 100)
+            res.participation_value = w.participation_value
+          },
         })
         causadasFv.add(normalizeInvoiceNumber(s.fv))
       }
@@ -806,6 +836,7 @@ export class ParticipationsService {
         const withFv = ocs.filter(o => isFv(o, w.finto_invoice))
         if (withFv.length > 1) { targets.set(w, { kind: 'shared' }); continue }
         if (withFv.length === 1) {
+          if (withFv[0].period) w._reprice?.(withFv[0].period, w)
           const sig = importSignature(w)
           targets.set(w, { kind: withFv[0].import_signature === sig ? 'unchanged' : 'update', id: withFv[0].id, purchase_order: withFv[0].purchase_order })
           continue
@@ -820,6 +851,7 @@ export class ParticipationsService {
         const pending = inPeriod(lookPeriod).find(o => !o.finto_invoice) ?? null
         if (pending) {
           pending.finto_invoice = w.finto_invoice   // la toma esta FV (no otra del mismo archivo)
+          if (pending.period) w._reprice?.(pending.period, w)
           targets.set(w, { kind: 'attach', id: pending.id, purchase_order: pending.purchase_order })
           res.note = `Se asigna a la OC ${pending.purchase_order} (${pending.period})`
           continue
@@ -873,6 +905,7 @@ export class ParticipationsService {
         delete w._fv_period
         delete w._causado_status
         delete w._res
+        delete w._reprice
         // Firma de lo causado que trae el archivo para esta FV (ver import_signature)
         w.import_signature = importSignature(w)
         w.updated_at = new Date().toISOString()

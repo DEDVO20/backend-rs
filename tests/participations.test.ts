@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { servicePeriod, rescaleParticipation, rateAt } from '../src/modules/participations/participations.domain.js'
 import {
   calcParticipation,
   availableParticipation,
@@ -791,5 +792,22 @@ describe('Ejemplo real FV-2-22 / FV-2-23 (dic 2025): recaudo al 100%', () => {
     expect(fv23.iva).toBe(95_000)
     expect(fv23.withholdings.total).toBe(201_722)
     expect(fv23.netReceivable).toBe(1_593_278)
+  })
+})
+
+describe('% vigente por mes del servicio', () => {
+  const rates = [{ percentage: 40, valid_from: '2026-06-01' }, { percentage: 30, valid_from: '2026-08-01' }]
+  it('la FV de agosto en vencido es del servicio de julio: conserva el % anterior', () => {
+    expect(rateAt(rates, `${servicePeriod('2026-08-15', 'vencido')}-01`, 0)).toBe(40)
+  })
+  it('la FV de septiembre en vencido es del servicio de agosto: usa el % nuevo', () => {
+    expect(rateAt(rates, `${servicePeriod('2026-09-15', 'vencido')}-01`, 0)).toBe(30)
+  })
+  it('en anticipado el mes del servicio es el de la FV', () => {
+    expect(servicePeriod('2026-08-15', 'anticipado')).toBe('2026-08')
+  })
+  it('reescala lo causado al nuevo % y no adivina sin % original', () => {
+    expect(rescaleParticipation(400000, 40, 30)).toBe(300000)
+    expect(rescaleParticipation(400000, 0, 30)).toBeNull()
   })
 })

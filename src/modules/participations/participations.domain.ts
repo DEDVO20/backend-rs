@@ -833,6 +833,18 @@ export type ParticipationRate = { percentage: number | string; valid_from: strin
  * a `isoDate`. Si la fecha es anterior a todos, el más antiguo; sin historial (o
  * sin fecha), `fallback` (el % actual de la configuración).
  */
+/** Mes del servicio de una FV: en facturación vencida, el mes anterior a la FV. */
+export function servicePeriod(isoDate: string, billingMode: BillingMode): string {
+  const month = isoDate.slice(0, 7)
+  return billingMode === 'vencido' ? addMonths(month, -1) : month
+}
+
+/** Reexpresa lo causado con otro %. null si no se conoce el % original. */
+export function rescaleParticipation(value: number, oldPct: number, newPct: number): number | null {
+  if (!(oldPct > 0)) return null
+  return Math.round(value * newPct / oldPct * 100) / 100
+}
+
 export function rateAt(rates: ParticipationRate[] | null | undefined, isoDate: string | null | undefined, fallback: number): number {
   const list = [...(rates ?? [])]
     .map(r => ({ pct: Number(r.percentage), from: String(r.valid_from).slice(0, 10) }))
