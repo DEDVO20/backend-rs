@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { servicePeriod, rescaleParticipation, rateAt } from '../src/modules/participations/participations.domain.js'
+import { servicePeriod, rescaleParticipation, rateAt, currentRateStart } from '../src/modules/participations/participations.domain.js'
 import {
   calcParticipation,
   availableParticipation,
@@ -805,6 +805,15 @@ describe('% vigente por mes del servicio', () => {
   })
   it('en anticipado el mes del servicio es el de la FV', () => {
     expect(servicePeriod('2026-08-15', 'anticipado')).toBe('2026-08')
+  })
+  it('el último % rige desde su primer registro seguido, no desde el más reciente', () => {
+    expect(currentRateStart([
+      { percentage: 40, valid_from: '2026-06-01' },
+      { percentage: 3, valid_from: '2026-08-01' },
+      { percentage: 3, valid_from: '2026-10-01' },
+    ])).toBe('2026-08-01')
+    expect(currentRateStart(rates)).toBe('2026-08-01')
+    expect(currentRateStart([])).toBeNull()
   })
   it('reescala lo causado al nuevo % y no adivina sin % original', () => {
     expect(rescaleParticipation(400000, 40, 30)).toBe(300000)
