@@ -6,8 +6,10 @@ import { logger } from '../../lib/logger.js'
 import { SiigoService } from './siigo.service.js'
 import { SiigoCollectionsService } from './siigo.collections.service.js'
 import { SiigoTrialBalanceService } from './siigo.trialBalance.service.js'
+import { SiigoReceivablesService } from './siigo.receivables.service.js'
 import { SiigoConnections } from './siigo.connections.js'
 import {
+  listReceivablesQuerySchema,
   listSiigoCollectionsQuerySchema,
   listSiigoSalesQuerySchema,
   listTrialBalanceQuerySchema,
@@ -15,6 +17,7 @@ import {
   syncLogsQuerySchema,
   syncSiigoBodySchema,
   syncSiigoCollectionsBodySchema,
+  syncReceivablesBodySchema,
   syncTrialBalanceBodySchema,
 } from './siigo.schema.js'
 
@@ -186,6 +189,37 @@ app.post(
 app.get('/trial-balance/sync-logs', requireRole(...INTERNAL), zValidator('query', syncLogsQuerySchema), async (c) => {
   const conn = await SiigoService.connectionFor(c.req.valid('query').connectionId)
   return c.json(await SiigoTrialBalanceService.getSyncLogs(conn.id))
+})
+
+// ── Cartera (facturas con saldo, solo gráficas; independiente del módulo de cobro) ──
+
+// GET /api/siigo/receivables — detalle de facturas con saldo (clientes: su propia empresa)
+app.get('/receivables', zValidator('query', listReceivablesQuerySchema), async (c) =>
+  c.json(await SiigoReceivablesService.list(c.req.valid('query'), c.get('user'))),
+)
+
+// GET /api/siigo/receivables/report — edades, clientes, vendedores y evolución de la cartera
+app.get('/receivables/report', zValidator('query', listSiigoCollectionsQuerySchema), async (c) =>
+  c.json(await SiigoReceivablesService.getReport(c.req.valid('query'), c.get('user'))),
+)
+
+app.post(
+  '/receivables/sync',
+  requirePermission('siigo', 'create'),
+  zValidator('json', syncReceivablesBodySchema),
+  async (c) => {
+    const body = c.req.valid('json')
+    const res = await startInBackground(
+      body.connectionId, id => SiigoReceivablesService.isRunning(id),
+      () => SiigoReceivablesService.syncFromSiigo(body, c.get('user').id), 'cartera',
+    )
+    return c.json(res, 202)
+  },
+)
+
+app.get('/receivables/sync-logs', requireRole(...INTERNAL), zValidator('query', syncLogsQuerySchema), async (c) => {
+  const conn = await SiigoService.connectionFor(c.req.valid('query').connectionId)
+  return c.json(await SiigoReceivablesService.getSyncLogs(conn.id))
 })
 
 export const siigoRoutes = app

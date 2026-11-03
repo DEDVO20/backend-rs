@@ -67,6 +67,17 @@ export const syncTrialBalanceBodySchema = z.object({
   year: z.coerce.number().int().min(2020).max(2035).optional(),
 })
 
+export const syncReceivablesBodySchema = z.object({ connectionId })
+
+export const listReceivablesQuerySchema = z.object({
+  connectionId,
+  companyId: z.string().uuid().optional(),
+  bucket:    z.enum(['No vencido', '1-30', '31-60', '61-90', '91+', 'Sin vencimiento']).optional(),
+  search:    z.string().max(100).optional(),
+  page:      z.coerce.number().int().positive().default(1),
+  limit:     z.coerce.number().int().positive().max(500).default(100),
+})
+
 export const syncLogsQuerySchema = z.object({ connectionId })
 
 /** Credenciales y ajustes de una conexión. accessKey vacía o ausente = conservar la actual */
@@ -83,6 +94,8 @@ export const saveSiigoConnectionBodySchema = z.object({
 export type ListSiigoSalesQuery = z.infer<typeof listSiigoSalesQuerySchema>
 export type ListTrialBalanceQuery = z.infer<typeof listTrialBalanceQuerySchema>
 export type SyncTrialBalanceBody = z.infer<typeof syncTrialBalanceBodySchema>
+export type SyncReceivablesBody = z.infer<typeof syncReceivablesBodySchema>
+export type ListReceivablesQuery = z.infer<typeof listReceivablesQuerySchema>
 export type ListSiigoCollectionsQuery = z.infer<typeof listSiigoCollectionsQuerySchema>
 export type SyncSiigoCollectionsBody = z.infer<typeof syncSiigoCollectionsBodySchema>
 export type SyncSiigoBody       = z.infer<typeof syncSiigoBodySchema>

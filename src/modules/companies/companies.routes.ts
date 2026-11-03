@@ -7,6 +7,7 @@ import { requireRole, requirePermission } from '../../middleware/requireRole.js'
 import { requireOwnCompany }  from '../../middleware/requireRole.js'
 import { CompaniesService }   from './companies.service.js'
 import {
+  CLIENT_EDITABLE_COMPANY_FIELDS,
   createCompanySchema,
   listCompaniesQuerySchema,
   updateCompanySchema,
@@ -62,13 +63,19 @@ app.patch('/:id',
     const id = c.req.param('id')!
     const isInternal = ['admin', 'rs_admin'].includes(role)
 
+    const input = c.req.valid('json')
     if (!isInternal) {
       if (role !== 'client_owner' || companyId !== id) {
         return c.json({ error: 'Acceso denegado' }, 403)
       }
+      // El cliente solo cambia sus datos públicos (sitio web); NIT, cupos, asesor, etc. los gestiona Finto
+      const notAllowed = Object.keys(input).filter(k => !(CLIENT_EDITABLE_COMPANY_FIELDS as readonly string[]).includes(k))
+      if (notAllowed.length) {
+        return c.json({ error: `No puedes modificar: ${notAllowed.join(', ')}` }, 403)
+      }
     }
 
-    const data = await CompaniesService.update(id, c.req.valid('json'))
+    const data = await CompaniesService.update(id, input)
     return c.json(data)
   },
 )

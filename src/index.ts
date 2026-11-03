@@ -20,7 +20,6 @@ import { servicesRoutes }        from './modules/services/services.routes.js'
 import { policiesRoutes }        from './modules/policies/policies.routes.js'
 import { requestTypesRoutes }    from './modules/request-types/request-types.routes.js'
 import { profilesRoutes }        from './modules/profiles/profiles.routes.js'
-import { dashboardsRoutes }      from './modules/dashboards/dashboards.routes.js'
 import { companyServicesRoutes } from './modules/company-services/company-services.routes.js'
 import { companiesRoutes }  from './modules/companies/companies.routes.js'
 import { tasksRoutes }      from './modules/tasks/tasks.routes.js'
@@ -127,7 +126,6 @@ app.route('/api/services',       servicesRoutes)
 app.route('/api/policies',       policiesRoutes)
 app.route('/api/request-types',    requestTypesRoutes)
 app.route('/api/profiles',         profilesRoutes)
-app.route('/api/dashboards',       dashboardsRoutes)
 app.route('/api/company-services', companyServicesRoutes)
 app.route('/api/companies',   companiesRoutes)
 app.route('/api/tasks',       tasksRoutes)

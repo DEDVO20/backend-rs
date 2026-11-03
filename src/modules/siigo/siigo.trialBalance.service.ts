@@ -41,13 +41,13 @@ export interface TrialBalanceSyncLog {
 }
 
 /** Hoy en hora de Colombia (YYYY-MM-DD) */
-function todayBogota(): string {
+export function todayBogota(): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Bogota', year: 'numeric', month: '2-digit', day: '2-digit' })
     .format(new Date())
 }
 
 /** Siigo genera el archivo de forma asíncrona: se espera y reintenta hasta recibir un XLSX válido */
-async function downloadXlsx(url: string): Promise<ArrayBuffer> {
+export async function downloadXlsx(url: string): Promise<ArrayBuffer> {
   for (let intento = 0; intento < DOWNLOAD_TRIES; intento++) {
     await sleep(intento === 0 ? 4000 : 2000 * 2 ** intento)
     try {
@@ -62,7 +62,7 @@ async function downloadXlsx(url: string): Promise<ArrayBuffer> {
   throw new Error('No se pudo descargar un XLSX válido desde Siigo.')
 }
 
-function fileUrlOf(resp: unknown): string {
+export function fileUrlOf(resp: unknown): string {
   const r = resp as Obj
   const url = typeof resp === 'string' ? resp : (r?.file_url || r?.fileUrl || r?.data?.file_url || r?.data?.fileUrl)
   if (!url || !/^https:\/\//i.test(String(url))) throw new Error('Siigo no devolvió file_url válido.')

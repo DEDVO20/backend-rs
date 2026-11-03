@@ -34,6 +34,8 @@ export const SIIGO_CONFIG = {
 
   PAGE_SIZE: 100,
   MAX_PAGES: 100,
+  // Cartera: se recorren TODAS las facturas hasta la fecha de corte (saldo actual de cada una)
+  RECEIVABLES_MAX_PAGES: 500,
 
   get SLEEP_BETWEEN_DOCS_MS() { return parseInt(process.env.SLEEP_BETWEEN_DOCS_MS || '400', 10) },
   get SLEEP_BETWEEN_PRODUCT_LOOKUPS_MS() { return parseInt(process.env.SLEEP_BETWEEN_PRODUCT_LOOKUPS_MS || '250', 10) },

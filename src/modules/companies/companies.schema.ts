@@ -1,5 +1,17 @@
 import { z } from 'zod'
 
+/** Sitio web: acepta "empresa.com" y lo guarda como "https://empresa.com"; vacío = sin sitio */
+const websiteSchema = z.preprocess(
+  v => {
+    const s = typeof v === 'string' ? v.trim() : v
+    return typeof s === 'string' && s && !/^https?:\/\//i.test(s) ? `https://${s}` : s
+  },
+  z.string().url('Sitio web inválido').max(300).optional().or(z.literal('')),
+)
+
+/** Campos que el client_owner puede cambiar de su propia empresa (el resto lo gestiona Finto) */
+export const CLIENT_EDITABLE_COMPANY_FIELDS = ['website'] as const
+
 export const updateCompanySchema = z.object({
   name:    z.string().min(2).optional(),
   nit:     z.string().optional(),
@@ -8,7 +20,7 @@ export const updateCompanySchema = z.object({
   sector:  z.string().optional(),
   phone:   z.string().optional(),
   address: z.string().optional(),
-  website: z.string().url().optional().or(z.literal('')),
+  website: websiteSchema,
   size:    z.string().optional(),
   contact: z.string().optional(),
   cargo:   z.string().optional(),
@@ -27,7 +39,7 @@ export const createCompanySchema = z.object({
   sector:  z.string().optional(),
   phone:   z.string().optional(),
   address: z.string().optional(),
-  website: z.string().url().optional().or(z.literal('')),
+  website: websiteSchema,
   size:    z.string().optional(),
   contact: z.string().optional(),
   cargo:   z.string().optional(),

@@ -147,6 +147,15 @@ async function processJob(jobName: string) {
         break
       }
 
+      case 'siigo-daily-receivables': {
+        const { SiigoReceivablesService } = await import('../modules/siigo/siigo.receivables.service.js')
+        result = await forEachSiigoConnection('cartera', async id => {
+          const log = await SiigoReceivablesService.syncFromSiigo({ connectionId: id })
+          return { cut_date: log.cut_date, invoices: log.invoices_count, customers: log.customers_count, total: log.total_balance }
+        })
+        break
+      }
+
       default:
         logger.warn({ jobName }, 'Cron: job desconocido')
         return
@@ -234,5 +243,10 @@ async function setupRepeatableJobs() {
     repeat: { pattern: '0 11 * * *' },
   })
 
-  logger.info('Cron jobs registrados: generate-tasks (diario 6AM), send-reminders (diario 7AM), mark-overdue (diario 1AM), tax-calendar-tasks (diario 6:30AM), tax-calendar-reminders (diario 7:15AM), participations-monthly-oc (día 1 6AM), siigo-daily-sync (diario 2AM), siigo-daily-collections (diario 2:30AM), siigo-daily-trial-balance (diario 6AM)')
+  // Cartera Siigo (gráficas) — diario 3:00 AM Colombia (8 UTC), después de facturación y recaudo
+  await cronQueue.add('siigo-daily-receivables', {}, {
+    repeat: { pattern: '0 8 * * *' },
+  })
+
+  logger.info('Cron jobs registrados: generate-tasks (diario 6AM), send-reminders (diario 7AM), mark-overdue (diario 1AM), tax-calendar-tasks (diario 6:30AM), tax-calendar-reminders (diario 7:15AM), participations-monthly-oc (día 1 6AM), siigo-daily-sync (diario 2AM), siigo-daily-collections (diario 2:30AM), siigo-daily-receivables (diario 3AM), siigo-daily-trial-balance (diario 6AM)')
 }
