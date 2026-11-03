@@ -35,6 +35,7 @@ export const MODULE_CATALOG = {
   roles:                { name: 'Roles y permisos',       scope: 'internal' },
   leads:                { name: 'Leads cotizador',        scope: 'internal' },
   blog:                 { name: 'Blog y Artículos',       scope: 'internal' },
+  services_admin:       { name: 'Administración servicios', scope: 'internal' },
 } as const satisfies Record<string, { name: string; scope: 'internal' | 'client' | 'shared' }>
 
 export type Module = keyof typeof MODULE_CATALOG

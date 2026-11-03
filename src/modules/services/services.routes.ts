@@ -1,9 +1,9 @@
 import { Hono }         from 'hono'
 import { zValidator }   from '@hono/zod-validator'
 import { z }            from 'zod'
-import { authMiddleware } from '../../middleware/auth.js'
-import { requireRole }    from '../../middleware/requireRole.js'
-import { supabase }       from '../../lib/supabase.js'
+import { authMiddleware }    from '../../middleware/auth.js'
+import { requirePermission } from '../../middleware/requireRole.js'
+import { supabase }          from '../../lib/supabase.js'
 
 const app = new Hono()
 
@@ -21,10 +21,24 @@ app.get('/public', async (c) => {
 app.use('/*', authMiddleware)
 
 const createServiceSchema = z.object({
-  name:        z.string().min(2),
-  description: z.string().optional(),
+  name:        z.string().trim().min(2).max(120),
+  description: z.string().trim().max(1000).nullable().optional(),
   active:      z.boolean().default(true),
 })
+
+/** ¿Existe otro servicio con el mismo nombre (sin distinguir mayúsculas)? */
+async function nameTaken(name: string, exceptId?: string): Promise<boolean> {
+  // Escapar comodines de ILIKE para comparar el nombre literal
+  let q = supabase
+    .from('services')
+    .select('id')
+    .ilike('name', name.replace(/[%_\\]/g, '\\$&'))
+    .limit(1)
+  if (exceptId) q = q.neq('id', exceptId)
+  const { data, error } = await q
+  if (error) throw error
+  return (data ?? []).length > 0
+}
 
 // GET /api/services — listar todos (público autenticado)
 app.get('/', async (c) => {
@@ -43,6 +57,28 @@ app.get('/', async (c) => {
   return c.json(data)
 })
 
+// GET /api/services/stats — uso de cada servicio (empresas activas y plantillas).
+// DEBE ir antes de /:id.
+app.get('/stats', async (c) => {
+  const [cs, tt] = await Promise.all([
+    supabase.from('company_services').select('service_id').eq('active', true),
+    supabase.from('task_templates').select('service_id, active'),
+  ])
+  if (cs.error) throw cs.error
+  if (tt.error) throw tt.error
+
+  const stats: Record<string, { companies: number; templates: number; active_templates: number }> = {}
+  const get = (id: string) => (stats[id] ??= { companies: 0, templates: 0, active_templates: 0 })
+  for (const r of cs.data ?? []) if (r.service_id) get(r.service_id).companies++
+  for (const r of tt.data ?? []) {
+    if (!r.service_id) continue
+    const s = get(r.service_id)
+    s.templates++
+    if (r.active) s.active_templates++
+  }
+  return c.json(stats)
+})
+
 // GET /api/services/:id
 app.get('/:id', async (c) => {
   const { data, error } = await supabase
@@ -55,14 +91,17 @@ app.get('/:id', async (c) => {
   return c.json(data)
 })
 
-// POST /api/services — solo admin/rs_admin
+// POST /api/services
 app.post('/',
-  requireRole('admin', 'rs_admin'),
+  requirePermission('services_admin', 'create'),
   zValidator('json', createServiceSchema),
   async (c) => {
+    const body = c.req.valid('json')
+    if (await nameTaken(body.name)) return c.json({ error: 'Ya existe un servicio con ese nombre' }, 409)
+
     const { data, error } = await supabase
       .from('services')
-      .insert(c.req.valid('json'))
+      .insert(body)
       .select()
       .single()
 
@@ -73,13 +112,17 @@ app.post('/',
 
 // PATCH /api/services/:id
 app.patch('/:id',
-  requireRole('admin', 'rs_admin'),
+  requirePermission('services_admin', 'update'),
   zValidator('json', createServiceSchema.partial()),
   async (c) => {
+    const id = c.req.param('id')!
+    const body = c.req.valid('json')
+    if (body.name && await nameTaken(body.name, id)) return c.json({ error: 'Ya existe un servicio con ese nombre' }, 409)
+
     const { data, error } = await supabase
       .from('services')
-      .update(c.req.valid('json'))
-      .eq('id', c.req.param('id')!)
+      .update(body)
+      .eq('id', id)
       .select()
       .single()
 
@@ -88,9 +131,9 @@ app.patch('/:id',
   },
 )
 
-// DELETE /api/services/:id — desactivar (soft)
+// DELETE /api/services/:id — desactivar (soft); las asignaciones existentes se conservan
 app.delete('/:id',
-  requireRole('admin', 'rs_admin'),
+  requirePermission('services_admin', 'delete'),
   async (c) => {
     const { data, error } = await supabase
       .from('services')
