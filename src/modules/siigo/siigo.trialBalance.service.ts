@@ -2,7 +2,7 @@ import { supabase } from '../../lib/supabase.js'
 import { logger } from '../../lib/logger.js'
 import { normalizeNit } from '../participations/participations.domain.js'
 import { SIIGO_CONFIG } from './siigo.config.js'
-import { matchCompanyByNit, sleep } from './siigo.helpers.js'
+import { dbError, matchCompanyByNit, sleep } from './siigo.helpers.js'
 import type { SiigoApiClient } from './siigo.client.js'
 import { SiigoConnections } from './siigo.connections.js'
 import { SiigoService } from './siigo.service.js'
@@ -124,7 +124,7 @@ export class SiigoTrialBalanceService {
         p_period:     per,
         p_lines:      rows,
       })
-      if (error) throw new Error(`No se pudo guardar el balance de ${per}: ${error.message}`)
+      if (error) throw dbError(`No se pudo guardar el balance de ${per}: ${error.message}`, error)
 
       const count = Number(data ?? rows.length)
       const now = new Date().toISOString()
@@ -251,7 +251,7 @@ export class SiigoTrialBalanceService {
       .eq('connection_id', connectionId)
       .order('started_at', { ascending: false })
       .limit(20)
-    if (error) throw new Error(`No se pudieron consultar los logs del balance de prueba: ${error.message}`)
+    if (error) throw dbError(`No se pudieron consultar los logs del balance de prueba: ${error.message}`, error)
     return { isSyncRunning: this.isRunning(connectionId), logs: (data ?? []) as TrialBalanceSyncLog[] }
   }
 
@@ -278,7 +278,7 @@ export class SiigoTrialBalanceService {
       p_to:         query.endDate?.slice(0, 7) ?? null,
       p_company_id: scope.companyId,
     })
-    if (error) throw new Error(`No se pudieron calcular las gráficas del balance: ${error.message}`)
+    if (error) throw dbError(`No se pudieron calcular las gráficas del balance: ${error.message}`, error)
     const r = (data ?? {}) as Obj
     return {
       ...base,
@@ -302,7 +302,7 @@ export class SiigoTrialBalanceService {
       supabase.from('siigo_trial_balance_periods').select('*').eq('connection_id', connectionId).order('period', { ascending: false }),
       this.getSyncLogs(connectionId),
     ])
-    if (pErr) throw new Error(`No se pudo consultar el control de periodos: ${pErr.message}`)
+    if (pErr) throw dbError(`No se pudo consultar el control de periodos: ${pErr.message}`, pErr)
 
     // Por defecto, el último mes importado correctamente
     const period = query.period ?? periods?.find(p => p.status === 'OK' || p.last_success_at)?.period ?? null
@@ -327,9 +327,9 @@ export class SiigoTrialBalanceService {
       supabase.rpc('siigo_trial_balance_report', args),
     ])
     if (pageRes.error && pageRes.error.code !== 'PGRST103') {
-      throw new Error(`No se pudo consultar el balance de prueba: ${pageRes.error.message}`)
+      throw dbError(`No se pudo consultar el balance de prueba: ${pageRes.error.message}`, pageRes.error)
     }
-    if (reportRes.error) throw new Error(`No se pudo calcular el resumen del balance: ${reportRes.error.message}`)
+    if (reportRes.error) throw dbError(`No se pudo calcular el resumen del balance: ${reportRes.error.message}`, reportRes.error)
 
     const num = (r: Obj, k: string) => Number(r[k] ?? 0)
     return {

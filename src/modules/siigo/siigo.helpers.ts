@@ -178,3 +178,12 @@ export function incrementalStartDate(lastEndDate: string | null, overlapDays: nu
   const floor = `${startYear}-01-01`
   return iso < floor ? floor : iso
 }
+
+/**
+ * Error de base de datos que conserva el código de Postgres/PostgREST (p. ej. 42P01 = tabla
+ * inexistente, PGRST202 = función inexistente) para que el manejador global pueda informar
+ * que falta una migración en lugar de un 500 genérico.
+ */
+export function dbError(message: string, err: { code?: string; details?: string | null } | null | undefined): Error {
+  return Object.assign(new Error(message), { code: err?.code, details: err?.details ?? undefined })
+}

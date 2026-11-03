@@ -2,7 +2,7 @@ import { supabase } from '../../lib/supabase.js'
 import { logger } from '../../lib/logger.js'
 import type { AuthUser } from '../../middleware/auth.js'
 import { normalizeNit } from '../participations/participations.domain.js'
-import { formatDate, incrementalStartDate, matchCompanyByNit, normalizeDateText, sleep } from './siigo.helpers.js'
+import { dbError, formatDate, incrementalStartDate, matchCompanyByNit, normalizeDateText, sleep } from './siigo.helpers.js'
 import { SIIGO_CONFIG } from './siigo.config.js'
 import {
   buildVentaLinesPorProducto,
@@ -150,7 +150,7 @@ export class SiigoService {
       .from('companies')
       .select('id, name, nit')
 
-    if (error) throw new Error(`No se pudieron cargar las empresas: ${error.message}`)
+    if (error) throw dbError(`No se pudieron cargar las empresas: ${error.message}`, error)
 
     return (data ?? []).map((c: any) => ({
       id:      c.id,
@@ -201,7 +201,7 @@ export class SiigoService {
         p_comprobantes: chunk.map(d => d.comprobante).filter(Boolean),
         p_lines:        chunk.flatMap(d => d.lines),
       })
-      if (error) throw new Error(`No se pudieron guardar las líneas de Siigo: ${error.message}`)
+      if (error) throw dbError(`No se pudieron guardar las líneas de Siigo: ${error.message}`, error)
       inserted += Number(data ?? 0)
     }
     return inserted
@@ -210,7 +210,7 @@ export class SiigoService {
   /** Vincula al tercero las líneas sin company_id (p. ej. empresas creadas después) */
   static async relinkCompanies(connectionId: string, companies: CompanyRef[]): Promise<number> {
     const { data, error } = await supabase.rpc('siigo_unlinked_nits', { p_connection: connectionId })
-    if (error) throw new Error(`No se pudieron consultar NIT sin vincular: ${error.message}`)
+    if (error) throw dbError(`No se pudieron consultar NIT sin vincular: ${error.message}`, error)
 
     let relinked = 0
     for (const nit of (data ?? []) as string[]) {
@@ -370,7 +370,7 @@ export class SiigoService {
       .limit(1)
       .maybeSingle()
 
-    if (error) throw new Error(`No se pudo consultar la última sync de Siigo: ${error.message}`)
+    if (error) throw dbError(`No se pudo consultar la última sync de Siigo: ${error.message}`, error)
     return data?.end_date ? String(data.end_date) : null
   }
 
@@ -386,7 +386,7 @@ export class SiigoService {
       .eq('connection_id', connectionId)
       .order('started_at', { ascending: false })
       .limit(20)
-    if (error) throw new Error(`No se pudieron consultar los logs de Siigo: ${error.message}`)
+    if (error) throw dbError(`No se pudieron consultar los logs de Siigo: ${error.message}`, error)
     return { isSyncRunning: this.isRunning(connectionId), logs: (data ?? []) as SyncLogEntry[] }
   }
 
@@ -420,7 +420,7 @@ export class SiigoService {
 
   private static async companyInfo(companyId: string): Promise<ClientCompany | null> {
     const { data, error } = await supabase.from('companies').select('id, name, nit').eq('id', companyId).maybeSingle()
-    if (error) throw new Error(`No se pudo consultar la empresa: ${error.message}`)
+    if (error) throw dbError(`No se pudo consultar la empresa: ${error.message}`, error)
     return data ? { id: data.id, name: data.name ?? '', nit: data.nit ?? null } : null
   }
 
@@ -455,7 +455,7 @@ export class SiigoService {
 
     if (error) {
       if (isRangeNotSatisfiable(error)) return { rows: [], count: count ?? null }
-      throw new Error(`No se pudieron consultar las líneas de Siigo: ${error.message}`)
+      throw dbError(`No se pudieron consultar las líneas de Siigo: ${error.message}`, error)
     }
     return { rows: ((data ?? []) as any[]).map(r => this.normalizeRow(r)), count: count ?? null }
   }
@@ -524,7 +524,7 @@ export class SiigoService {
   /** El dueño de los libros siempre ve el desglose por cliente de SUS libros */
   private static async fetchReport(args: SalesFilterArgs): Promise<SalesReport> {
     const { data, error } = await supabase.rpc('siigo_sales_report', { ...args, p_include_customers: true })
-    if (error) throw new Error(`No se pudo calcular el resumen de Siigo: ${error.message}`)
+    if (error) throw dbError(`No se pudo calcular el resumen de Siigo: ${error.message}`, error)
     return data as SalesReport
   }
 

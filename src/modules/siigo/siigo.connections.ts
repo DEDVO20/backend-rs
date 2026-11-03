@@ -1,6 +1,7 @@
 import { supabase } from '../../lib/supabase.js'
 import { decryptSecret, encryptSecret } from '../../lib/secretBox.js'
 import { SIIGO_CONFIG } from './siigo.config.js'
+import { dbError } from './siigo.helpers.js'
 import { clearCachedSiigoToken } from './siigo.cache.js'
 import { SiigoApiClient, type SiigoCredentials } from './siigo.client.js'
 import type { SaveSiigoConnectionBody } from './siigo.schema.js'
@@ -49,20 +50,20 @@ function httpError(message: string, statusCode: number) {
 export class SiigoConnections {
   static async platform(): Promise<SiigoConnectionRow> {
     const { data, error } = await supabase.from('siigo_connections').select(COLUMNS).eq('is_platform', true).maybeSingle()
-    if (error) throw new Error(`No se pudo consultar la conexión de Siigo de Finto: ${error.message}`)
-    if (!data) throw httpError('No existe la conexión de Siigo de la plataforma (migración 20261030 sin aplicar).', 500)
+    if (error) throw dbError(`No se pudo consultar la conexión de Siigo de Finto: ${error.message}`, error)
+    if (!data) throw dbError('No existe la conexión de Siigo de la plataforma (migración 20261030_siigo_connections sin aplicar)', { code: 'SIIGO_MIGRATION' })
     return data as unknown as SiigoConnectionRow
   }
 
   static async byId(id: string): Promise<SiigoConnectionRow | null> {
     const { data, error } = await supabase.from('siigo_connections').select(COLUMNS).eq('id', id).maybeSingle()
-    if (error) throw new Error(`No se pudo consultar la conexión de Siigo: ${error.message}`)
+    if (error) throw dbError(`No se pudo consultar la conexión de Siigo: ${error.message}`, error)
     return (data as unknown as SiigoConnectionRow) ?? null
   }
 
   static async byCompany(companyId: string): Promise<SiigoConnectionRow | null> {
     const { data, error } = await supabase.from('siigo_connections').select(COLUMNS).eq('company_id', companyId).maybeSingle()
-    if (error) throw new Error(`No se pudo consultar la conexión de Siigo: ${error.message}`)
+    if (error) throw dbError(`No se pudo consultar la conexión de Siigo: ${error.message}`, error)
     return (data as unknown as SiigoConnectionRow) ?? null
   }
 
@@ -83,7 +84,7 @@ export class SiigoConnections {
       .select(`${COLUMNS}, companies(name)`)
       .order('is_platform', { ascending: false })
       .order('label', { ascending: true })
-    if (error) throw new Error(`No se pudieron consultar las conexiones de Siigo: ${error.message}`)
+    if (error) throw dbError(`No se pudieron consultar las conexiones de Siigo: ${error.message}`, error)
     return ((data ?? []) as any[]).map(r => {
       const { companies, ...row } = r
       return this.toPublic(row as SiigoConnectionRow, companies?.name ?? null)
@@ -131,7 +132,7 @@ export class SiigoConnections {
   /** Conexiones que el cron debe sincronizar */
   static async syncTargets(): Promise<SiigoConnectionRow[]> {
     const { data, error } = await supabase.from('siigo_connections').select(COLUMNS).eq('active', true)
-    if (error) throw new Error(`No se pudieron consultar las conexiones de Siigo: ${error.message}`)
+    if (error) throw dbError(`No se pudieron consultar las conexiones de Siigo: ${error.message}`, error)
     return ((data ?? []) as unknown as SiigoConnectionRow[]).filter(r => this.hasCredentials(r))
   }
 
@@ -151,7 +152,7 @@ export class SiigoConnections {
   /** Crea o actualiza la conexión de una empresa cliente */
   static async saveForCompany(companyId: string, input: SaveSiigoConnectionBody, userId: string): Promise<SiigoConnectionPublic> {
     const { data: company, error: cErr } = await supabase.from('companies').select('id, name').eq('id', companyId).maybeSingle()
-    if (cErr) throw new Error(`No se pudo consultar la empresa: ${cErr.message}`)
+    if (cErr) throw dbError(`No se pudo consultar la empresa: ${cErr.message}`, cErr)
     if (!company) throw httpError('Empresa no encontrada', 404)
 
     const existing = await this.byCompany(companyId)
@@ -160,7 +161,7 @@ export class SiigoConnections {
 
     if (existing) {
       const { data, error } = await supabase.from('siigo_connections').update(changes).eq('id', existing.id).select(COLUMNS).single()
-      if (error) throw new Error(`No se pudo guardar la conexión de Siigo: ${error.message}`)
+      if (error) throw dbError(`No se pudo guardar la conexión de Siigo: ${error.message}`, error)
       saved = data as unknown as SiigoConnectionRow
     } else {
       if (!input.username?.trim() || !input.accessKey?.trim()) {
@@ -171,7 +172,7 @@ export class SiigoConnections {
         .insert({ ...changes, company_id: companyId, is_platform: false, label: company.name })
         .select(COLUMNS)
         .single()
-      if (error) throw new Error(`No se pudo crear la conexión de Siigo: ${error.message}`)
+      if (error) throw dbError(`No se pudo crear la conexión de Siigo: ${error.message}`, error)
       saved = data as unknown as SiigoConnectionRow
     }
 
@@ -188,7 +189,7 @@ export class SiigoConnections {
       .eq('id', platform.id)
       .select(COLUMNS)
       .single()
-    if (error) throw new Error(`No se pudo guardar la conexión de Siigo de Finto: ${error.message}`)
+    if (error) throw dbError(`No se pudo guardar la conexión de Siigo de Finto: ${error.message}`, error)
     await clearCachedSiigoToken(platform.id)
     return this.toPublic(data as unknown as SiigoConnectionRow)
   }
@@ -215,7 +216,7 @@ export class SiigoConnections {
       .eq('id', row.id)
       .select(COLUMNS)
       .single()
-    if (error) throw new Error(`No se pudo guardar el resultado de la prueba: ${error.message}`)
+    if (error) throw dbError(`No se pudo guardar el resultado de la prueba: ${error.message}`, error)
     return this.toPublic(data as unknown as SiigoConnectionRow)
   }
 }

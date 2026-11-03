@@ -3,7 +3,7 @@ import { logger } from '../../lib/logger.js'
 import type { AuthUser } from '../../middleware/auth.js'
 import { normalizeNit } from '../participations/participations.domain.js'
 import { SIIGO_CONFIG } from './siigo.config.js'
-import { matchCompanyByNit, round2, sleep } from './siigo.helpers.js'
+import { dbError, matchCompanyByNit, round2, sleep } from './siigo.helpers.js'
 import { getCodigoProductoFromItem } from './siigo.calculator.js'
 import type { SiigoApiClient } from './siigo.client.js'
 import { SiigoConnections } from './siigo.connections.js'
@@ -373,7 +373,7 @@ export class SiigoCollectionsService {
         p_end:   endDate,
         p_lines: lines,
       })
-      if (error) throw new Error(`No se pudieron guardar las líneas de recaudo: ${error.message}`)
+      if (error) throw dbError(`No se pudieron guardar las líneas de recaudo: ${error.message}`, error)
 
       details['Movimientos sin due resueltos'] = lines.filter(l => l.movement_class === 'ITEM' && !/^FV-/i.test(l.invoice)).length
       details['Anticipos / otros ingresos'] = lines.filter(l => l.movement_class === 'ANTICIPO' || l.movement_class === 'OTRO_INGRESO').length
@@ -433,7 +433,7 @@ export class SiigoCollectionsService {
       .eq('connection_id', connectionId)
       .order('started_at', { ascending: false })
       .limit(20)
-    if (error) throw new Error(`No se pudieron consultar los logs de recaudo: ${error.message}`)
+    if (error) throw dbError(`No se pudieron consultar los logs de recaudo: ${error.message}`, error)
     return { isSyncRunning: this.isRunning(connectionId), logs: (data ?? []) as CollectionSyncLog[] }
   }
 
@@ -453,7 +453,7 @@ export class SiigoCollectionsService {
   /** El dueño de los libros siempre ve el desglose por cliente de SUS libros */
   private static async fetchReport(args: CollectionFilterArgs): Promise<CollectionReport> {
     const { data, error } = await supabase.rpc('siigo_collection_report', { ...args, p_include_customers: true })
-    if (error) throw new Error(`No se pudo calcular el resumen de recaudo: ${error.message}`)
+    if (error) throw dbError(`No se pudo calcular el resumen de recaudo: ${error.message}`, error)
     return data as CollectionReport
   }
 
@@ -467,7 +467,7 @@ export class SiigoCollectionsService {
 
     if (error) {
       if (error.code === 'PGRST103') return { rows: [] as CollectionLine[], count: count ?? null }
-      throw new Error(`No se pudieron consultar las líneas de recaudo: ${error.message}`)
+      throw dbError(`No se pudieron consultar las líneas de recaudo: ${error.message}`, error)
     }
     return {
       rows: ((data ?? []) as any[]).map(r => ({ ...r, applied_value: Number(r.applied_value ?? 0) })) as CollectionLine[],

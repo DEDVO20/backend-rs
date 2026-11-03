@@ -166,7 +166,7 @@ app.onError((err, c) => {
   logger.error({ err: err.message, code: (err as any).code, details: (err as any).details, path: c.req.path }, 'Error no manejado')
   // Esquema desactualizado (tabla/columna/relación inexistente): se informa aun en
   // producción, para saber que falta aplicar una migración.
-  const SCHEMA_CODES = ['42P01', '42703', 'PGRST200', 'PGRST204', 'PGRST205']
+  const SCHEMA_CODES = ['42P01', '42703', '42883', 'PGRST200', 'PGRST202', 'PGRST204', 'PGRST205', 'SIIGO_MIGRATION']
   if (SCHEMA_CODES.includes(String((err as any).code ?? ''))) {
     return c.json({ error: `Falta aplicar una migración en la base de datos: ${err.message}` }, 500)
   }
