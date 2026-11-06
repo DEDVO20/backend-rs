@@ -126,6 +126,14 @@ export function isRetentionTax(tx: unknown): boolean {
   return txt.includes('rete') || txt.includes('reten') || txt.includes('withhold') || txt.includes('retention')
 }
 
+/**
+ * Autorretención (p. ej. autorretención especial de renta 1,1 %): la asume el vendedor,
+ * no se descuenta al cliente ni del total de la factura. No es impuesto cargo ni retención.
+ */
+export function isAutoRetentionTax(tx: unknown): boolean {
+  return /auto\s*-?\s*rr?ete/.test(taxText(tx).normalize('NFD').replace(/[̀-ͯ]/g, ''))
+}
+
 export function isIcaTax(tx: unknown): boolean {
   const txt = taxText(tx)
   return txt.includes('ica') || txt.includes('industria') || txt.includes('comercio')

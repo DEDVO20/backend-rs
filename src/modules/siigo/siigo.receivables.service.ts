@@ -19,7 +19,7 @@ import {
   type CustomerControl,
 } from './siigo.receivables.js'
 import type { AuthUser } from '../../middleware/auth.js'
-import type { ListReceivablesQuery, ListSiigoCollectionsQuery, SyncReceivablesBody } from './siigo.schema.js'
+import type { ListReceivablesQuery, ReceivablesReportQuery, SyncReceivablesBody } from './siigo.schema.js'
 
 const REPORT_URL = `${SIIGO_CONFIG.SIIGO_BASE_URL}/v1/test-balance-report-by-thirdparty`
 const USERS_URL = `${SIIGO_CONFIG.SIIGO_BASE_URL}/v1/users`
@@ -286,7 +286,7 @@ export class SiigoReceivablesService {
    * Agregados de la cartera para las gráficas de los libros consultados.
    * La foto es siempre la última sincronizada; el periodo solo filtra la evolución diaria.
    */
-  static async getReport(query: ListSiigoCollectionsQuery, user: AuthUser) {
+  static async getReport(query: ReceivablesReportQuery, user: AuthUser) {
     const scope = await SiigoService.resolveScope(query, user)
     const { logs, isSyncRunning } = scope.books ? await this.getSyncLogs(scope.books.connectionId) : { logs: [], isSyncRunning: false }
     const base = {
@@ -306,6 +306,10 @@ export class SiigoReceivablesService {
       p_company_id: scope.companyId,
       p_from:       query.startDate ?? null,
       p_to:         query.endDate ?? null,
+      // Filtros cruzados de las gráficas: solo se envían si vienen (la firma sin ellos sigue sirviendo)
+      ...(query.bucket ? { p_bucket: query.bucket } : {}),
+      ...(query.seller ? { p_seller: query.seller } : {}),
+      ...(query.customerNit ? { p_nit: query.customerNit } : {}),
     })
     if (error) throw dbError(`No se pudieron calcular las gráficas de cartera: ${error.message}`, error)
     return { ...base, ...empty, ...((data ?? {}) as Obj) }

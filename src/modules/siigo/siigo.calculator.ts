@@ -2,8 +2,8 @@ import {
   round2,
   toNumberAbs,
   firstNonEmpty,
+  isAutoRetentionTax,
   isRetentionTax,
-  isIcaTax,
   taxAmountBestEffort,
   normalizeStatus,
   normalizeDateText,
@@ -232,16 +232,14 @@ export function calcVentaItemSiigo(it: Record<string, any>) {
   let impuestoCargo = 0
   let impuestoRetencion = 0
 
+  // Retenciones: ReteFuente, ReteIVA y ReteICA, que Siigo resta del total del documento
+  // (como en su informe "Ventas por cliente"). La autorretención no: la asume el vendedor.
   const taxes = Array.isArray(it.taxes) ? it.taxes : []
   for (const tx of taxes) {
+    if (isAutoRetentionTax(tx)) continue
     const amount = taxAmountBestEffort(tx)
-    if (isRetentionTax(tx)) {
-      if (!isIcaTax(tx)) {
-        impuestoRetencion += amount
-      }
-    } else {
-      impuestoCargo += amount
-    }
+    if (isRetentionTax(tx)) impuestoRetencion += amount
+    else impuestoCargo += amount
   }
 
   const withholdingTaxes = ([] as unknown[])
@@ -250,9 +248,7 @@ export function calcVentaItemSiigo(it: Record<string, any>) {
     .concat(Array.isArray(it.retention) ? it.retention : [])
 
   for (const r of withholdingTaxes) {
-    if (!isIcaTax(r)) {
-      impuestoRetencion += taxAmountBestEffort(r)
-    }
+    if (!isAutoRetentionTax(r)) impuestoRetencion += taxAmountBestEffort(r)
   }
 
   bruto = round2(bruto)
@@ -278,11 +274,19 @@ export function totalGlobalRetentions(doc: Record<string, any>): number {
     .concat(Array.isArray(doc.retention) ? doc.retention : [])
 
   for (const r of globalRetentions) {
-    if (!isIcaTax(r)) {
-      total += taxAmountBestEffort(r)
-    }
+    if (!isAutoRetentionTax(r)) total += taxAmountBestEffort(r)
   }
   return round2(total)
+}
+
+/**
+ * Tasa para llevar el documento a pesos. Los documentos en moneda extranjera (USD…) traen
+ * sus valores en esa moneda; el informe de Siigo los muestra en COP con la tasa del documento.
+ */
+export function exchangeRateOf(doc: Record<string, any>): number {
+  const code = String(doc?.currency?.code ?? 'COP').trim().toUpperCase()
+  const rate = Number(doc?.currency?.exchange_rate ?? 0)
+  return code && code !== 'COP' && Number.isFinite(rate) && rate > 0 ? rate : 1
 }
 
 export function totalCharges(doc: Record<string, any>): number {
@@ -442,6 +446,8 @@ export async function buildVentaLinesPorProducto(
 
   const period = fechaText.slice(0, 7)
   const items = Array.isArray(doc.items) ? doc.items : []
+  // Signo (NC negativas) y conversión a pesos de documentos en moneda extranjera
+  const factor = sign * exchangeRateOf(doc)
 
   if (!items.length) {
     const calcDocSinItems = calcVentaSiigo(doc)
@@ -460,14 +466,14 @@ export async function buildVentaLinesPorProducto(
       seller_id:           sellerId,
       product_code:        '',
       product_description: 'SIN PRODUCTO',
-      gross_value:         round2(calcDocSinItems.bruto * sign),
-      discount:            round2(calcDocSinItems.descuento * sign),
-      subtotal:            round2(calcDocSinItems.subtotal * sign),
-      tax_charge:          round2(calcDocSinItems.impuestoCargo * sign),
-      tax_retention:       round2(calcDocSinItems.impuestoRetencion * sign),
-      total_charges:       round2(calcDocSinItems.cargoTotales * sign),
-      total_discounts:     round2(calcDocSinItems.descuentoTotales * sign),
-      total:               round2(totalDocSinItems * sign),
+      gross_value:         round2(calcDocSinItems.bruto * factor),
+      discount:            round2(calcDocSinItems.descuento * factor),
+      subtotal:            round2(calcDocSinItems.subtotal * factor),
+      tax_charge:          round2(calcDocSinItems.impuestoCargo * factor),
+      tax_retention:       round2(calcDocSinItems.impuestoRetencion * factor),
+      total_charges:       round2(calcDocSinItems.cargoTotales * factor),
+      total_discounts:     round2(calcDocSinItems.descuentoTotales * factor),
+      total:               round2(totalDocSinItems * factor),
     }]
   }
 
@@ -547,14 +553,14 @@ export async function buildVentaLinesPorProducto(
     seller_id:           sellerId,
     product_code:        linea.codigoProducto,
     product_description: linea.descripcionProducto,
-    gross_value:         round2(linea.bruto * sign),
-    discount:            round2(linea.descuento * sign),
-    subtotal:            round2(linea.subtotal * sign),
-    tax_charge:          round2(linea.impuestoCargo * sign),
-    tax_retention:       round2(linea.impuestoRetencion * sign),
-    total_charges:       round2(linea.cargoTotales * sign),
-    total_discounts:     round2(linea.descuentoTotales * sign),
-    total:               round2(linea.total * sign),
+    gross_value:         round2(linea.bruto * factor),
+    discount:            round2(linea.descuento * factor),
+    subtotal:            round2(linea.subtotal * factor),
+    tax_charge:          round2(linea.impuestoCargo * factor),
+    tax_retention:       round2(linea.impuestoRetencion * factor),
+    total_charges:       round2(linea.cargoTotales * factor),
+    total_discounts:     round2(linea.descuentoTotales * factor),
+    total:               round2(linea.total * factor),
   }))
 }
 

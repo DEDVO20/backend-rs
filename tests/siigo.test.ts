@@ -148,3 +148,54 @@ describe('Siigo Calculator & Exporter (TypeScript)', () => {
     expect(buffer.byteLength).toBeGreaterThan(1000)
   })
 })
+
+describe('calcVentaSiigo · retenciones', () => {
+  it('resta la ReteICA del documento igual que Siigo (FV-2-119)', () => {
+    const c = calcVentaSiigo({
+      items: [{
+        price: 2_500_000, quantity: 1,
+        taxes: [
+          { name: 'IVA 19%', type: 'IVA', percentage: 19, value: 475_000 },
+          { name: 'ReteFuente 11%', type: 'Retefuente', percentage: 11, value: 275_000 },
+        ],
+      }],
+      retentions: [{ name: 'ReteICA 8,66', type: 'ReteICA', percentage: 8.66, value: 21_650 }],
+    })
+    expect(c.impuestoRetencion).toBe(296_650)
+    expect(c.total).toBe(2_678_350) // total de la factura en Siigo
+  })
+})
+
+describe('ventas Siigo · autorretención y moneda extranjera', () => {
+  const lookup = { getCustomerName: async () => 'Cliente', getProductDescription: async () => 'Servicios jurídicos' }
+
+  it('no resta la autorretención (FV-4-4164: total 1.875.814,56 en Siigo)', () => {
+    const c = calcVentaSiigo({
+      items: [{
+        price: 1_750_905, quantity: 1,
+        taxes: [
+          { name: 'IVA 19%', type: 'IVA', percentage: 19, value: 332_671.95 },
+          { name: 'Retefuente 11%', type: 'Retefuente', percentage: 11, value: 192_599.55 },
+          { name: 'Autorretención 1,1%', type: 'Autorretencion', percentage: 1.1, value: 19_259.96 },
+        ],
+      }],
+      retentions: [{ name: 'ReteICA 8,66', type: 'ReteICA', percentage: 8.66, value: 15_162.84 }],
+    })
+    expect(c.impuestoRetencion).toBe(207_762.39)
+    expect(c.total).toBe(1_875_814.56)
+  })
+
+  it('convierte a pesos los documentos en USD con la tasa del documento', async () => {
+    const lines = await buildVentaLinesPorProducto({
+      id: 'usd-1', name: 'FV-4-4447', date: '2026-05-10', status: 'approved',
+      currency: { code: 'USD', exchange_rate: 3691.5 },
+      customer: { identification: '364955097', branch_office: 0 },
+      items: [{ code: '010', description: 'Honorarios', price: 50_500, quantity: 1, taxes: [{ name: 'IVA 19%', type: 'IVA', value: 9_595 }] }],
+      total: 60_095,
+    }, 'FACTURA', 1, lookup as any, '2026-01-01', '2026-12-31')
+    expect(lines).toHaveLength(1)
+    expect(lines[0]!.subtotal).toBe(186_420_750)
+    expect(lines[0]!.tax_charge).toBe(35_419_942.5)
+    expect(lines[0]!.total).toBe(221_840_692.5)
+  })
+})

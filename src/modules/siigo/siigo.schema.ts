@@ -78,6 +78,14 @@ export const listReceivablesQuerySchema = z.object({
   limit:     z.coerce.number().int().positive().max(500).default(100),
 })
 
+const agingBucket = z.enum(['No vencido', '1-30', '31-60', '61-90', '91+', 'Sin vencimiento'])
+
+/** Gráficas de cartera: periodo de la evolución + filtros cruzados (edad, vendedor, cliente) */
+export const receivablesReportQuerySchema = listSiigoCollectionsQuerySchema.extend({
+  bucket: agingBucket.optional(),
+  seller: z.string().max(200).optional(),
+})
+
 export const syncLogsQuerySchema = z.object({ connectionId })
 
 /** Credenciales y ajustes de una conexión. accessKey vacía o ausente = conservar la actual */
@@ -97,6 +105,7 @@ export type SyncTrialBalanceBody = z.infer<typeof syncTrialBalanceBodySchema>
 export type SyncReceivablesBody = z.infer<typeof syncReceivablesBodySchema>
 export type ListReceivablesQuery = z.infer<typeof listReceivablesQuerySchema>
 export type ListSiigoCollectionsQuery = z.infer<typeof listSiigoCollectionsQuerySchema>
+export type ReceivablesReportQuery = z.infer<typeof receivablesReportQuerySchema>
 export type SyncSiigoCollectionsBody = z.infer<typeof syncSiigoCollectionsBodySchema>
 export type SyncSiigoBody       = z.infer<typeof syncSiigoBodySchema>
 export type SaveSiigoConnectionBody = z.infer<typeof saveSiigoConnectionBodySchema>

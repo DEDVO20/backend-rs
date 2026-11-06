@@ -11,6 +11,7 @@ import { SiigoConnections } from './siigo.connections.js'
 import {
   listReceivablesQuerySchema,
   listSiigoCollectionsQuerySchema,
+  receivablesReportQuerySchema,
   listSiigoSalesQuerySchema,
   listTrialBalanceQuerySchema,
   saveSiigoConnectionBodySchema,
@@ -199,7 +200,7 @@ app.get('/receivables', zValidator('query', listReceivablesQuerySchema), async (
 )
 
 // GET /api/siigo/receivables/report — edades, clientes, vendedores y evolución de la cartera
-app.get('/receivables/report', zValidator('query', listSiigoCollectionsQuerySchema), async (c) =>
+app.get('/receivables/report', zValidator('query', receivablesReportQuerySchema), async (c) =>
   c.json(await SiigoReceivablesService.getReport(c.req.valid('query'), c.get('user'))),
 )
 
