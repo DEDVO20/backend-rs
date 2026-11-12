@@ -4,6 +4,7 @@ import { Hono }           from 'hono'
 import { cors }           from 'hono/cors'
 import { secureHeaders }  from 'hono/secure-headers'
 import { csrf }           from 'hono/csrf'
+import { HTTPException }  from 'hono/http-exception'
 import { logger }  from './lib/logger.js'
 import { rateLimiter }       from './middleware/rateLimiter.js'
 import { auditMiddleware }   from './middleware/auditMiddleware.js'
@@ -29,6 +30,7 @@ import { collectionRoutes } from './modules/collection/collection.routes.js'
 import { accountingRoutes } from './modules/accounting/accounting.routes.js'
 import { participationsRoutes } from './modules/participations/participations.routes.js'
 import { siigoRoutes }          from './modules/siigo/siigo.routes.js'
+import { hubspotRoutes }        from './modules/hubspot/hubspot.routes.js'
 import { taxRoutes }            from './modules/tax/tax.routes.js'
 import { documentsRoutes }  from './modules/documents/documents.routes.js'
 import { auditRoutes }      from './modules/audit/audit.routes.js'
@@ -143,6 +145,7 @@ app.route('/api/collection',  collectionRoutes)
 app.route('/api/accounting',  accountingRoutes)
 app.route('/api/participations', participationsRoutes)
 app.route('/api/siigo',          siigoRoutes)
+app.route('/api/hubspot',        hubspotRoutes)
 app.route('/api/tax',            taxRoutes)
 app.route('/api/documents',   documentsRoutes)
 app.route('/api/audit',       auditRoutes)
@@ -156,7 +159,8 @@ app.notFound((c) => c.json({ error: 'Ruta no encontrada' }, 404))
 
 // ── Error handler ─────────────────────────────────────────────────────────────────────────
 app.onError((err, c) => {
-  const statusCode = (err as any).statusCode ?? 500
+  // HTTPException (p. ej. el 403 del middleware CSRF) trae su status en `.status`
+  const statusCode = (err as any).statusCode ?? (err instanceof HTTPException ? err.status : 500)
 
   // Hono's onError creates a fresh response that bypasses the CORS middleware.
   // We must re-inject CORS headers manually so the browser can read the error body.
@@ -168,7 +172,7 @@ app.onError((err, c) => {
   }
 
   if (statusCode < 500) {
-    return c.json({ error: err.message }, statusCode)
+    return c.json({ error: err.message || (statusCode === 403 ? 'Solicitud bloqueada (origen no permitido)' : 'Solicitud inválida') }, statusCode)
   }
   logger.error({ err: err.message, code: (err as any).code, details: (err as any).details, path: c.req.path }, 'Error no manejado')
   // Esquema desactualizado (tabla/columna/relación inexistente): se informa aun en

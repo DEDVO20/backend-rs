@@ -156,6 +156,26 @@ async function processJob(jobName: string) {
         break
       }
 
+      case 'hubspot-daily-sync': {
+        // Negocios de HubSpot de cada conexión activa con token; un fallo no detiene las demás
+        const { HubspotService } = await import('../modules/hubspot/hubspot.service.js')
+        const targets = await HubspotService.syncTargets()
+        const results: Record<string, unknown> = {}
+        let failed = 0
+        for (const conn of targets) {
+          try {
+            const log = await HubspotService.sync(conn.id)
+            results[conn.label] = { deals: log.deals_count }
+          } catch (err: any) {
+            if (err?.statusCode !== 409) failed++
+            results[conn.label] = { error: err.message }
+          }
+        }
+        if (targets.length && failed === targets.length) throw new Error('HubSpot falló en todas las conexiones')
+        result = targets.length ? results : { skipped: true, reason: 'No hay conexiones de HubSpot activas con token' }
+        break
+      }
+
       default:
         logger.warn({ jobName }, 'Cron: job desconocido')
         return
@@ -248,5 +268,10 @@ async function setupRepeatableJobs() {
     repeat: { pattern: '0 8 * * *' },
   })
 
-  logger.info('Cron jobs registrados: generate-tasks (diario 6AM), send-reminders (diario 7AM), mark-overdue (diario 1AM), tax-calendar-tasks (diario 6:30AM), tax-calendar-reminders (diario 7:15AM), participations-monthly-oc (día 1 6AM), siigo-daily-sync (diario 2AM), siigo-daily-collections (diario 2:30AM), siigo-daily-receivables (diario 3AM), siigo-daily-trial-balance (diario 6AM)')
+  // CRM HubSpot (gráficas de propuestas) — diario 3:30 AM Colombia (8:30 UTC)
+  await cronQueue.add('hubspot-daily-sync', {}, {
+    repeat: { pattern: '30 8 * * *' },
+  })
+
+  logger.info('Cron jobs registrados: generate-tasks (diario 6AM), send-reminders (diario 7AM), mark-overdue (diario 1AM), tax-calendar-tasks (diario 6:30AM), tax-calendar-reminders (diario 7:15AM), participations-monthly-oc (día 1 6AM), siigo-daily-sync (diario 2AM), siigo-daily-collections (diario 2:30AM), siigo-daily-receivables (diario 3AM), hubspot-daily-sync (diario 3:30AM), siigo-daily-trial-balance (diario 6AM)')
 }
