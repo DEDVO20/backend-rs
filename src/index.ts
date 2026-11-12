@@ -3,6 +3,7 @@ import { serve }          from '@hono/node-server'
 import { Hono }           from 'hono'
 import { cors }           from 'hono/cors'
 import { secureHeaders }  from 'hono/secure-headers'
+import { csrf }           from 'hono/csrf'
 import { logger }  from './lib/logger.js'
 import { rateLimiter }       from './middleware/rateLimiter.js'
 import { auditMiddleware }   from './middleware/auditMiddleware.js'
@@ -54,6 +55,14 @@ app.use('*', cors({
   maxAge:       600,
   credentials:  true,
 }))
+
+// ── CSRF ──────────────────────────────────────────────────────────────────────
+// La sesión viaja en cookies httpOnly: se rechazan envíos "simples" (form,
+// multipart, text/plain) desde orígenes no permitidos. Los JSON cross-origin ya
+// los frena el preflight de CORS.
+const csrfGuard = csrf({ origin: (origin) => allowedOrigins.includes(origin) })
+app.use('/api/*',  csrfGuard)
+app.use('/auth/*', csrfGuard)
 
 // ── Errores que no son instancia de Error ─────────────────────────────────────
 // Supabase devuelve `error` como objeto plano ({ message, code, details }) y el

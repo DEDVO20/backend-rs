@@ -67,8 +67,10 @@ import { authRoutes } from '../src/modules/auth/auth.routes.js'
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+const cookies = (res: Response) => res.headers.getSetCookie()
+
 describe('POST /login', () => {
-  it('devuelve tokens con credenciales válidas', async () => {
+  it('emite los tokens en cookies httpOnly y no en el body', async () => {
     const res = await authRoutes.request('/login', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -77,9 +79,17 @@ describe('POST /login', () => {
 
     expect(res.status).toBe(200)
     const body = await res.json() as any
-    expect(body).toHaveProperty('access_token', 'tok_access')
-    expect(body).toHaveProperty('refresh_token', 'tok_refresh')
+    expect(body).not.toHaveProperty('access_token')
+    expect(body).not.toHaveProperty('refresh_token')
     expect(body.user).toMatchObject({ id: 'user-uuid-123', email: 'test@empresa.com' })
+
+    const set = cookies(res)
+    const at = set.find(c => c.startsWith('rs_at=tok_access'))
+    const rt = set.find(c => c.startsWith('rs_rt=tok_refresh'))
+    expect(at).toMatch(/HttpOnly/i)
+    expect(at).toMatch(/Path=\//)
+    expect(rt).toMatch(/HttpOnly/i)
+    expect(rt).toMatch(/Path=\/auth/)
   })
 
   it('rechaza credenciales inválidas', async () => {
@@ -110,20 +120,24 @@ describe('POST /login', () => {
 })
 
 describe('POST /refresh', () => {
-  it('devuelve nuevos tokens con refresh_token válido', async () => {
+  it('renueva las cookies con la cookie de refresh válida', async () => {
     const res = await authRoutes.request('/refresh', {
       method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ refresh_token: 'tok_refresh' }),
+      headers: { Cookie: 'rs_rt=tok_refresh' },
     })
 
     expect(res.status).toBe(200)
     const body = await res.json() as any
-    expect(body).toHaveProperty('access_token')
-    expect(body).toHaveProperty('refresh_token')
+    expect(body).not.toHaveProperty('access_token')
+    expect(cookies(res).some(c => c.startsWith('rs_at=tok_access'))).toBe(true)
   })
 
-  it('rechaza refresh_token inválido', async () => {
+  it('responde 401 sin cookie de refresh', async () => {
+    const res = await authRoutes.request('/refresh', { method: 'POST' })
+    expect(res.status).toBe(401)
+  })
+
+  it('rechaza refresh token inválido y limpia las cookies', async () => {
     const { supabasePublic } = await import('../src/lib/supabase.js')
     vi.mocked(supabasePublic.auth.refreshSession).mockResolvedValueOnce({
       data:  { session: null, user: null } as any,
@@ -132,11 +146,33 @@ describe('POST /refresh', () => {
 
     const res = await authRoutes.request('/refresh', {
       method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ refresh_token: 'expired' }),
+      headers: { Cookie: 'rs_rt=expired' },
     })
 
     expect(res.status).toBe(401)
+    expect(cookies(res).some(c => /^rs_rt=;/.test(c) && /Max-Age=0/i.test(c))).toBe(true)
+  })
+})
+
+describe('POST /logout', () => {
+  it('revoca la sesión con el JWT y limpia las cookies', async () => {
+    const { supabase } = await import('../src/lib/supabase.js')
+    const res = await authRoutes.request('/logout', {
+      method:  'POST',
+      headers: { Cookie: 'rs_at=tok_access; rs_rt=tok_refresh' },
+    })
+
+    expect(res.status).toBe(200)
+    expect(supabase.auth.admin.signOut).toHaveBeenCalledWith('tok_access', 'global')
+    const set = cookies(res)
+    expect(set.some(c => /^rs_at=;/.test(c))).toBe(true)
+    expect(set.some(c => /^rs_rt=;/.test(c))).toBe(true)
+  })
+
+  it('limpia las cookies aunque no haya sesión', async () => {
+    const res = await authRoutes.request('/logout', { method: 'POST' })
+    expect(res.status).toBe(200)
+    expect(cookies(res).some(c => /^rs_rt=;/.test(c))).toBe(true)
   })
 })
 
@@ -212,13 +248,6 @@ describe('POST /reset-password', () => {
       body:    JSON.stringify({ access_token: 'invalid', password: 'NuevaPassword123' }),
     })
 
-    expect(res.status).toBe(401)
-  })
-})
-
-describe('POST /logout', () => {
-  it('rechaza sin token', async () => {
-    const res = await authRoutes.request('/logout', { method: 'POST' })
     expect(res.status).toBe(401)
   })
 })

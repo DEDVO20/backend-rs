@@ -1,6 +1,7 @@
 import type { Context, Next } from 'hono'
 import { supabasePublic, supabase } from '../lib/supabase.js'
 import type { Role } from '../lib/permissions.js'
+import { readAccessToken } from '../lib/authCookies.js'
 
 export type AuthUser = {
   id:        string
@@ -28,8 +29,12 @@ function pruneAuthCache() {
   }
 }
 
+export function invalidateAuthCache(token: string) {
+  authCache.delete(token)
+}
+
 export async function authMiddleware(c: Context, next: Next) {
-  const token = c.req.header('Authorization')?.replace('Bearer ', '')
+  const token = readAccessToken(c)
 
   if (!token) {
     return c.json({ error: 'No autorizado — falta el token' }, 401)

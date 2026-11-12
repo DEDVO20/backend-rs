@@ -2,11 +2,12 @@ import { Hono }         from 'hono'
 import { zValidator }   from '@hono/zod-validator'
 import { z }            from 'zod'
 import { supabasePublic, supabase } from '../../lib/supabase.js'
-import { authMiddleware }           from '../../middleware/auth.js'
+import { authMiddleware, invalidateAuthCache } from '../../middleware/auth.js'
 import { getModulesForRole, getPermissionsForRole } from '../../lib/permissions.js'
 import { auditAsync }               from '../../lib/audit.js'
 import { rateLimiter }              from '../../middleware/rateLimiter.js'
 import { logger }                   from '../../lib/logger.js'
+import { setAuthCookies, clearAuthCookies, readAccessToken, readRefreshToken } from '../../lib/authCookies.js'
 
 const app = new Hono()
 
@@ -16,10 +17,6 @@ const authLimiter = rateLimiter({ windowMs: 15 * 60 * 1000, max: 5, keyPrefix: '
 const loginSchema = z.object({
   email:    z.string().email(),
   password: z.string().min(6),
-})
-
-const refreshSchema = z.object({
-  refresh_token: z.string().min(1),
 })
 
 const forgotPasswordSchema = z.object({
@@ -48,10 +45,11 @@ app.post('/login',
     auditAsync({ action: 'login', resource: 'auth', resource_id: data.user.id, c,
       metadata: { email: data.user.email } })
 
+    // Los tokens NO van en el body: solo en cookies httpOnly
+    setAuthCookies(c, data.session)
+
     return c.json({
-      access_token:  data.session.access_token,
-      refresh_token: data.session.refresh_token,
-      expires_in:    data.session.expires_in,
+      expires_in: data.session.expires_in,
       user: {
         id:    data.user.id,
         email: data.user.email,
@@ -60,43 +58,47 @@ app.post('/login',
   },
 )
 
-// POST /auth/refresh
-app.post('/refresh',
-  zValidator('json', refreshSchema),
-  async (c) => {
-    const { refresh_token } = c.req.valid('json')
-
-    const { data, error } = await supabasePublic.auth.refreshSession({ refresh_token })
-
-    if (error || !data.session) {
-      return c.json({ error: 'Refresh token inválido o expirado' }, 401)
-    }
-
-    return c.json({
-      access_token:  data.session.access_token,
-      refresh_token: data.session.refresh_token,
-      expires_in:    data.session.expires_in,
-      user: {
-        id:    data.user!.id,
-        email: data.user!.email,
-      },
-    })
-  },
-)
-
-// POST /auth/logout
-app.post('/logout', authMiddleware, async (c) => {
-  const { id } = c.get('user')
-
-  // Revocar todas las sesiones del usuario usando service_role
-  const { error } = await supabase.auth.admin.signOut(id)
-
-  if (error) {
-    return c.json({ error: 'No se pudo cerrar la sesión' }, 500)
+// POST /auth/refresh — lee el refresh token de la cookie httpOnly
+app.post('/refresh', async (c) => {
+  const refresh_token = readRefreshToken(c)
+  if (!refresh_token) {
+    return c.json({ error: 'Sesión expirada' }, 401)
   }
 
-  auditAsync({ action: 'logout', resource: 'auth', resource_id: id, user: c.get('user'), c })
+  const { data, error } = await supabasePublic.auth.refreshSession({ refresh_token })
 
+  if (error || !data.session) {
+    clearAuthCookies(c)
+    return c.json({ error: 'Refresh token inválido o expirado' }, 401)
+  }
+
+  setAuthCookies(c, data.session)
+
+  return c.json({
+    expires_in: data.session.expires_in,
+    user: {
+      id:    data.user!.id,
+      email: data.user!.email,
+    },
+  })
+})
+
+// POST /auth/logout — siempre limpia las cookies, aunque el access token ya haya expirado
+app.post('/logout', async (c) => {
+  const token = readAccessToken(c)
+
+  if (token) {
+    invalidateAuthCache(token)
+    const { data: { user } } = await supabasePublic.auth.getUser(token)
+    if (user) {
+      // admin.signOut recibe el JWT de la sesión (no el id del usuario)
+      const { error } = await supabase.auth.admin.signOut(token, 'global')
+      if (error) logger.warn({ err: error.message, userId: user.id }, 'logout: no se pudo revocar la sesión')
+      auditAsync({ action: 'logout', resource: 'auth', resource_id: user.id, c })
+    }
+  }
+
+  clearAuthCookies(c)
   return c.json({ message: 'Sesión cerrada correctamente' })
 })
 
