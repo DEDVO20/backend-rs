@@ -39,6 +39,9 @@ app.post('/login',
     const { data, error } = await supabasePublic.auth.signInWithPassword({ email, password })
 
     if (error || !data.session) {
+      // Motivo real solo en logs (invalid_credentials, email_not_confirmed, user_banned…);
+      // al cliente siempre el mismo mensaje para no revelar si el correo existe.
+      logger.warn({ email, code: error?.code ?? 'no_session', status: error?.status, msg: error?.message }, 'login rechazado por Supabase')
       return c.json({ error: 'Credenciales inválidas' }, 401)
     }
 

@@ -19,11 +19,17 @@ function sameSite(): 'Lax' | 'Strict' | 'None' {
   return 'Lax'
 }
 
-function baseOptions(): CookieOptions {
+// HTTPS detrás del proxy de Railway llega como x-forwarded-proto=https
+function isHttps(c: Context): boolean {
+  const proto = c.req.header('x-forwarded-proto')?.split(',')[0].trim()
+  return proto === 'https' || new URL(c.req.url).protocol === 'https:'
+}
+
+function baseOptions(c: Context): CookieOptions {
   const ss = sameSite()
   return {
     httpOnly: true,
-    secure:   isProd || ss === 'None',
+    secure:   isProd || ss === 'None' || isHttps(c),
     sameSite: ss,
     ...(process.env.COOKIE_DOMAIN ? { domain: process.env.COOKIE_DOMAIN } : {}),
   }
@@ -37,7 +43,7 @@ export function setAuthCookies(
   c: Context,
   session: { access_token: string; refresh_token: string; expires_in?: number },
 ) {
-  const opts = baseOptions()
+  const opts = baseOptions(c)
   setCookie(c, ACCESS_COOKIE, session.access_token, {
     ...opts,
     path:   '/',
@@ -51,7 +57,7 @@ export function setAuthCookies(
 }
 
 export function clearAuthCookies(c: Context) {
-  const opts = baseOptions()
+  const opts = baseOptions(c)
   deleteCookie(c, ACCESS_COOKIE,  { ...opts, path: '/' })
   deleteCookie(c, REFRESH_COOKIE, { ...opts, path: REFRESH_PATH })
 }
