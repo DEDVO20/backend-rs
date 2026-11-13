@@ -6,7 +6,7 @@ import { SiigoService } from '../siigo/siigo.service.js'
 import { HubspotClient } from './hubspot.client.js'
 import { ownerName, stagesFromPipelines, toDealRow } from './hubspot.domain.js'
 import type { AuthUser } from '../../middleware/auth.js'
-import type { HubspotReportQuery, SaveHubspotConnectionBody } from './hubspot.schema.js'
+import type { HubspotReportQuery, ListHubspotDealsQuery, SaveHubspotConnectionBody } from './hubspot.schema.js'
 
 const INTERNAL_ROLES = ['admin', 'rs_admin', 'rs_staff', 'contador']
 const COLUMNS = 'id, company_id, is_platform, label, token_enc, active, last_test_at, last_test_ok, last_test_message, updated_at'
@@ -228,6 +228,56 @@ export class HubspotService {
       .limit(20)
     if (error) throw dbError(`No se pudieron consultar los logs de HubSpot: ${error.message}`, error)
     return { isSyncRunning: this.isRunning(connectionId), logs: (data ?? []) as HubspotSyncLog[] }
+  }
+
+  // ── Detalle de negocios ────────────────────────────────────────────────────
+
+  /** Negocios paginados (más recientes primero) con los filtros de la pestaña CRM */
+  static async listDeals(query: ListHubspotDealsQuery, user: AuthUser) {
+    const conn = await this.resolveScope(query, user)
+    const base = { page: query.page, limit: query.limit }
+    if (!conn || !this.hasToken(conn)) {
+      return { ...base, connection: conn ? this.toPublic(conn) : null, notConnected: true, isSyncRunning: false, lastSync: null, data: [], total: 0, stages: [], owners: [] }
+    }
+
+    // La fecha del negocio es la de cierre (o la de creación si no la tiene), como en las gráficas
+    let q = supabase.from('hubspot_deals').select('*', { count: 'exact' }).eq('connection_id', conn.id)
+    if (query.startDate) q = q.or(`close_date.gte.${query.startDate},and(close_date.is.null,create_date.gte.${query.startDate})`)
+    if (query.endDate) q = q.or(`close_date.lte.${query.endDate},and(close_date.is.null,create_date.lte.${query.endDate})`)
+    if (query.kind) q = q.eq('stage_kind', query.kind)
+    if (query.stage) q = q.eq('stage_label', query.stage)
+    if (query.owner) q = query.owner === 'Sin asignar' ? q.eq('owner_name', '') : q.eq('owner_name', query.owner)
+    const search = query.search?.replace(/[,()*%\\]/g, ' ').trim()
+    if (search) q = q.or(`name.ilike.%${search}%,owner_name.ilike.%${search}%`)
+
+    const from = (query.page - 1) * query.limit
+    const [pageRes, catalogRes, { logs, isSyncRunning }] = await Promise.all([
+      q.order('close_date', { ascending: false, nullsFirst: false }).order('create_date', { ascending: false }).range(from, from + query.limit - 1),
+      supabase.from('hubspot_deals').select('stage_label, stage_order, owner_name').eq('connection_id', conn.id).limit(10000),
+      this.getSyncLogs(conn.id),
+    ])
+    if (pageRes.error && pageRes.error.code !== 'PGRST103') throw dbError(`No se pudieron consultar los negocios de HubSpot: ${pageRes.error.message}`, pageRes.error)
+    if (catalogRes.error) throw dbError(`No se pudieron consultar las etapas de HubSpot: ${catalogRes.error.message}`, catalogRes.error)
+
+    // Catálogos para los filtros: etapas en el orden del embudo y socios
+    const stageOrder = new Map<string, number>()
+    const owners = new Set<string>()
+    for (const r of (catalogRes.data ?? []) as { stage_label: string; stage_order: number; owner_name: string }[]) {
+      stageOrder.set(r.stage_label, Math.min(stageOrder.get(r.stage_label) ?? Infinity, r.stage_order))
+      owners.add(r.owner_name || 'Sin asignar')
+    }
+
+    return {
+      ...base,
+      connection:    this.toPublic(conn),
+      notConnected:  false,
+      isSyncRunning,
+      lastSync:      logs[0] ?? null,
+      data:          ((pageRes.data ?? []) as Record<string, any>[]).map(r => ({ ...r, amount: Number(r.amount ?? 0) })),
+      total:         pageRes.count ?? 0,
+      stages:        [...stageOrder].sort((a, b) => a[1] - b[1]).map(([s]) => s),
+      owners:        [...owners].sort((a, b) => a.localeCompare(b, 'es')),
+    }
   }
 
   // ── Informe ────────────────────────────────────────────────────────────────

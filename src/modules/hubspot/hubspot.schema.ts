@@ -19,6 +19,15 @@ export const hubspotReportQuerySchema = z.object({
   endDate:      isoDate.optional(),
 })
 
+export const listHubspotDealsQuerySchema = hubspotReportQuerySchema.extend({
+  kind:   z.enum(['open', 'sent', 'won', 'lost']).optional(),
+  stage:  z.string().max(200).optional(),
+  owner:  z.string().max(200).optional(),
+  search: z.string().max(100).optional(),
+  page:   z.coerce.number().int().positive().default(1),
+  limit:  z.coerce.number().int().positive().max(500).default(100),
+})
+
 export const hubspotSyncBodySchema = z.object({
   connectionId: z.string().uuid().optional(),
   companyId:    z.string().uuid().optional(),
@@ -26,3 +35,4 @@ export const hubspotSyncBodySchema = z.object({
 
 export type SaveHubspotConnectionBody = z.infer<typeof saveHubspotConnectionBodySchema>
 export type HubspotReportQuery = z.infer<typeof hubspotReportQuerySchema>
+export type ListHubspotDealsQuery = z.infer<typeof listHubspotDealsQuerySchema>

@@ -4,7 +4,7 @@ import { authMiddleware } from '../../middleware/auth.js'
 import { requireModule, requirePermission, requireRole } from '../../middleware/requireRole.js'
 import { logger } from '../../lib/logger.js'
 import { HubspotService } from './hubspot.service.js'
-import { hubspotReportQuerySchema, hubspotSyncBodySchema, saveHubspotConnectionBodySchema } from './hubspot.schema.js'
+import { hubspotReportQuerySchema, hubspotSyncBodySchema, listHubspotDealsQuerySchema, saveHubspotConnectionBodySchema } from './hubspot.schema.js'
 
 /**
  * CRM (HubSpot). Las gráficas viven junto a las de Siigo, así que usan el mismo módulo y permisos.
@@ -39,6 +39,11 @@ app.post('/connections/:id/test', requirePermission('siigo', 'update'), async (c
 // GET /api/hubspot/report — valor por etapa y socio, y conversión mensual
 app.get('/report', zValidator('query', hubspotReportQuerySchema), async (c) =>
   c.json(await HubspotService.getReport(c.req.valid('query'), c.get('user'))),
+)
+
+// GET /api/hubspot/deals — detalle de negocios (pestaña CRM de Consultas Siigo)
+app.get('/deals', zValidator('query', listHubspotDealsQuerySchema), async (c) =>
+  c.json(await HubspotService.listDeals(c.req.valid('query'), c.get('user'))),
 )
 
 // POST /api/hubspot/sync — trae los negocios en segundo plano (202)
