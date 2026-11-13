@@ -8,6 +8,30 @@ type Obj = Record<string, any>
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
+/** Nombre legible de la consulta, para los mensajes de error */
+function describePath(path: string): string {
+  if (path.includes('/owners')) return 'los socios (owners)'
+  if (path.includes('/pipelines')) return 'las etapas de negocios (pipelines)'
+  if (path.includes('/deals')) return 'los negocios (deals)'
+  return path
+}
+
+/** Permisos que HubSpot pide en un 403 (errors[].context.requiredGranularScopes o requiredScopes) */
+export function missingScopes(body: string): string {
+  try {
+    const json = JSON.parse(body)
+    const scopes = new Set<string>()
+    for (const e of Array.isArray(json?.errors) ? json.errors : []) {
+      for (const k of ['requiredGranularScopes', 'requiredScopes', 'requiredAllScopes']) {
+        for (const s of Array.isArray(e?.context?.[k]) ? e.context[k] : []) scopes.add(String(s))
+      }
+    }
+    return [...scopes].join(' o ')
+  } catch {
+    return ''
+  }
+}
+
 /** Cliente de la API de HubSpot con token de private app (scopes: crm.objects.deals.read, crm.objects.owners.read) */
 export class HubspotClient {
   public requestCount = 0
@@ -34,8 +58,21 @@ export class HubspotClient {
         waitMs = Math.min(waitMs * 2, 30_000)
         continue
       }
-      if (resp.status === 401) throw Object.assign(new Error('HubSpot rechazó el token (401). Revisa el token de la private app.'), { statusCode: 400 })
-      if (resp.status === 403) throw Object.assign(new Error(`HubSpot negó el acceso (403): faltan permisos en la private app. ${body.slice(0, 300)}`), { statusCode: 400 })
+      if (resp.status === 401) {
+        // Motivo que da HubSpot (token vencido, inválido, de otra cuenta…) y pista si no es un token de private app
+        let reason = ''
+        try { reason = String(JSON.parse(body)?.message ?? '') } catch { reason = body.slice(0, 200) }
+        const hint = /^pat-/i.test(this.token)
+          ? 'El token tiene el formato correcto: puede estar revocado o haber sido rotado en HubSpot.'
+          : 'El valor guardado no es un token de private app (debe empezar por "pat-", ej. pat-na1-…); no uses el client secret ni el ID de la app.'
+        throw Object.assign(new Error(`HubSpot rechazó el token (401)${reason ? `: ${reason}` : ''}. ${hint}`), { statusCode: 400 })
+      }
+      if (resp.status === 403) {
+        throw Object.assign(new Error(
+          `HubSpot negó el acceso (403) al consultar ${describePath(path)}: a la app privada le faltan permisos. ` +
+          `Agrega en HubSpot (Apps privadas → Alcances) ${missingScopes(body) || 'crm.objects.deals.read y crm.objects.owners.read'} y vuelve a probar.`,
+        ), { statusCode: 400 })
+      }
       if (!resp.ok) throw new Error(`HubSpot respondió ${resp.status} en ${path}: ${body.slice(0, 500)}`)
       return body ? JSON.parse(body) : {}
     }

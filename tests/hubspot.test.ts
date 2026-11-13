@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { hubspotDate, ownerName, stageKind, stagesFromPipelines, toDealRow } from '../src/modules/hubspot/hubspot.domain.js'
+import { cleanToken, hubspotDate, ownerName, stageKind, stagesFromPipelines, toDealRow } from '../src/modules/hubspot/hubspot.domain.js'
+import { missingScopes } from '../src/modules/hubspot/hubspot.client.js'
 
 describe('stageKind', () => {
   it('clasifica las etapas de RAD por su nombre', () => {
@@ -50,5 +51,25 @@ describe('toDealRow', () => {
   it('acepta fechas en milisegundos', () => {
     expect(hubspotDate('1760547600000')).toBe('2025-10-15')
     expect(hubspotDate('')).toBeNull()
+  })
+})
+
+describe('cleanToken', () => {
+  it('quita "Bearer ", espacios y saltos de línea sin tocar el token', () => {
+    expect(cleanToken('  Bearer pat-na1-abc-123\n')).toBe('pat-na1-abc-123')
+    expect(cleanToken('pat-na1-ab c\r\n-123')).toBe('pat-na1-abc-123')
+    expect(cleanToken('pat-eu1-sss')).toBe('pat-eu1-sss')
+  })
+})
+
+describe('missingScopes', () => {
+  it('lista los permisos que HubSpot pide en un 403', () => {
+    const body = JSON.stringify({
+      status: 'error',
+      message: "This app hasn't been granted all required scopes to make this call.",
+      errors: [{ message: 'One or more of the following scopes are required.', context: { requiredGranularScopes: ['crm.objects.owners.read'] } }],
+    })
+    expect(missingScopes(body)).toBe('crm.objects.owners.read')
+    expect(missingScopes('no es json')).toBe('')
   })
 })

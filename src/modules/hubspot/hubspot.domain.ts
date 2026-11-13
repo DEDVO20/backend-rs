@@ -106,3 +106,8 @@ export function toDealRow(deal: Obj, stages: Map<string, StageInfo>, owners: Map
     create_date:    hubspotDate(p.createdate),
   }
 }
+
+/** Token tal como lo pegan: sin "Bearer " delante ni espacios o saltos de línea */
+export function cleanToken(raw: string): string {
+  return raw.trim().replace(/^bearer\s+/i, '').replace(/\s+/g, '')
+}

@@ -4,7 +4,7 @@ import { decryptSecret, encryptSecret } from '../../lib/secretBox.js'
 import { dbError } from '../siigo/siigo.helpers.js'
 import { SiigoService } from '../siigo/siigo.service.js'
 import { HubspotClient } from './hubspot.client.js'
-import { ownerName, stagesFromPipelines, toDealRow } from './hubspot.domain.js'
+import { cleanToken, ownerName, stagesFromPipelines, toDealRow } from './hubspot.domain.js'
 import type { AuthUser } from '../../middleware/auth.js'
 import type { HubspotReportQuery, ListHubspotDealsQuery, SaveHubspotConnectionBody } from './hubspot.schema.js'
 
@@ -41,7 +41,6 @@ export interface HubspotSyncLog {
 }
 
 const envToken = () => process.env.HUBSPOT_ACCESS_TOKEN?.trim() || ''
-
 function httpError(message: string, statusCode: number) {
   return Object.assign(new Error(message), { statusCode })
 }
@@ -98,7 +97,8 @@ export class HubspotService {
     const changes: Record<string, unknown> = { updated_at: new Date().toISOString(), updated_by: userId, label: company.name }
     if (input.active !== undefined) changes.active = input.active
     if (input.token?.trim()) {
-      changes.token_enc = encryptSecret(input.token.trim())
+      // Se quitan espacios, saltos de línea y un "Bearer " pegado por error al copiar el token
+      changes.token_enc = encryptSecret(cleanToken(input.token))
       changes.last_test_ok = null
       changes.last_test_at = null
       changes.last_test_message = null
