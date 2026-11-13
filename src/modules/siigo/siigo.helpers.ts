@@ -195,3 +195,21 @@ export function incrementalStartDate(lastEndDate: string | null, overlapDays: nu
 export function dbError(message: string, err: { code?: string; details?: string | null } | null | undefined): Error {
   return Object.assign(new Error(message), { code: err?.code, details: err?.details ?? undefined })
 }
+
+/**
+ * Meses elegidos de un año → rangos de fechas, uniendo los meses seguidos
+ * (ej. 2026 [1,2,3,7] → 2026-01-01..2026-03-31 y 2026-07-01..2026-07-31).
+ */
+export function monthRanges(year: number, months: number[]): { startDate: string; endDate: string }[] {
+  const sorted = [...new Set(months)].filter(m => m >= 1 && m <= 12).sort((a, b) => a - b)
+  const out: { startDate: string; endDate: string }[] = []
+  const pad = (n: number) => String(n).padStart(2, '0')
+  for (let i = 0; i < sorted.length; i++) {
+    const first = sorted[i]!
+    let last = first
+    while (sorted[i + 1] === last + 1) last = sorted[++i]!
+    const lastDay = new Date(Date.UTC(year, last, 0)).getUTCDate()
+    out.push({ startDate: `${year}-${pad(first)}-01`, endDate: `${year}-${pad(last)}-${pad(lastDay)}` })
+  }
+  return out
+}

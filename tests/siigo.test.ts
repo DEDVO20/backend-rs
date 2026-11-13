@@ -6,7 +6,7 @@ import {
   distribuirValorPorProducto,
 } from '../src/modules/siigo/siigo.calculator.js'
 import { buildSiigoExcelBuffer } from '../src/modules/siigo/siigo.exporter.js'
-import { incrementalStartDate, matchCompanyByNit } from '../src/modules/siigo/siigo.helpers.js'
+import { incrementalStartDate, matchCompanyByNit, monthRanges } from '../src/modules/siigo/siigo.helpers.js'
 
 describe('incrementalStartDate', () => {
   it('arranca desde la última sync menos el solape', () => {
@@ -197,5 +197,16 @@ describe('ventas Siigo · autorretención y moneda extranjera', () => {
     expect(lines[0]!.subtotal).toBe(186_420_750)
     expect(lines[0]!.tax_charge).toBe(35_419_942.5)
     expect(lines[0]!.total).toBe(221_840_692.5)
+  })
+})
+
+describe('monthRanges', () => {
+  it('une meses seguidos en un solo rango y respeta el último día de cada mes', () => {
+    expect(monthRanges(2026, [7, 1, 2, 3, 2])).toEqual([
+      { startDate: '2026-01-01', endDate: '2026-03-31' },
+      { startDate: '2026-07-01', endDate: '2026-07-31' },
+    ])
+    expect(monthRanges(2024, [2])).toEqual([{ startDate: '2024-02-01', endDate: '2024-02-29' }])
+    expect(monthRanges(2026, [])).toEqual([])
   })
 })

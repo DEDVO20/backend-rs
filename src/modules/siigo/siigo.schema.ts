@@ -23,15 +23,23 @@ export const listSiigoSalesQuerySchema = z.object({
   limit:       z.coerce.number().int().positive().max(500).default(50),
 })
 
+/** Meses 1–12 de un año, para importar meses específicos */
+const monthsField = z.array(z.coerce.number().int().min(1).max(12)).min(1).max(12).optional()
+
 export const syncSiigoBodySchema = z.object({
   connectionId,
   // 'incremental': desde la última sync completada (menos un margen de solape) hasta hoy
-  mode:         z.enum(['days', 'range', 'full', 'incremental']).default('days'),
+  // 'months': solo los meses indicados del año (cada bloque de meses seguidos es un rango)
+  mode:         z.enum(['days', 'range', 'full', 'incremental', 'months']).default('days'),
   days:         z.coerce.number().int().positive().max(365).default(15),
   year:         z.coerce.number().int().min(2020).max(2035).optional(),
+  months:       monthsField,
   startDate:    z.string().optional(),
   endDate:      z.string().optional(),
   sellerFilter: z.string().optional(),
+}).refine(b => b.mode !== 'months' || (b.year && b.months?.length), {
+  message: 'Elige el año y al menos un mes para importar',
+  path: ['months'],
 })
 
 export const listSiigoCollectionsQuerySchema = z.object({
@@ -49,7 +57,10 @@ export const syncSiigoCollectionsBodySchema = z.object({
   connectionId,
   startDate: isoDate.optional(),
   endDate:   isoDate.optional(),
-})
+  // Meses específicos de un año (en lugar de startDate/endDate)
+  year:      z.coerce.number().int().min(2020).max(2035).optional(),
+  months:    monthsField,
+}).refine(b => !b.months?.length || b.year, { message: 'Indica el año de los meses a importar', path: ['year'] })
 
 export const listTrialBalanceQuerySchema = z.object({
   connectionId,
@@ -61,10 +72,18 @@ export const listTrialBalanceQuerySchema = z.object({
   limit:     z.coerce.number().int().positive().max(500).default(100),
 })
 
+/**
+ * mode 'current': mes en curso · 'year': enero al mes actual (o diciembre si el año ya cerró)
+ * · 'months': solo los meses indicados (1–12) del año.
+ */
 export const syncTrialBalanceBodySchema = z.object({
   connectionId,
-  mode: z.enum(['current', 'year']).default('current'),
-  year: z.coerce.number().int().min(2020).max(2035).optional(),
+  mode:   z.enum(['current', 'year', 'months']).default('current'),
+  year:   z.coerce.number().int().min(2020).max(2035).optional(),
+  months: z.array(z.coerce.number().int().min(1).max(12)).min(1).max(12).optional(),
+}).refine(b => b.mode !== 'months' || (b.months?.length ?? 0) > 0, {
+  message: 'Elige al menos un mes para importar',
+  path: ['months'],
 })
 
 export const syncReceivablesBodySchema = z.object({ connectionId })

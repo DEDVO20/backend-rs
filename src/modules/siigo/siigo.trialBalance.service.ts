@@ -160,6 +160,7 @@ export class SiigoTrialBalanceService {
    * Importa el balance de prueba por tercero.
    * - mode 'current': solo el mes en curso (actualización diaria).
    * - mode 'year': de enero al mes actual (o diciembre si es un año cerrado).
+   * - mode 'months': solo los meses elegidos del año (los futuros se ignoran).
    */
   static async syncFromSiigo(input: SyncTrialBalanceBody = { mode: 'current' }, triggeredBy?: string): Promise<TrialBalanceSyncLog> {
     const conn = await SiigoService.connectionFor(input.connectionId)
@@ -172,7 +173,14 @@ export class SiigoTrialBalanceService {
     const year = input.year ?? Number(today.slice(0, 4))
     const last = this.lastMonthOf(year, today)
     if (last < 1) throw Object.assign(new Error(`El año ${year} aún no ha comenzado.`), { statusCode: 400 })
-    const months = input.mode === 'year' ? Array.from({ length: last }, (_, i) => i + 1) : [last]
+    const months = input.mode === 'year' ? Array.from({ length: last }, (_, i) => i + 1)
+      : input.mode === 'months' ? [...new Set(input.months ?? [])].filter(m => m <= last).sort((a, b) => a - b)
+        : [last]
+    if (!months.length) {
+      throw Object.assign(new Error(`Los meses elegidos de ${year} aún no han comenzado.`), { statusCode: 400 })
+    }
+    // El historial solo distingue mes actual / año; la importación por meses se registra como 'year'
+    const logMode: TrialBalanceSyncLog['mode'] = input.mode === 'current' ? 'current' : 'year'
 
     const startTime = Date.now()
     const details: Record<string, string> = {}
@@ -204,7 +212,7 @@ export class SiigoTrialBalanceService {
         started_at:          new Date(startTime).toISOString(),
         finished_at:         new Date().toISOString(),
         status:              monthsOk > 0 ? 'completed' : 'failed',
-        mode:                input.mode,
+        mode:                logMode,
         year,
         months_ok:           monthsOk,
         months_failed:       failed,
@@ -224,7 +232,7 @@ export class SiigoTrialBalanceService {
         started_at:          new Date(startTime).toISOString(),
         finished_at:         new Date().toISOString(),
         status:              'failed',
-        mode:                input.mode,
+        mode:                logMode,
         year,
         months_ok:           monthsOk,
         months_failed:       months.length - monthsOk,

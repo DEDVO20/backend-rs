@@ -8,6 +8,7 @@ import { SiigoCollectionsService } from './siigo.collections.service.js'
 import { SiigoTrialBalanceService } from './siigo.trialBalance.service.js'
 import { SiigoReceivablesService } from './siigo.receivables.service.js'
 import { SiigoConnections } from './siigo.connections.js'
+import { monthRanges } from './siigo.helpers.js'
 import {
   listReceivablesQuerySchema,
   listSiigoCollectionsQuerySchema,
@@ -40,7 +41,7 @@ app.use('/*', authMiddleware, requireModule('siigo'))
 async function startInBackground(
   connectionId: string | undefined,
   isRunning: (id: string) => boolean,
-  run: () => Promise<unknown>,
+  run: (connId: string) => Promise<unknown>,
   label: string,
 ) {
   const conn = await SiigoService.connectionFor(connectionId)
@@ -48,8 +49,24 @@ async function startInBackground(
   if (isRunning(conn.id)) {
     throw Object.assign(new Error(`Ya hay una sincronización de ${label} en curso para ${conn.label}. Espera a que termine.`), { statusCode: 409 })
   }
-  run().catch(err => logger.error({ err: err.message, connection: conn.label }, `Sincronización de ${label} Siigo fallida`))
+  run(conn.id).catch(err => logger.error({ err: err.message, connection: conn.label }, `Sincronización de ${label} Siigo fallida`))
   return { started: true, connectionId: conn.id }
+}
+
+/**
+ * Importaciones por meses en curso (`tipo:conexión`). Cada bloque de meses seguidos se importa
+ * como un rango, uno tras otro; entre rangos la sync del servicio queda libre un instante,
+ * así que el lote completo se marca aparte para no aceptar otra importación en medio.
+ */
+const monthBatches = new Set<string>()
+
+async function runMonthRanges(key: string, year: number, months: number[], runRange: (r: { startDate: string; endDate: string }) => Promise<unknown>) {
+  monthBatches.add(key)
+  try {
+    for (const r of monthRanges(year, months)) await runRange(r)
+  } finally {
+    monthBatches.delete(key)
+  }
 }
 
 // ── Conexiones (solo roles internos) ────────────────────────────────────────
@@ -118,9 +135,14 @@ app.post(
   zValidator('json', syncSiigoBodySchema),
   async (c) => {
     const body = c.req.valid('json')
+    const userId = c.get('user').id
     const res = await startInBackground(
-      body.connectionId, id => SiigoService.isRunning(id),
-      () => SiigoService.syncFromSiigo(body, c.get('user').id), 'facturación',
+      body.connectionId, id => SiigoService.isRunning(id) || monthBatches.has(`sales:${id}`),
+      connId => body.mode === 'months'
+        ? runMonthRanges(`sales:${connId}`, body.year!, body.months!, r =>
+          SiigoService.syncFromSiigo({ ...body, mode: 'range', startDate: r.startDate, endDate: r.endDate }, userId))
+        : SiigoService.syncFromSiigo(body, userId),
+      'facturación',
     )
     return c.json(res, 202)
   },
@@ -129,7 +151,8 @@ app.post(
 // GET /api/siigo/sync-logs?connectionId — historial de sincronización de facturación
 app.get('/sync-logs', requireRole(...INTERNAL), zValidator('query', syncLogsQuerySchema), async (c) => {
   const conn = await SiigoService.connectionFor(c.req.valid('query').connectionId)
-  return c.json(await SiigoService.getSyncLogs(conn.id))
+  const r = await SiigoService.getSyncLogs(conn.id)
+  return c.json({ ...r, isSyncRunning: r.isSyncRunning || monthBatches.has(`sales:${conn.id}`) })
 })
 
 // ── Recaudo (recibos de caja) ───────────────────────────────────────────────
@@ -148,9 +171,14 @@ app.post(
   zValidator('json', syncSiigoCollectionsBodySchema),
   async (c) => {
     const body = c.req.valid('json')
+    const userId = c.get('user').id
     const res = await startInBackground(
-      body.connectionId, id => SiigoCollectionsService.isRunning(id),
-      () => SiigoCollectionsService.syncFromSiigo(body, c.get('user').id), 'recaudo',
+      body.connectionId, id => SiigoCollectionsService.isRunning(id) || monthBatches.has(`collections:${id}`),
+      connId => body.months?.length
+        ? runMonthRanges(`collections:${connId}`, body.year!, body.months, r =>
+          SiigoCollectionsService.syncFromSiigo({ connectionId: body.connectionId, startDate: r.startDate, endDate: r.endDate }, userId))
+        : SiigoCollectionsService.syncFromSiigo(body, userId),
+      'recaudo',
     )
     return c.json(res, 202)
   },
@@ -158,7 +186,8 @@ app.post(
 
 app.get('/collections/sync-logs', requireRole(...INTERNAL), zValidator('query', syncLogsQuerySchema), async (c) => {
   const conn = await SiigoService.connectionFor(c.req.valid('query').connectionId)
-  return c.json(await SiigoCollectionsService.getSyncLogs(conn.id))
+  const r = await SiigoCollectionsService.getSyncLogs(conn.id)
+  return c.json({ ...r, isSyncRunning: r.isSyncRunning || monthBatches.has(`collections:${conn.id}`) })
 })
 
 // ── Balance de prueba por tercero ───────────────────────────────────────────
