@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import ExcelJS from 'exceljs'
 import {
+  cashSeries,
   convertirFilas,
   esXlsx,
   fechaCorte,
@@ -99,6 +100,24 @@ describe('balance de prueba por tercero', () => {
       ['13050501', 'Actual diario', 1100],
       ['13050501', 'Actual diario', 200],
       ['41556001', 'Actual diario', -500],
+    ])
+  })
+})
+
+describe('cashSeries', () => {
+  const l = (period: string, account_code: string, identification: string, debit: number, credit: number, final_balance: number) =>
+    ({ period, account_code, identification, debit, credit, final_balance })
+
+  it('suma el disponible (11) por mes sin contar dos veces la cuenta con terceros', () => {
+    expect(cashSeries([
+      l('2026-01', '11100501', '860002964', 1000, 400, 600), // banco por tercero
+      l('2026-01', '11100501', '', 1000, 400, 600),          // la misma cuenta sin tercero: se ignora
+      l('2026-01', '11050501', '', 50, 20, 30),              // caja sin terceros
+      l('2026-01', '13050501', '900100200', 999, 0, 999),    // no es disponible
+      l('2026-02', '11100501', '860002964', 200, 700, 100),
+    ])).toEqual([
+      { period: '2026-01', entradas: 1050, salidas: 420, posicion: 630 },
+      { period: '2026-02', entradas: 200, salidas: 700, posicion: 100 },
     ])
   })
 })

@@ -8,6 +8,8 @@ import { SiigoConnections } from './siigo.connections.js'
 import { SiigoService } from './siigo.service.js'
 import {
   MESES,
+  cashSeries,
+  type CashLine,
   convertirFilas,
   esXlsx,
   localizarEncabezados,
@@ -270,15 +272,19 @@ export class SiigoTrialBalanceService {
       clientCompany: scope.clientCompany,
       lastSync:      logs[0] ?? null,
     }
-    if (scope.denied) return { ...base, latestPeriod: null, monthly: [], byAccount: [], topCartera: [] }
+    if (scope.denied) return { ...base, latestPeriod: null, monthly: [], byAccount: [], topCartera: [], cash: [], periods: [] }
 
-    const { data, error } = await supabase.rpc('siigo_trial_balance_series', {
-      p_connection: scope.books!.connectionId,
-      p_from:       query.startDate?.slice(0, 7) ?? null,
-      p_to:         query.endDate?.slice(0, 7) ?? null,
-      p_company_id: scope.companyId,
-    })
+    const connectionId = scope.books!.connectionId
+    const from = query.startDate?.slice(0, 7) ?? null
+    const to = query.endDate?.slice(0, 7) ?? null
+
+    const [{ data, error }, cashLines, { data: periods, error: pErr }] = await Promise.all([
+      supabase.rpc('siigo_trial_balance_series', { p_connection: connectionId, p_from: from, p_to: to, p_company_id: scope.companyId }),
+      this.cashLines(connectionId, from, to, scope.companyId),
+      supabase.from('siigo_trial_balance_periods').select('period, status').eq('connection_id', connectionId).order('period'),
+    ])
     if (error) throw dbError(`No se pudieron calcular las gráficas del balance: ${error.message}`, error)
+    if (pErr) throw dbError(`No se pudo consultar el control de periodos: ${pErr.message}`, pErr)
     const r = (data ?? {}) as Obj
     return {
       ...base,
@@ -286,7 +292,31 @@ export class SiigoTrialBalanceService {
       monthly:      r.monthly ?? [],
       byAccount:    r.byAccount ?? [],
       topCartera:   r.topCartera ?? [],
+      // Flujo de caja reportado (clase 11) y estado de importación de cada mes
+      cash:         cashSeries(cashLines),
+      periods:      (periods ?? []).filter(p => (!from || p.period >= from) && (!to || p.period <= to)),
     }
+  }
+
+  /** Filas de las cuentas de disponible (11) del rango, paginadas (PostgREST corta en 1000 filas) */
+  private static async cashLines(connectionId: string, from: string | null, to: string | null, companyId: string | null): Promise<CashLine[]> {
+    const out: CashLine[] = []
+    const PAGE = 1000
+    for (let offset = 0; offset < 100_000; offset += PAGE) {
+      let q = supabase
+        .from('siigo_trial_balance_lines')
+        .select('period, account_code, identification, debit, credit, final_balance')
+        .eq('connection_id', connectionId)
+        .like('account_code', '11%')
+      if (from) q = q.gte('period', from)
+      if (to) q = q.lte('period', to)
+      if (companyId) q = q.eq('company_id', companyId)
+      const { data, error } = await q.order('period').order('account_code').order('id').range(offset, offset + PAGE - 1)
+      if (error) throw dbError(`No se pudo consultar el disponible del balance: ${error.message}`, error)
+      out.push(...((data ?? []) as CashLine[]))
+      if ((data ?? []).length < PAGE) break
+    }
+    return out
   }
 
   /** Consulta de un mes de los libros consultados: filas paginadas, totales por clase, cuadre y control de periodos */

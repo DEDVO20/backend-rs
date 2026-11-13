@@ -258,6 +258,48 @@ export function convertirFilas(
   return { lines: unicos, detectados: registros.length, antesDeDuplicados: lines.length }
 }
 
+export interface CashLine {
+  period: string
+  account_code: string
+  identification: string
+  debit: number
+  credit: number
+  final_balance: number
+}
+
+export interface CashMonth {
+  period: string
+  /** Débitos a las cuentas de disponible (11): dinero que entra a caja y bancos */
+  entradas: number
+  /** Créditos a las cuentas de disponible: dinero que sale */
+  salidas: number
+  /** Saldo final del disponible al cierre del mes */
+  posicion: number
+}
+
+/**
+ * Flujo de caja reportado por mes a partir de las cuentas de disponible (clase 11).
+ * Por mes y cuenta se usan las filas por tercero si existen; si no, la fila de la cuenta
+ * (mismo criterio que las series del balance, para no contar dos veces un saldo).
+ */
+export function cashSeries(lines: CashLine[]): CashMonth[] {
+  const conTercero = new Set(lines.filter(l => l.identification).map(l => `${l.period}|${l.account_code}`))
+  const byPeriod = new Map<string, CashMonth>()
+  for (const l of lines) {
+    if (!l.account_code.startsWith('11')) continue
+    if (!l.identification && conTercero.has(`${l.period}|${l.account_code}`)) continue
+    const m = byPeriod.get(l.period) ?? { period: l.period, entradas: 0, salidas: 0, posicion: 0 }
+    m.entradas += Number(l.debit) || 0
+    m.salidas += Number(l.credit) || 0
+    m.posicion += Number(l.final_balance) || 0
+    byPeriod.set(l.period, m)
+  }
+  const r2 = (n: number) => Math.round(n * 100) / 100
+  return [...byPeriod.values()]
+    .sort((a, b) => a.period.localeCompare(b.period))
+    .map(m => ({ period: m.period, entradas: r2(m.entradas), salidas: r2(m.salidas), posicion: r2(m.posicion) }))
+}
+
 /**
  * Lee todas las hojas del XLSX como matrices de valores (fila/columna 0-indexadas).
  * Usa SheetJS: el XLSX que genera Siigo no lo puede abrir ExcelJS
