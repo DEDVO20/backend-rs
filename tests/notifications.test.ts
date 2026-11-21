@@ -29,11 +29,15 @@ const makeChain = (resolved: unknown = mockOnboarding) => {
     c[m] = () => c
   })
   c.single = () => Promise.resolve({ data: resolved, error: null })
+  c.maybeSingle = c.single
   return c
 }
 
 vi.mock('../src/lib/supabase.js', () => ({
-  supabase: { from: () => makeChain(), rpc: () => Promise.resolve({ data: { ok: true, token: 'tok_test' }, error: null }) },
+  supabase: {
+    from: (table: string) => makeChain(table === 'companies' ? { name: mockOnboarding.company_name, status: 'active' } : mockOnboarding),
+    rpc: () => Promise.resolve({ data: null, error: null }),
+  },
 }))
 
 vi.mock('../src/notifications/NotificationService.js', () => ({

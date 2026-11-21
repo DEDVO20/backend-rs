@@ -20,6 +20,7 @@ vi.mock('../src/lib/supabase.js', () => {
   return {
   supabase: {
     from: vi.fn().mockReturnValue(chain),
+    rpc: vi.fn().mockResolvedValue({ data: null, error: null }),
     auth: {
       admin: {
         signOut:        vi.fn().mockResolvedValue({ error: null }),
@@ -54,7 +55,7 @@ vi.mock('../src/lib/supabase.js', () => {
 }})
 
 vi.mock('../src/notifications/NotificationService.js', () => ({
-  NotificationService: { enqueue: vi.fn().mockResolvedValue(undefined) },
+  NotificationService: { enqueue: vi.fn().mockResolvedValue(undefined), sendNow: vi.fn().mockResolvedValue(undefined) },
 }))
 
 vi.mock('../src/lib/audit.js', () => ({
@@ -177,6 +178,30 @@ describe('POST /logout', () => {
 })
 
 describe('POST /forgot-password', () => {
+  it('envía el enlace y guarda solamente su hash vinculado a la cuenta', async () => {
+    const { supabase } = await import('../src/lib/supabase.js')
+    const { NotificationService } = await import('../src/notifications/NotificationService.js')
+    const { createHash } = await import('node:crypto')
+    vi.mocked(supabase.rpc).mockResolvedValueOnce({ data: 'user-uuid-123', error: null } as never)
+    const res = await authRoutes.request('/forgot-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-real-ip': '10.0.2.1' },
+      body: JSON.stringify({ email: 'Test@empresa.com' }),
+    })
+
+    expect(res.status).toBe(200)
+    const sent = vi.mocked(NotificationService.sendNow).mock.calls.at(-1)?.[0]
+    expect(sent?.to).toBe('test@empresa.com')
+    const token = new URL(String(sent?.data.resetUrl)).searchParams.get('token')!
+    expect(supabase.from).toHaveBeenCalledWith('password_recovery_tokens')
+    expect(supabase.from('').insert).toHaveBeenCalledWith({
+      email: 'test@empresa.com',
+      user_id: 'user-uuid-123',
+      token_hash: createHash('sha256').update(token).digest('hex'),
+      expires_at: expect.any(String),
+    })
+  })
+
   it('siempre responde 200 aunque el email no exista', async () => {
     const res = await authRoutes.request('/forgot-password', {
       method:  'POST',
@@ -202,52 +227,73 @@ describe('POST /forgot-password', () => {
 
 describe('POST /reset-password', () => {
   const ip = { 'x-real-ip': '10.0.1.0' }
+  const token = 'e8f06d37-3058-4081-b31e-b015f18fe199'
 
   it('actualiza contraseña con token válido', async () => {
     const { supabase } = await import('../src/lib/supabase.js')
 
-    // Mock: token encontrado en BD
-    vi.mocked(supabase.from('').single).mockResolvedValueOnce({
-      data: { email: 'test@empresa.com' }, error: null,
-    } as any)
-    // Mock: listUsers devuelve el usuario
-    vi.mocked(supabase.auth.admin.listUsers).mockResolvedValueOnce({
-      data: { users: [{ id: 'user-uuid-123', email: 'test@empresa.com' }] }, error: null,
-    } as any)
+    vi.mocked(supabase.rpc).mockResolvedValueOnce({ data: 'user-uuid-123', error: null } as never)
 
     const res = await authRoutes.request('/reset-password', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json', ...ip },
-      body:    JSON.stringify({ access_token: 'tok_valid', password: 'NuevaPassword123' }),
+      body:    JSON.stringify({ access_token: token, password: 'NuevaPassword123' }),
     })
 
     expect(res.status).toBe(200)
+    expect(supabase.rpc).toHaveBeenCalledWith('claim_password_recovery', { p_token: token })
+    expect(supabase.auth.admin.updateUserById).toHaveBeenCalledWith('user-uuid-123', { password: 'NuevaPassword123' })
   })
 
   it('rechaza contraseña menor a 8 caracteres', async () => {
     const res = await authRoutes.request('/reset-password', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json', 'x-real-ip': '10.0.1.1' },
-      body:    JSON.stringify({ access_token: 'tok_valid', password: 'corta' }),
+      body:    JSON.stringify({ access_token: token, password: 'corta' }),
     })
 
     expect(res.status).toBe(400)
   })
 
   it('rechaza token no encontrado en BD', async () => {
-    const { supabase } = await import('../src/lib/supabase.js')
-
-    // Mock: token no encontrado
-    vi.mocked(supabase.from('').single).mockResolvedValueOnce({
-      data: null, error: { message: 'not found' },
-    } as any)
-
     const res = await authRoutes.request('/reset-password', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json', 'x-real-ip': '10.0.1.2' },
-      body:    JSON.stringify({ access_token: 'invalid', password: 'NuevaPassword123' }),
+      body:    JSON.stringify({ access_token: token, password: 'NuevaPassword123' }),
     })
 
     expect(res.status).toBe(401)
   })
+
+  it('solo actualiza la contraseña de la solicitud que obtuvo el enlace', async () => {
+    const { supabase } = await import('../src/lib/supabase.js')
+    vi.mocked(supabase.rpc).mockResolvedValueOnce({ data: 'user-uuid-123', error: null } as never)
+    vi.mocked(supabase.auth.admin.updateUserById).mockClear()
+
+    const reset = () => authRoutes.request('/reset-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-real-ip': '10.0.1.3' },
+      body: JSON.stringify({ access_token: token, password: 'NuevaPassword123' }),
+    })
+    const responses = await Promise.all([reset(), reset()])
+
+    expect(responses.map(res => res.status).sort()).toEqual([200, 401])
+    expect(supabase.auth.admin.updateUserById).toHaveBeenCalledTimes(1)
+  })
+})
+
+it('rechaza una sesión que Supabase revocó aunque su perfil esté en caché', async () => {
+  const { supabasePublic } = await import('../src/lib/supabase.js')
+  const { Hono } = await import('hono')
+  const { authMiddleware } = await import('../src/middleware/auth.js')
+  const app = new Hono()
+  app.get('/', authMiddleware, c => c.json({ ok: true }))
+  const request = { headers: { Authorization: 'Bearer revoked-session-test' } }
+  expect((await app.request('/', request)).status).toBe(200)
+
+  vi.mocked(supabasePublic.auth.getUser).mockResolvedValueOnce({
+    data: { user: null },
+    error: { code: 'session_not_found' } as never,
+  })
+  expect((await app.request('/', request)).status).toBe(401)
 })

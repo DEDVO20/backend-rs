@@ -40,6 +40,7 @@ const emailPayload = {
   template: 'password-reset',
   data:     { resetUrl: 'https://app.test/reset', name: 'Ana' },
 }
+const collectionEmail = { ...emailPayload, template: 'collection-agreement' }
 
 function lastCall() {
   const [url, init] = fetchMock.mock.calls.at(-1)!
@@ -68,7 +69,7 @@ describe('Proveedor de email', () => {
   it('con proveedor resend en la plataforma, el email sale por Resend con las copias ocultas', async () => {
     settingsRow = { provider: 'resend', bcc: ['copias@empresa.com', 'cliente@empresa.com'] }
 
-    await NotificationService.dispatch({ ...emailPayload, bcc: ['otro@empresa.com'] })
+    await NotificationService.dispatch({ ...collectionEmail, bcc: ['otro@empresa.com'] })
 
     const { url, body } = lastCall()
     expect(url).toContain('api.resend.com')
@@ -87,11 +88,22 @@ describe('Proveedor de email', () => {
     expect(lastCall().url).toContain('api.zavu.dev')
   })
 
+  it.each(['password-reset', 'invitation', 'kyc-approved'])('excluye copias del correo %s', async (template) => {
+    settingsRow = { provider: 'resend', bcc: ['copias@empresa.com'] }
+
+    await NotificationService.dispatch({
+      ...emailPayload, template, cc: ['copia@empresa.com'], bcc: ['otra@empresa.com'],
+    })
+
+    expect(lastCall().body).not.toHaveProperty('cc')
+    expect(lastCall().body).not.toHaveProperty('bcc')
+  })
+
   it('sin fila en la tabla, usa EMAIL_PROVIDER y EMAIL_BCC del entorno', async () => {
     process.env.EMAIL_PROVIDER = 'resend'
     process.env.EMAIL_BCC      = 'a@empresa.com, b@empresa.com'
 
-    await NotificationService.dispatch(emailPayload)
+    await NotificationService.dispatch(collectionEmail)
 
     const { url, body } = lastCall()
     expect(url).toContain('api.resend.com')
