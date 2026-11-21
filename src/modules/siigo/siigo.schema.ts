@@ -107,6 +107,17 @@ export const receivablesReportQuerySchema = listSiigoCollectionsQuerySchema.exte
 
 export const syncLogsQuerySchema = z.object({ connectionId })
 
+/** Estado financiero desplegable: hijos de `parent` ('' = clases) por año (resultados) o por mes (situación) */
+export const trialBalanceTreeQuerySchema = z.object({
+  connectionId,
+  companyId: z.string().uuid().optional(),
+  statement: z.enum(['resultados', 'situacion']),
+  parent:    z.string().regex(/^\d{0,12}$/, 'Código de cuenta inválido').default(''),
+  startDate: isoDate.optional(),
+  endDate:   isoDate.optional(),
+  tercero:   z.string().max(100).optional(),
+})
+
 /** Credenciales y ajustes de una conexión. accessKey vacía o ausente = conservar la actual */
 export const saveSiigoConnectionBodySchema = z.object({
   username:             z.string().max(200).optional(),
@@ -120,6 +131,7 @@ export const saveSiigoConnectionBodySchema = z.object({
 
 export type ListSiigoSalesQuery = z.infer<typeof listSiigoSalesQuerySchema>
 export type ListTrialBalanceQuery = z.infer<typeof listTrialBalanceQuerySchema>
+export type TrialBalanceTreeQuery = z.infer<typeof trialBalanceTreeQuerySchema>
 export type SyncTrialBalanceBody = z.infer<typeof syncTrialBalanceBodySchema>
 export type SyncReceivablesBody = z.infer<typeof syncReceivablesBodySchema>
 export type ListReceivablesQuery = z.infer<typeof listReceivablesQuerySchema>

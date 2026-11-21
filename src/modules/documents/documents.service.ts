@@ -10,6 +10,11 @@ type ListQuery    = z.infer<typeof listDocumentsQuerySchema>
 type CreateInput  = z.infer<typeof createDocumentSchema>
 type UpdateInput  = z.infer<typeof updateDocumentSchema>
 
+export function uploadExtension(fileName: string) {
+  const extension = fileName.split('.').pop() ?? ''
+  return /^[a-z0-9]{1,16}$/i.test(extension) ? extension.toLowerCase() : 'bin'
+}
+
 export class DocumentsService {
   static async list(query: ListQuery, userCompanyId: string | null, isInternal: boolean) {
     const { category, service_id, company_id, page, limit } = query
@@ -36,14 +41,16 @@ export class DocumentsService {
     return { data, total: count ?? 0, page, limit }
   }
 
-  static async getById(id: string) {
-    const { data, error } = await supabase
+  static async getById(id: string, companyId?: string) {
+    let query = supabase
       .from('documents')
       .select('*')
       .eq('id', id)
-      .single()
+    if (companyId !== undefined) query = query.eq('company_id', companyId)
+    const { data, error } = await query.maybeSingle()
 
     if (error) throw error
+    if (!data) throw Object.assign(new Error('Documento no encontrado'), { statusCode: 404 })
     return data
   }
 
@@ -96,7 +103,7 @@ export class DocumentsService {
     companyId: string | null,
     uploadedBy: string,
   ) {
-    const ext  = file.name.split('.').pop() ?? 'bin'
+    const ext = uploadExtension(file.name)
     const folder = companyId ?? 'uploads'
     const path = `${folder}/${Date.now()}-${crypto.randomUUID()}.${ext}`
 
@@ -157,7 +164,7 @@ export class DocumentsService {
     file: File,
     onboardingId: string,
   ): Promise<{ storagePath: string; fileUrl: string }> {
-    const ext  = (file.name.split('.').pop() ?? 'bin').toLowerCase()
+    const ext = uploadExtension(file.name)
     const path = `kyc/${onboardingId}/${Date.now()}-${crypto.randomUUID()}.${ext}`
 
     const MIME_BY_EXT: Record<string, string> = {

@@ -35,7 +35,10 @@ app.get('/',
 
 // GET /api/requests/:id
 app.get('/:id', async (c) => {
-  const data = await RequestsService.getById(c.req.param('id')!)
+  const { role, companyId } = c.get('user')
+  const isInternal = INTERNAL_ROLES.some(internalRole => internalRole === role)
+  if (!isInternal && !companyId) return c.json({ error: 'Solicitud no encontrada' }, 404)
+  const data = await RequestsService.getById(c.req.param('id')!, isInternal ? undefined : companyId!)
   return c.json(data)
 })
 

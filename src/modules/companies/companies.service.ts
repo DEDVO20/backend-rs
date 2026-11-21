@@ -1,5 +1,9 @@
 import { supabase }           from '../../lib/supabase.js'
-import { NotificationService } from '../../notifications/NotificationService.js'
+import { isCompanyInactive }  from '../../lib/companyStatus.js'
+
+function httpError(message: string, statusCode: number) {
+  return Object.assign(new Error(message), { statusCode })
+}
 import type { z }             from 'zod'
 import type {
   listCompaniesQuerySchema,
@@ -8,8 +12,6 @@ import type {
 
 type ListQuery   = z.infer<typeof listCompaniesQuerySchema>
 type UpdateInput = z.infer<typeof updateCompanySchema>
-
-const PLATFORM_URL = process.env.PLATFORM_URL ?? 'https://app.tudominio.com'
 
 export class CompaniesService {
   static async create(input: Record<string, unknown>) {
@@ -47,7 +49,7 @@ export class CompaniesService {
       .select(`
         *,
         company_services(*,services(*)),
-        profiles(id,full_name,email,role,active)
+        profiles!profiles_company_id_fkey(id,full_name,email,role,active)
       `)
       .eq('id', id)
       .single()
@@ -89,33 +91,55 @@ export class CompaniesService {
     return data
   }
 
-  static async inviteUser(companyId: string, email: string, role: string, inviterId: string) {
-    const { data, error } = await supabase.rpc('invite_company_user', {
-      p_company_id: companyId,
-      p_email:      email,
-      p_role:       role,
-    })
+  /**
+   * Inactiva la empresa: sus usuarios pierden acceso (authMiddleware), se cancelan
+   * sus invitaciones pendientes y sale de tareas automáticas y sincronizaciones.
+   * Los perfiles NO se desactivan, para que la reactivación restaure el acceso.
+   */
+  static async inactivate(id: string, userId: string, reason?: string | null) {
+    const { data: current, error: curErr } = await supabase
+      .from('companies').select('id, status').eq('id', id).maybeSingle()
+    if (curErr) throw curErr
+    if (!current) throw httpError('Empresa no encontrada', 404)
+    if (isCompanyInactive(current.status)) throw httpError('La empresa ya está inactiva', 409)
+
+    const { data, error } = await supabase
+      .from('companies')
+      .update({
+        status:              'inactive',
+        inactivated_at:      new Date().toISOString(),
+        inactivated_by:      userId,
+        inactivation_reason: reason?.trim() || null,
+      })
+      .eq('id', id)
+      .select()
+      .single()
     if (error) throw error
 
-    // Leer nombre de la empresa para personalizar el email
-    const { data: company } = await supabase
+    const { count, error: invErr } = await supabase
+      .from('company_invitations')
+      .update({ status: 'cancelled' }, { count: 'exact' })
+      .eq('company_id', id)
+      .eq('status', 'pending')
+    if (invErr) throw invErr
+
+    return { ...data, cancelled_invitations: count ?? 0 }
+  }
+
+  static async reactivate(id: string) {
+    const { data: current, error: curErr } = await supabase
+      .from('companies').select('id, status').eq('id', id).maybeSingle()
+    if (curErr) throw curErr
+    if (!current) throw httpError('Empresa no encontrada', 404)
+    if (!isCompanyInactive(current.status)) throw httpError('La empresa no está inactiva', 409)
+
+    const { data, error } = await supabase
       .from('companies')
-      .select('name')
-      .eq('id', companyId)
+      .update({ status: 'activa', inactivated_at: null, inactivated_by: null, inactivation_reason: null })
+      .eq('id', id)
+      .select()
       .single()
-
-    void NotificationService.enqueue({
-      channel:  'email',
-      template: 'invitation',
-      to:       email,
-      data: {
-        name:        null,
-        companyName: company?.name ?? '',
-        inviteUrl:   `${PLATFORM_URL}/invitations/accept?token=${(data as { token?: string })?.token ?? ''}`,
-      },
-      companyId,
-    })
-
+    if (error) throw error
     return data
   }
 

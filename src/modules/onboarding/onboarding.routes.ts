@@ -1,12 +1,13 @@
-import { Hono }          from 'hono'
+import { Hono, type Context, type Next } from 'hono'
+import { createHmac, timingSafeEqual } from 'node:crypto'
 import { zValidator }    from '@hono/zod-validator'
 import { authMiddleware }    from '../../middleware/auth.js'
 import { requireModule }     from '../../middleware/requireRole.js'
 import { requireRole, requirePermission } from '../../middleware/requireRole.js'
-import { OnboardingService } from './onboarding.service.js'
+import { EDITABLE_DRAFT_STATUSES, OnboardingService } from './onboarding.service.js'
 import { DocumentsService }  from '../documents/documents.service.js'
 import { supabase }          from '../../lib/supabase.js'
-import { logger }            from '../../lib/logger.js'
+import { createInvitation } from '../invitations/invitations.service.js'
 import {
   createOnboardingSchema,
   updateOnboardingSchema,
@@ -20,6 +21,26 @@ import {
 
 const app = new Hono()
 
+function draftSignature(id: string, expiresAt: string) {
+  return createHmac('sha256', process.env.SUPABASE_SERVICE_ROLE_KEY!)
+    .update(`finto:onboarding:draft:v1:${id}:${expiresAt}`).digest()
+}
+
+async function requireDraft(c: Context, next: Next) {
+  const id = c.req.param('id')!
+  const credential = c.req.header('Authorization')?.match(/^Onboarding (\d{13})\.([0-9a-f]{64})$/)
+  if (!credential || Number(credential[1]) <= Date.now() ||
+      !timingSafeEqual(draftSignature(id, credential[1]!), Buffer.from(credential[2]!, 'hex'))) {
+    return c.json({ error: 'Credencial de registro inválida o expirada' }, 403)
+  }
+
+  const { data, error } = await supabase.from('client_onboardings').select('id')
+    .eq('id', id).in('status', EDITABLE_DRAFT_STATUSES).maybeSingle()
+  if (error) throw error
+  if (!data) return c.json({ error: 'Este expediente ya no se puede editar desde el formulario' }, 409)
+  await next()
+}
+
 // ── Rutas públicas (sin auth) ─────────────────────────────────────────────────
 
 // POST /api/onboarding — crear borrador (formulario público)
@@ -27,7 +48,9 @@ app.post('/',
   zValidator('json', createOnboardingSchema),
   async (c) => {
     const data = await OnboardingService.create(c.req.valid('json'))
-    return c.json(data, 201)
+    const expiresAt = String(Date.now() + 24 * 60 * 60 * 1000)
+    c.header('Cache-Control', 'no-store')
+    return c.json({ ...data, draft_token: `${expiresAt}.${draftSignature(data.id, expiresAt).toString('hex')}` }, 201)
   },
 )
 
@@ -46,7 +69,7 @@ app.get('/',
 )
 
 // GET /api/onboarding/:id — detalle
-app.get('/:id', async (c) => {
+app.get('/:id', authMiddleware, requireModule('onboarding'), async (c) => {
     const data = await OnboardingService.getById(c.req.param('id')!)
     return c.json(data)
   },
@@ -54,6 +77,9 @@ app.get('/:id', async (c) => {
 
 // PATCH /api/onboarding/:id — actualizar borrador
 app.patch('/:id',
+  authMiddleware,
+  requireModule('onboarding'),
+  requirePermission('onboarding', 'update'),
   zValidator('json', updateOnboardingSchema),
   async (c) => {
     const data = await OnboardingService.update(c.req.param('id')!, c.req.valid('json'))
@@ -63,6 +89,7 @@ app.patch('/:id',
 
 // POST /api/onboarding/:id/services — seleccionar servicios
 app.post('/:id/services',
+  requireDraft,
   zValidator('json', selectServicesSchema),
   async (c) => {
     const data = await OnboardingService.selectServices(c.req.param('id')!, c.req.valid('json'))
@@ -72,6 +99,7 @@ app.post('/:id/services',
 
 // POST /api/onboarding/:id/policies — aceptar políticas
 app.post('/:id/policies',
+  requireDraft,
   zValidator('json', acceptPoliciesSchema),
   async (c) => {
     const data = await OnboardingService.acceptPolicies(c.req.param('id')!, c.req.valid('json'))
@@ -79,19 +107,18 @@ app.post('/:id/policies',
   },
 )
 
-// POST /api/onboarding/:id/kyc/documents — subir archivo KYC (multipart) o registrar metadata (json)
-app.post('/:id/kyc/documents', async (c) => {
-  const userId       = c.get('user')?.id   // puede ser undefined si la ruta es pública
+// POST /api/onboarding/:id/kyc/documents — subir archivo KYC (multipart)
+app.post('/:id/kyc/documents', requireDraft, async (c) => {
   const onboardingId = c.req.param('id')!
   const contentType    = c.req.header('content-type') ?? ''
 
   if (contentType.includes('multipart/form-data')) {
     const body     = await c.req.parseBody()
     const file     = body['file']
-    const docType  = body['doc_type'] as string | undefined
+    const docType  = uploadKycDocSchema.shape.doc_type.safeParse(body['doc_type'])
 
     if (!(file instanceof File)) return c.json({ error: 'Se requiere un archivo en el campo "file"' }, 400)
-    if (!docType)                return c.json({ error: 'El campo "doc_type" es requerido' }, 400)
+    if (!docType.success) return c.json({ error: 'Tipo de documento inválido' }, 400)
 
     const MAX_SIZE = 10 * 1024 * 1024  // 10 MB
     if (file.size > MAX_SIZE) return c.json({ error: 'El archivo supera el límite de 10 MB' }, 413)
@@ -99,7 +126,7 @@ app.post('/:id/kyc/documents', async (c) => {
     const { storagePath, fileUrl } = await DocumentsService.uploadKycFile(file, onboardingId)
 
     const parsed = uploadKycDocSchema.safeParse({
-      doc_type:      docType,
+      doc_type:      docType.data,
       storage_path:  storagePath,
       file_url:      fileUrl,
       original_name: file.name,
@@ -108,17 +135,11 @@ app.post('/:id/kyc/documents', async (c) => {
     })
     if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400)
 
-    const data = await OnboardingService.uploadKycDoc(onboardingId, parsed.data, userId)
+    const data = await OnboardingService.uploadKycDoc(onboardingId, parsed.data)
     return c.json(data, 201)
   }
 
-  // Fallback JSON — metadata de archivo ya subido directamente a Storage
-  const json = await c.req.json()
-  const parsed = uploadKycDocSchema.safeParse(json)
-  if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400)
-
-  const data = await OnboardingService.uploadKycDoc(onboardingId, parsed.data, userId)
-  return c.json(data, 201)
+  return c.json({ error: 'Se requiere multipart/form-data con el archivo' }, 415)
 })
 
 // PATCH /api/onboarding/:id/kyc/documents/:docId — verificar/rechazar doc
@@ -164,13 +185,14 @@ app.get('/:id/kyc/documents/:docId/url',
 )
 
 // POST /api/onboarding/:id/submit — enviar a revisión
-app.post('/:id/submit', async (c) => {
+app.post('/:id/submit', requireDraft, async (c) => {
   const data = await OnboardingService.submit(c.req.param('id')!)
   return c.json(data)
 })
 
 // POST /api/onboarding/:id/approve — solo rs_admin y admin
 app.post('/:id/approve',
+  authMiddleware,
   requireRole('rs_admin', 'admin'),
   requirePermission('onboarding', 'update'),
   async (c) => {
@@ -182,6 +204,7 @@ app.post('/:id/approve',
 
 // POST /api/onboarding/:id/reject — solo rs_admin y admin
 app.post('/:id/reject',
+  authMiddleware,
   requireRole('rs_admin', 'admin'),
   requirePermission('onboarding', 'update'),
   zValidator('json', rejectOnboardingSchema),
@@ -194,6 +217,7 @@ app.post('/:id/reject',
 
 // POST /api/onboarding/:id/request-correction — solo rs_admin y admin
 app.post('/:id/request-correction',
+  authMiddleware,
   requireRole('rs_admin', 'admin'),
   requirePermission('onboarding', 'update'),
   async (c) => {
@@ -215,42 +239,13 @@ app.post('/:id/resend-invitation',
     const ob = await OnboardingService.getById(onboardingId)
     if (!ob) return c.json({ error: 'Onboarding no encontrado' }, 404)
 
-    // Invalidar invitaciones anteriores
-    await supabase
-      .from('company_invitations')
-      .update({ status: 'cancelled' })
-      .eq('email', ob.rep_email.toLowerCase().trim())
-      .eq('status', 'pending')
-
-    // Crear nueva invitación
-    const token = crypto.randomUUID()
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
-
-    await supabase.from('company_invitations').insert({
-      email:      ob.rep_email.toLowerCase().trim(),
-      full_name:  ob.rep_name,
-      role:       'client_owner',
-      company_id: ob.company_id ?? null,
-      token,
-      status:     'pending',
-      expires_at: expiresAt,
+    if (ob.status !== 'approved' || !ob.company_id) {
+      return c.json({ error: 'El expediente debe estar aprobado y vinculado a una empresa' }, 409)
+    }
+    await createInvitation({
+      email: ob.rep_email, fullName: ob.rep_name, role: 'client_owner',
+      companyId: ob.company_id, invitedBy: c.get('user').id, fromOnboarding: true,
     })
-
-    const { NotificationService } = await import('../../notifications/NotificationService.js')
-    const platformUrl = process.env.PLATFORM_URL ?? 'https://app.tudominio.com'
-
-    void NotificationService.enqueue({
-      channel:  'email',
-      template: 'kyc-approved',
-      to:       ob.rep_email,
-      data: {
-        ownerName:   ob.rep_name,
-        companyName: ob.company_name,
-        platformUrl: `${platformUrl}/invitations/accept?token=${token}`,
-      },
-    })
-
-    logger.info({ onboardingId, email: ob.rep_email }, 'Invitación reenviada')
     return c.json({ ok: true, email: ob.rep_email })
   },
 )

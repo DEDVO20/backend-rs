@@ -57,15 +57,15 @@ const templates: Record<string, Builder> = {
   }),
 
   'kyc-approved': (d) => ({
-    subject: '¡Tu empresa fue aprobada! — Crea tu contraseña',
+    subject: '¡Tu empresa fue aprobada! Acepta tu invitación',
     html: layout('Empresa aprobada', `
       <p>Hola ${str(d.ownerName)},</p>
       <p>La empresa <strong>${str(d.companyName)}</strong> ha sido aprobada exitosamente.</p>
-      <div class="info">Para acceder a la plataforma, primero debes crear tu contraseña haciendo clic en el botón de abajo.</div>
-      <p><a class="btn" href="${str(d.platformUrl ?? '#')}">Crear mi contraseña</a></p>
+      <div class="info">Acepta la invitación para acceder a la plataforma con tu cuenta de Finto.</div>
+      <p><a class="btn" href="${str(d.platformUrl ?? '#')}">Aceptar invitación</a></p>
       <p style="color:#888;font-size:13px">Este enlace expira en 7 días.</p>
     `),
-    text: `Hola ${str(d.ownerName)}, la empresa ${str(d.companyName)} fue aprobada. Crea tu contraseña aquí: ${str(d.platformUrl)}`,
+    text: `Hola ${str(d.ownerName)}, la empresa ${str(d.companyName)} fue aprobada. Acepta la invitación aquí: ${str(d.platformUrl)}`,
   }),
 
   'kyc-rejected': (d) => ({

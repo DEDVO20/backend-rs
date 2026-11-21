@@ -21,6 +21,7 @@ import {
   syncSiigoCollectionsBodySchema,
   syncReceivablesBodySchema,
   syncTrialBalanceBodySchema,
+  trialBalanceTreeQuerySchema,
 } from './siigo.schema.js'
 
 /**
@@ -200,6 +201,11 @@ app.get('/trial-balance', zValidator('query', listTrialBalanceQuerySchema), asyn
 // GET /api/siigo/trial-balance/report — series para las gráficas
 app.get('/trial-balance/report', zValidator('query', listSiigoCollectionsQuerySchema), async (c) =>
   c.json(await SiigoTrialBalanceService.getChartsReport(c.req.valid('query'), c.get('user'))),
+)
+
+// GET /api/siigo/trial-balance/tree — estado de resultados / situación financiera desplegable por cuenta
+app.get('/trial-balance/tree', zValidator('query', trialBalanceTreeQuerySchema), async (c) =>
+  c.json(await SiigoTrialBalanceService.getTree(c.req.valid('query'), c.get('user'))),
 )
 
 app.post(

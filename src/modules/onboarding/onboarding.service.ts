@@ -1,6 +1,7 @@
 import { supabase }           from '../../lib/supabase.js'
 import { logger }             from '../../lib/logger.js'
 import { NotificationService } from '../../notifications/NotificationService.js'
+import { createInvitation } from '../invitations/invitations.service.js'
 import type { z }             from 'zod'
 import type {
   listOnboardingQuerySchema,
@@ -22,7 +23,7 @@ type PoliciesInput  = z.infer<typeof acceptPoliciesSchema>
 type KycDocInput    = z.infer<typeof uploadKycDocSchema>
 type KycDocReview   = z.infer<typeof reviewKycDocSchema>
 
-const PLATFORM_URL = process.env.PLATFORM_URL ?? 'https://app.tudominio.com'
+export const EDITABLE_DRAFT_STATUSES = ['draft', 'services_selected', 'policies_accepted', 'kyc_submitted', 'needs_correction', 'resubmit']
 
 export class OnboardingService {
   static async list(query: ListQuery, reviewerId: string) {
@@ -91,43 +92,18 @@ export class OnboardingService {
         .select()
         .single()
 
-      if (companyErr) {
-        logger.error({ companyErr }, 'Error creando empresa desde onboarding')
-      } else {
-        companyId = company.id
-        // Vincular empresa al onboarding
-        await supabase.from('client_onboardings').update({ company_id: companyId }).eq('id', id)
-      }
+      if (companyErr) throw companyErr
+      companyId = company.id
+      const { error: linkError } = await supabase.from('client_onboardings').update({ company_id: companyId }).eq('id', id)
+      if (linkError) throw linkError
     }
 
-    // 2. Crear invitación para que el representante asigne su contraseña
-    const token = crypto.randomUUID()
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
-
-    await supabase.from('company_invitations').insert({
-      email:      data.rep_email.toLowerCase().trim(),
-      full_name:  data.rep_name,
-      role:       'client_owner',
-      company_id: companyId,
-      token,
-      status:     'pending',
-      expires_at: expiresAt,
+    await createInvitation({
+      email: data.rep_email, fullName: data.rep_name, role: 'client_owner',
+      companyId, invitedBy: reviewerId, fromOnboarding: true,
     })
 
-    // 3. Enviar email con link para crear contraseña
-    void NotificationService.enqueue({
-      channel:  'email',
-      template: 'kyc-approved',
-      to:       data.rep_email,
-      data: {
-        ownerName:   data.rep_name,
-        companyName: data.company_name,
-        platformUrl: `${PLATFORM_URL}/invitations/accept?token=${token}`,
-      },
-      companyId: companyId ?? undefined,
-    })
-
-    return data
+    return { ...data, company_id: companyId }
   }
 
   static async reject(id: string, reviewerId: string, input: RejectInput) {
@@ -218,6 +194,7 @@ export class OnboardingService {
       .from('client_onboardings')
       .update({ status: 'services_selected', current_step: 2 })
       .eq('id', id)
+      .in('status', EDITABLE_DRAFT_STATUSES)
 
     return { ok: true, count: rows.length }
   }
@@ -244,6 +221,7 @@ export class OnboardingService {
       .from('client_onboardings')
       .update({ status: 'policies_accepted', current_step: 3 })
       .eq('id', id)
+      .in('status', EDITABLE_DRAFT_STATUSES)
 
     return { ok: true, count: rows.length }
   }
@@ -267,7 +245,7 @@ export class OnboardingService {
     return data
   }
 
-  static async uploadKycDoc(onboardingId: string, input: KycDocInput, reviewerId?: string) {
+  static async uploadKycDoc(onboardingId: string, input: KycDocInput) {
     const submission = await OnboardingService.getOrCreateKycSubmission(onboardingId)
 
     const { data, error } = await supabase
@@ -321,10 +299,12 @@ export class OnboardingService {
         submitted_at: new Date().toISOString(),
       })
       .eq('id', id)
+      .in('status', EDITABLE_DRAFT_STATUSES)
       .select()
-      .single()
+      .maybeSingle()
 
     if (error) throw error
+    if (!data) throw Object.assign(new Error('Este expediente ya fue enviado a revisión'), { statusCode: 409 })
 
     // Actualizar kyc_submission a under_review
     await supabase

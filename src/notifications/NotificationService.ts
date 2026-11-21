@@ -89,15 +89,15 @@ export class NotificationService {
         const { text, html, subject } = await renderTemplate(payload.template, payload.data)
 
         if (payload.channel === 'email' && provider === 'resend') {
+          const containsAccessLink = ['password-reset', 'invitation', 'kyc-approved'].includes(payload.template)
           messageId = await ResendChannel.send({
             to:      payload.to,
             channel: 'email',
             text,
             html,
             subject,
-            cc:      payload.cc,
-            // Copias ocultas del envío + las globales definidas en Configuración
-            bcc:     [...(payload.bcc ?? []), ...(settings?.bcc ?? [])],
+            cc:      containsAccessLink ? undefined : payload.cc,
+            bcc:     containsAccessLink ? undefined : [...(payload.bcc ?? []), ...(settings?.bcc ?? [])],
           })
         } else {
           messageId = await ZavuChannel.send({

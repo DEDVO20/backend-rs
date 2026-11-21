@@ -1,4 +1,5 @@
 import { Hono }         from 'hono'
+import { createHash }   from 'node:crypto'
 import { zValidator }   from '@hono/zod-validator'
 import { z }            from 'zod'
 import { supabasePublic, supabase } from '../../lib/supabase.js'
@@ -8,6 +9,7 @@ import { auditAsync }               from '../../lib/audit.js'
 import { rateLimiter }              from '../../middleware/rateLimiter.js'
 import { logger }                   from '../../lib/logger.js'
 import { setAuthCookies, clearAuthCookies, readAccessToken, readRefreshToken } from '../../lib/authCookies.js'
+import { findAuthAccount } from '../../lib/authAccount.js'
 
 const app = new Hono()
 
@@ -25,7 +27,7 @@ const forgotPasswordSchema = z.object({
 })
 
 const resetPasswordSchema = z.object({
-  access_token: z.string().min(1),
+  access_token: z.string().uuid(),
   password:     z.string().min(8, 'La contraseña debe tener al menos 8 caracteres'),
 })
 
@@ -114,47 +116,29 @@ app.post('/forgot-password',
 
     const normalizedEmail = email.toLowerCase().trim()
 
-    // Verificar que el usuario existe (sin revelar al cliente)
-    const { data: listData, error: listErr } = await supabase.auth.admin.listUsers({ perPage: 1000 })
-    if (listErr) {
-      logger.error({ err: listErr.message }, 'forgot-password: error listando usuarios')
-    }
-    const user = listData?.users?.find(u => u.email?.toLowerCase() === normalizedEmail)
-
-    logger.info({ email: normalizedEmail, found: !!user }, 'forgot-password: solicitud recibida')
-
-    if (user) {
-      const token = crypto.randomUUID()
-      const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString() // 1 hora
-
-      // Guardar token en company_invitations (reutilizamos la tabla)
-      const { error: insErr } = await supabase.from('company_invitations').insert({
-        email: normalizedEmail,
-        token,
-        role:       'password_reset',
-        status:     'pending',
-        expires_at: expiresAt,
-      })
-      if (insErr) {
-        logger.error({ err: insErr.message }, 'forgot-password: error guardando token')
-      }
-
-      const platformUrl = process.env.PLATFORM_URL ?? 'https://app.tudominio.com'
-      const resetUrl = `${platformUrl}/reset-password?token=${token}`
-
-      const { NotificationService } = await import('../../notifications/NotificationService.js')
-      try {
-        // Envío directo (no cola) — más confiable para acción crítica
-        await NotificationService.sendNow({
-          channel:  'email',
-          template: 'password-reset',
-          to:       normalizedEmail,
-          data:     { resetUrl, name: user.user_metadata?.full_name ?? '' },
+    try {
+      const userId = await findAuthAccount(normalizedEmail)
+      if (userId) {
+        const token = crypto.randomUUID()
+        const { error } = await supabase.from('password_recovery_tokens').insert({
+          email: normalizedEmail,
+          token_hash: createHash('sha256').update(token).digest('hex'),
+          user_id: userId,
+          expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
         })
-        logger.info({ email: normalizedEmail }, 'forgot-password: email enviado')
-      } catch (err) {
-        logger.error({ err: err instanceof Error ? err.message : String(err) }, 'forgot-password: fallo al enviar email')
+        if (error) throw error
+
+        const platformUrl = process.env.PLATFORM_URL ?? 'https://app.tudominio.com'
+        const { NotificationService } = await import('../../notifications/NotificationService.js')
+        await NotificationService.sendNow({
+          channel: 'email',
+          template: 'password-reset',
+          to: normalizedEmail,
+          data: { resetUrl: `${platformUrl}/reset-password?token=${token}` },
+        })
       }
+    } catch {
+      logger.error('forgot-password: no se pudo generar o enviar el enlace')
     }
 
     // Siempre 200 para no revelar si el email existe
@@ -169,44 +153,18 @@ app.post('/reset-password',
   async (c) => {
     const { access_token: token, password } = c.req.valid('json')
 
-    // Buscar token en company_invitations
-    const { data: inv, error: invErr } = await supabase
-      .from('company_invitations')
-      .select('email')
-      .eq('token', token)
-      .eq('role', 'password_reset')
-      .eq('status', 'pending')
-      .gt('expires_at', new Date().toISOString())
-      .single()
+    const { data: userId, error: claimError } = await supabase.rpc('claim_password_recovery', { p_token: token })
+    if (claimError) throw claimError
+    if (!userId) return c.json({ error: 'Enlace inválido o expirado' }, 401)
 
-    if (invErr || !inv) {
-      return c.json({ error: 'Token inválido o expirado' }, 401)
-    }
-
-    // Buscar usuario por email
-    const { data: listData } = await supabase.auth.admin.listUsers()
-    const user = listData?.users?.find(u => u.email === inv.email)
-
-    if (!user) {
-      return c.json({ error: 'Usuario no encontrado' }, 404)
-    }
-
-    // Actualizar contraseña
-    const { error } = await supabase.auth.admin.updateUserById(user.id, { password })
-
+    // Supabase Auth cambia la contraseña y revoca las sesiones en la misma transacción.
+    const { error } = await supabase.auth.admin.updateUserById(userId, { password })
     if (error) {
-      return c.json({ error: 'No se pudo actualizar la contraseña' }, 500)
+      logger.warn({ code: error.code, userId }, 'reset-password: no se pudo actualizar la cuenta')
+      return c.json({ error: 'No se pudo actualizar la contraseña. Solicita un nuevo enlace.' }, 500)
     }
 
-    // Marcar token como usado
-    await supabase.from('company_invitations')
-      .update({ status: 'accepted', accepted_at: new Date().toISOString() })
-      .eq('token', token)
-
-    // Revocar sesiones activas
-    await supabase.auth.admin.signOut(user.id)
-
-    auditAsync({ action: 'update', resource: 'auth', resource_id: user.id, c,
+    auditAsync({ action: 'update', resource: 'auth', resource_id: userId, c,
       metadata: { event: 'password_reset' } })
 
     return c.json({ message: 'Contraseña actualizada correctamente. Todas las sesiones han sido cerradas.' })

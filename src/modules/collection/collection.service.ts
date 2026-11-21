@@ -54,7 +54,7 @@ export class CollectionService {
     let debtorsQ = supabase
       .from('collection_debtors')
       .select('id, status, phone, email, collection_debts(outstanding_amount, overdue_1_30, overdue_31_60, overdue_61_90, overdue_91_plus, not_yet_due)')
-    if (companyId) debtorsQ = debtorsQ.eq('company_id', companyId)
+    if (companyId) debtorsQ = debtorsQ.eq('company_id', companyId).eq('collection_debts.company_id', companyId)
     if (socio) debtorsQ = debtorsQ.eq('socio', socio)
     const { data: debtors, error } = await debtorsQ
 
@@ -138,7 +138,7 @@ export class CollectionService {
     if (postProcess) q = q.limit(2000)
     else q = q.range(from, from + limit - 1)
 
-    if (companyId) q = q.eq('company_id', companyId)
+    if (companyId) q = q.eq('company_id', companyId).eq('collection_debts.company_id', companyId)
 
     if (status) {
       q = q.eq('status', status)
@@ -245,14 +245,16 @@ export class CollectionService {
     return [...set].sort((a, b) => a.localeCompare(b))
   }
 
-  static async getDebtor(id: string) {
-    const { data, error } = await supabase
+  static async getDebtor(id: string, companyId: string | null) {
+    let query = supabase
       .from('collection_debtors')
       .select('*, companies(name), collection_debts(*)')
       .eq('id', id)
-      .single()
+    if (companyId) query = query.eq('company_id', companyId).eq('collection_debts.company_id', companyId)
+    const { data, error } = await query.maybeSingle()
 
     if (error) throw error
+    if (!data) return null
 
     let advisorName = null
     if (data.assigned_user_id) {
@@ -336,6 +338,9 @@ export class CollectionService {
   // ── Agreements ────────────────────────────────────────────────────────────
 
   static async createAgreement(input: CreateAgreementInput, companyId: string, createdBy: string) {
+    const debtor = await CollectionService.getDebtor(input.debtor_id, companyId)
+    if (!debtor) throw Object.assign(new Error('Deudor no encontrado'), { statusCode: 404 })
+
     const { data, error } = await supabase
       .from('collection_agreements')
       .insert({ ...input, company_id: companyId, created_by: createdBy })
@@ -345,8 +350,6 @@ export class CollectionService {
     if (error) throw error
 
     // Notificar al deudor por WhatsApp y email si tiene los datos
-    const debtor = await CollectionService.getDebtor(input.debtor_id)
-
     const notifData = {
       debtorName: debtor.debtor_name,
       amount: String(input.total_amount),
@@ -377,12 +380,16 @@ export class CollectionService {
     return data
   }
 
-  static async listAgreements(debtorId: string) {
-    const { data, error } = await supabase
+  static async listAgreements(debtorId: string, companyId: string | null) {
+    let query = supabase
       .from('collection_agreements')
-      .select('*')
+      .select('*, collection_debtors!inner()')
       .eq('debtor_id', debtorId)
       .order('created_at', { ascending: false })
+    if (companyId) {
+      query = query.eq('company_id', companyId).eq('collection_debtors.company_id', companyId)
+    }
+    const { data, error } = await query
 
     if (error) throw error
     return data

@@ -51,8 +51,8 @@ export class RequestsService {
     return { data, total: count ?? 0, page, limit }
   }
 
-  static async getById(id: string) {
-    const { data, error } = await supabase
+  static async getById(id: string, companyId?: string) {
+    let query = supabase
       .from('operational_requests')
       .select(`
         *,
@@ -62,9 +62,11 @@ export class RequestsService {
         assigned_to:profiles!fk_operational_requests_assigned_to(full_name,email)
       `)
       .eq('id', id)
-      .single()
+    if (companyId !== undefined) query = query.eq('company_id', companyId)
+    const { data, error } = await query.maybeSingle()
 
     if (error) throw error
+    if (!data) throw Object.assign(new Error('Solicitud no encontrada'), { statusCode: 404 })
     return data
   }
 

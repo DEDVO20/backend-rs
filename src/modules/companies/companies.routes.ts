@@ -1,11 +1,13 @@
 import { Hono }         from 'hono'
 import { zValidator }   from '@hono/zod-validator'
 import { z }            from 'zod'
-import { authMiddleware }     from '../../middleware/auth.js'
+import { authMiddleware, invalidateCompanyAuthCache } from '../../middleware/auth.js'
 import { requireModule }      from '../../middleware/requireRole.js'
 import { requireRole, requirePermission } from '../../middleware/requireRole.js'
 import { requireOwnCompany }  from '../../middleware/requireRole.js'
 import { CompaniesService }   from './companies.service.js'
+import { createInvitation, listPendingInvitations } from '../invitations/invitations.service.js'
+import { auditAsync }         from '../../lib/audit.js'
 import {
   CLIENT_EDITABLE_COMPANY_FIELDS,
   createCompanySchema,
@@ -80,33 +82,76 @@ app.patch('/:id',
   },
 )
 
+// POST /api/companies/:id/inactivate — solo admin/rs_admin
+const inactivateSchema = z.object({
+  reason: z.string().trim().max(500).optional(),
+})
+
+app.post('/:id/inactivate',
+  requireRole('admin', 'rs_admin'),
+  requirePermission('companies', 'update'),
+  zValidator('json', inactivateSchema),
+  async (c) => {
+    const { id: userId } = c.get('user')
+    const data = await CompaniesService.inactivate(c.req.param('id')!, userId, c.req.valid('json').reason)
+    invalidateCompanyAuthCache(data.id)   // el bloqueo aplica de inmediato, no en 60 s
+    auditAsync({ action: 'update', resource: 'companies', resource_id: data.id, user: c.get('user'), c,
+      metadata: { event: 'company_inactivated', reason: data.inactivation_reason } })
+    return c.json(data)
+  },
+)
+
+// POST /api/companies/:id/reactivate — solo admin/rs_admin
+app.post('/:id/reactivate',
+  requireRole('admin', 'rs_admin'),
+  requirePermission('companies', 'update'),
+  async (c) => {
+    const data = await CompaniesService.reactivate(c.req.param('id')!)
+    auditAsync({ action: 'update', resource: 'companies', resource_id: data.id, user: c.get('user'), c,
+      metadata: { event: 'company_reactivated' } })
+    return c.json(data)
+  },
+)
+
 // GET /api/companies/:id/team
 app.get('/:id/team', requireOwnCompany('id'), async (c) => {
   const data = await CompaniesService.getTeam(c.req.param('id')!)
   return c.json(data)
 })
 
-// POST /api/companies/:id/invite
+// GET /api/companies/:id/invitations — invitaciones pendientes de la empresa
+app.get('/:id/invitations',
+  requireRole('admin', 'rs_admin', 'rs_staff', 'client_owner'),
+  requireOwnCompany('id'),
+  async (c) => c.json(await listPendingInvitations(c.req.param('id')!)),
+)
+
+// POST /api/companies/:id/invite — invitar dueño o usuario de la empresa.
+// Reenviar = invitar de nuevo el mismo correo (cancela la invitación anterior).
 const inviteSchema = z.object({
-  email: z.string().email(),
-  role:  z.enum(['client_owner', 'client_user']),
+  email:     z.string().email(),
+  full_name: z.string().trim().min(2).optional(),
+  role:      z.enum(['client_owner', 'client_user']),
 })
 
 app.post('/:id/invite',
+  requireRole('admin', 'rs_admin', 'rs_staff', 'client_owner'),
   requireOwnCompany('id'),
   zValidator('json', inviteSchema),
   async (c) => {
     const { id: inviterId, role } = c.get('user')
     const companyId = c.req.param('id')!
-    const { email, role: targetRole } = c.req.valid('json')
+    const { email, full_name, role: targetRole } = c.req.valid('json')
 
     // client_owner solo puede invitar client_user
     if (role === 'client_owner' && targetRole === 'client_owner') {
       return c.json({ error: 'No puedes invitar otro owner' }, 403)
     }
 
-    const data = await CompaniesService.inviteUser(companyId, email, targetRole, inviterId)
-    return c.json(data)
+    const data = await createInvitation({
+      email, fullName: full_name, role: targetRole, companyId, invitedBy: inviterId,
+    })
+    return c.json(data, 201)
   },
 )
 

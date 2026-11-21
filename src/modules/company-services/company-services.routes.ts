@@ -2,7 +2,7 @@ import { Hono }         from 'hono'
 import { zValidator }   from '@hono/zod-validator'
 import { z }            from 'zod'
 import { authMiddleware } from '../../middleware/auth.js'
-import { requireRole }    from '../../middleware/requireRole.js'
+import { requireOwnCompany, requireRole } from '../../middleware/requireRole.js'
 import { supabase }       from '../../lib/supabase.js'
 import { logger }         from '../../lib/logger.js'
 
@@ -19,7 +19,7 @@ const assignServiceSchema = z.object({
 
 // GET /api/company-services/pairs — todas las relaciones activas empresa↔servicio
 // (para filtros que se condicionan entre sí). DEBE ir antes de /:companyId.
-app.get('/pairs', async (c) => {
+app.get('/pairs', requireRole('admin', 'rs_admin', 'rs_staff', 'contador'), async (c) => {
   const { data, error } = await supabase
     .from('company_services')
     .select('company_id, service_id')
@@ -29,7 +29,7 @@ app.get('/pairs', async (c) => {
 })
 
 // GET /api/company-services/:companyId — servicios activos de una empresa
-app.get('/:companyId', async (c) => {
+app.get('/:companyId', requireOwnCompany(), async (c) => {
   const { data, error } = await supabase
     .from('company_services')
     .select('*, services(id, name, description)')

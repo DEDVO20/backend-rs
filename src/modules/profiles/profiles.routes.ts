@@ -2,9 +2,10 @@ import { Hono } from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import { z } from 'zod'
 import { authMiddleware } from '../../middleware/auth.js'
-import { requireRole } from '../../middleware/requireRole.js'
+import { requireOwnCompany, requireRole } from '../../middleware/requireRole.js'
 import { supabase } from '../../lib/supabase.js'
 import { paginationSchema, paginationRange, paginatedResponse } from '../../lib/paginate.js'
+import { createInvitation } from '../invitations/invitations.service.js'
 
 const app = new Hono()
 
@@ -28,7 +29,7 @@ app.get('/me', async (c) => {
 
   const { data, error } = await supabase
     .from('profiles')
-    .select('*, companies(id, name, status)')
+    .select('*, companies!profiles_company_id_fkey(id, name, status)')
     .eq('id', id)
     .single()
 
@@ -70,7 +71,7 @@ app.get('/',
 
     let q = supabase
       .from('profiles')
-      .select('*, companies(name)', { count: 'exact' })
+      .select('*, companies!profiles_company_id_fkey(name)', { count: 'exact' })
       .order('created_at', { ascending: false })
       .range(from, to)
 
@@ -110,7 +111,7 @@ app.get('/:id',
   async (c) => {
     const { data, error } = await supabase
       .from('profiles')
-      .select('*, companies(name)')
+      .select('*, companies!profiles_company_id_fkey(name)')
       .eq('id', c.req.param('id')!)
       .single()
 
@@ -125,6 +126,11 @@ app.patch('/:id',
   zValidator('json', updateProfileAdminSchema),
   async (c) => {
     const body = c.req.valid('json')
+    const { role: actorRole } = c.get('user')
+
+    if (actorRole !== 'admin' && body.role === 'admin') {
+      return c.json({ error: 'Solo un administrador puede asignar este rol' }, 403)
+    }
 
     // El rol debe existir en la tabla `roles` (incluye roles custom).
     if (body.role) {
@@ -133,20 +139,21 @@ app.patch('/:id',
       if (!role) return c.json({ error: 'Rol no encontrado' }, 400)
     }
 
-    const { data, error } = await supabase
+    let query = supabase
       .from('profiles')
       .update(body)
       .eq('id', c.req.param('id')!)
-      .select()
-      .single()
+    if (actorRole !== 'admin') query = query.neq('role', 'admin')
+    const { data, error } = await query.select().maybeSingle()
 
     if (error) throw error
+    if (!data) return c.json({ error: 'Perfil no encontrado' }, 404)
     return c.json(data)
   },
 )
 
 // GET /api/profiles/company/:companyId/team — equipo de una empresa con invitaciones pendientes
-app.get('/company/:companyId/team', async (c) => {
+app.get('/company/:companyId/team', requireOwnCompany(), async (c) => {
   const { data, error } = await supabase
     .from('company_team_view')
     .select('*')
@@ -170,6 +177,9 @@ app.post('/invite',
   zValidator('json', inviteAdminSchema),
   async (c) => {
     const { full_name, email, role: targetRole } = c.req.valid('json')
+    if (targetRole === 'admin' && c.get('user').role !== 'admin') {
+      return c.json({ error: 'Solo un administrador puede asignar este rol' }, 403)
+    }
 
     // El rol debe existir y ser interno: solo se invita personal administrativo.
     const { data: role } = await supabase
@@ -179,43 +189,11 @@ app.post('/invite',
       return c.json({ error: 'Solo se puede invitar personal administrativo con roles internos' }, 400)
     }
 
-    // Create invitation record
-    const token = crypto.randomUUID()
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
-
-    const { error: invErr } = await supabase
-      .from('company_invitations')
-      .insert({
-        full_name,
-        email: email.toLowerCase().trim(),
-        role: targetRole,
-        token,
-        status: 'pending',
-        expires_at: expiresAt,
-        company_id: null,
-      })
-
-    if (invErr) {
-      if (invErr.code === '23505') return c.json({ error: 'Ya existe una invitación pendiente para ese email' }, 409)
-      throw invErr
-    }
-
-    // Send invitation email via Zavu
-    const { NotificationService } = await import('../../notifications/NotificationService.js')
-    const platformUrl = process.env.PLATFORM_URL ?? 'https://app.tudominio.com'
-
-    void NotificationService.enqueue({
-      channel: 'email',
-      template: 'invitation',
-      to: email,
-      data: {
-        name: full_name,
-        companyName: 'Finto',
-        inviteUrl: `${platformUrl}/invitations/accept?token=${token}`,
-      },
+    // InvitationError trae statusCode (409, 404…) y lo responde el onError global
+    const result = await createInvitation({
+      email, fullName: full_name, role: targetRole, companyId: null, invitedBy: c.get('user').id,
     })
-
-    return c.json({ ok: true, email, role: targetRole, expires_at: expiresAt }, 201)
+    return c.json(result, 201)
   },
 )
 

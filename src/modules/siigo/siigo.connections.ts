@@ -1,5 +1,6 @@
 import { supabase } from '../../lib/supabase.js'
 import { decryptSecret, encryptSecret } from '../../lib/secretBox.js'
+import { isCompanyInactive } from '../../lib/companyStatus.js'
 import { SIIGO_CONFIG } from './siigo.config.js'
 import { dbError } from './siigo.helpers.js'
 import { clearCachedSiigoToken } from './siigo.cache.js'
@@ -131,9 +132,13 @@ export class SiigoConnections {
 
   /** Conexiones que el cron debe sincronizar */
   static async syncTargets(): Promise<SiigoConnectionRow[]> {
-    const { data, error } = await supabase.from('siigo_connections').select(COLUMNS).eq('active', true)
+    const { data, error } = await supabase.from('siigo_connections').select(`${COLUMNS}, companies(status)`).eq('active', true)
     if (error) throw dbError(`No se pudieron consultar las conexiones de Siigo: ${error.message}`, error)
-    return ((data ?? []) as unknown as SiigoConnectionRow[]).filter(r => this.hasCredentials(r))
+    // La de Finto no tiene empresa; las de empresas inactivas no se sincronizan
+    return ((data ?? []) as any[])
+      .filter(r => !isCompanyInactive(r.companies?.status))
+      .map(({ companies: _c, ...row }) => row as SiigoConnectionRow)
+      .filter(r => this.hasCredentials(r))
   }
 
   private static buildChanges(input: SaveSiigoConnectionBody, userId: string) {

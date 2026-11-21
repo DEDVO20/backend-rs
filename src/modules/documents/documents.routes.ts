@@ -1,9 +1,10 @@
-import { Hono }       from 'hono'
+import { Hono, type Context } from 'hono'
+import { HTTPException } from 'hono/http-exception'
 import { zValidator } from '@hono/zod-validator'
 import { authMiddleware } from '../../middleware/auth.js'
 import { requireModule }  from '../../middleware/requireRole.js'
 import { requireRole, requirePermission } from '../../middleware/requireRole.js'
-import { DocumentsService } from './documents.service.js'
+import { DocumentsService, uploadExtension } from './documents.service.js'
 import {
   listDocumentsQuerySchema,
   createDocumentSchema,
@@ -62,16 +63,33 @@ app.get('/areas', async (c) => {
 })
 
 // GET /api/documents/:id
+function readDocument(c: Context) {
+  const { role, companyId } = c.get('user')
+  const id = c.req.param('id')!
+  if (INTERNAL_ROLES.some(internalRole => internalRole === role)) return DocumentsService.getById(id)
+  if (!companyId) throw new HTTPException(404, { message: 'Documento no encontrado' })
+  return DocumentsService.getById(id, companyId)
+}
+
 app.get('/:id', async (c) => {
-  const data = await DocumentsService.getById(c.req.param('id')!)
+  const data = await readDocument(c)
   return c.json(data)
 })
 
 // GET /api/documents/:id/download — URL firmada de Supabase Storage
 app.get('/:id/download', async (c) => {
-  const doc = await DocumentsService.getById(c.req.param('id')!)
+  const doc = await readDocument(c)
   if (!doc.storage_path) return c.json({ error: 'Documento sin archivo' }, 404)
+  const { role, companyId } = c.get('user')
+  if (!INTERNAL_ROLES.some(internalRole => internalRole === role)) {
+    const [folder, ...segments] = doc.storage_path.split('/') as string[]
+    if (folder !== companyId || !segments.length ||
+        segments.some(segment => !segment || segment === '.' || segment === '..' || /[%\\]/.test(segment))) {
+      return c.json({ error: 'Documento no encontrado' }, 404)
+    }
+  }
   const url = await DocumentsService.getSignedUrl(doc.storage_path)
+  c.header('Cache-Control', 'no-store')
   return c.json({ url })
 })
 
@@ -81,9 +99,9 @@ app.post('/upload-url', requirePermission('documents', 'create'), async (c) => {
   if (!companyId) return c.json({ error: 'Sin empresa asignada' }, 400)
 
   const { fileName, contentType } = await c.req.json<{ fileName: string; contentType: string }>()
-  if (!fileName) return c.json({ error: 'fileName requerido' }, 400)
+  if (typeof fileName !== 'string' || !fileName) return c.json({ error: 'fileName requerido' }, 400)
 
-  const ext  = fileName.split('.').pop() ?? 'bin'
+  const ext = uploadExtension(fileName)
   const path = `${companyId}/${Date.now()}-${crypto.randomUUID()}.${ext}`
 
   const { supabase } = await import('../../lib/supabase.js')
@@ -112,6 +130,10 @@ app.post('/confirm-upload', requirePermission('documents', 'create'), async (c) 
   }>()
 
   if (!path || !title) return c.json({ error: 'path y title requeridos' }, 400)
+  if (typeof path !== 'string' || !path.startsWith(`${companyId}/`) ||
+      !/^\d+-[0-9a-f-]{36}\.[a-z0-9]{1,16}$/i.test(path.slice(companyId.length + 1))) {
+    return c.json({ error: 'Ruta de archivo inválida para esta empresa' }, 403)
+  }
 
   const { data: urlData } = await supabase.storage.from('documents').getPublicUrl(path)
 

@@ -1,6 +1,7 @@
 import { supabase } from '../../lib/supabase.js'
 import { logger } from '../../lib/logger.js'
 import { decryptSecret, encryptSecret } from '../../lib/secretBox.js'
+import { isCompanyInactive } from '../../lib/companyStatus.js'
 import { dbError } from '../siigo/siigo.helpers.js'
 import { SiigoService } from '../siigo/siigo.service.js'
 import { HubspotClient } from './hubspot.client.js'
@@ -144,9 +145,13 @@ export class HubspotService {
 
   /** Conexiones que el cron debe sincronizar */
   static async syncTargets(): Promise<HubspotConnectionRow[]> {
-    const { data, error } = await supabase.from('hubspot_connections').select(COLUMNS).eq('active', true)
+    const { data, error } = await supabase.from('hubspot_connections').select(`${COLUMNS}, companies(status)`).eq('active', true)
     if (error) throw dbError(`No se pudieron consultar las conexiones de HubSpot: ${error.message}`, error)
-    return ((data ?? []) as HubspotConnectionRow[]).filter(r => this.hasToken(r))
+    // La de Finto no tiene empresa; las de empresas inactivas no se sincronizan
+    return ((data ?? []) as any[])
+      .filter(r => !isCompanyInactive(r.companies?.status))
+      .map(({ companies: _c, ...row }) => row as HubspotConnectionRow)
+      .filter(r => this.hasToken(r))
   }
 
   /**

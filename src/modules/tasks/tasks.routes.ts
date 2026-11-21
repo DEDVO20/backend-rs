@@ -130,7 +130,10 @@ app.get('/cron-logs',
 
 // GET /api/tasks/:id
 app.get('/:id', async (c) => {
-  const data = await TasksService.getById(c.req.param('id')!)
+  const { role, companyId } = c.get('user')
+  const isInternal = INTERNAL_ROLES.some(internalRole => internalRole === role)
+  if (!isInternal && !companyId) return c.json({ error: 'Tarea no encontrada' }, 404)
+  const data = await TasksService.getById(c.req.param('id')!, isInternal ? undefined : companyId!)
   return c.json(data)
 })
 
@@ -150,9 +153,11 @@ app.patch('/:id',
   requirePermission('tasks', 'update'),
   zValidator('json', updateTaskSchema),
   async (c) => {
-    const { role } = c.get('user')
+    const { role, companyId } = c.get('user')
     const body = c.req.valid('json')
     const isInternal = (INTERNAL_ROLES as readonly string[]).includes(role)
+    if (!isInternal && !companyId) return c.json({ error: 'Tarea no encontrada' }, 404)
+    const clientCompanyId = isInternal ? undefined : companyId!
 
     // Clientes solo pueden cambiar status y document_id
     if (!isInternal && Object.keys(body).some(k => k !== 'status' && k !== 'document_id')) {
@@ -160,17 +165,21 @@ app.patch('/:id',
     }
 
     // Validar quién puede completar según owner_type
-    if (body.status === 'done') {
+    if (body.status === 'done' && isInternal) {
       const task = await TasksService.getById(c.req.param('id')!)
-      if (task.owner_type === 'client' && isInternal) {
+      if (task.owner_type === 'client') {
         return c.json({ error: 'Esta tarea debe ser completada por el cliente' }, 403)
-      }
-      if (task.owner_type === 'rs_team' && !isInternal) {
-        return c.json({ error: 'Esta tarea debe ser completada por el equipo Finto' }, 403)
       }
     }
 
-    const data = await TasksService.update(c.req.param('id')!, body)
+    if (clientCompanyId && body.document_id) {
+      const { data: document, error } = await supabase.from('documents').select('id')
+        .eq('id', body.document_id).eq('company_id', clientCompanyId).maybeSingle()
+      if (error) throw error
+      if (!document) return c.json({ error: 'Documento no encontrado' }, 404)
+    }
+
+    const data = await TasksService.update(c.req.param('id')!, body, clientCompanyId)
     return c.json(data)
   },
 )

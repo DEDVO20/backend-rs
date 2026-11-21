@@ -17,7 +17,7 @@ import {
   readWorkbook,
 } from './siigo.trialBalance.js'
 import type { AuthUser } from '../../middleware/auth.js'
-import type { ListSiigoCollectionsQuery, ListTrialBalanceQuery, SyncTrialBalanceBody } from './siigo.schema.js'
+import type { ListSiigoCollectionsQuery, ListTrialBalanceQuery, SyncTrialBalanceBody, TrialBalanceTreeQuery } from './siigo.schema.js'
 
 const REPORT_URL = `${SIIGO_CONFIG.SIIGO_BASE_URL}/v1/test-balance-report-by-thirdparty`
 const DOWNLOAD_TRIES = 5
@@ -325,6 +325,28 @@ export class SiigoTrialBalanceService {
       if ((data ?? []).length < PAGE) break
     }
     return out
+  }
+
+  /**
+   * Estado de resultados (por año) o de situación financiera (por mes), desplegable:
+   * devuelve los hijos de `parent` (clases si viene vacío) con su valor por columna.
+   */
+  static async getTree(query: TrialBalanceTreeQuery, user: AuthUser) {
+    const scope = await SiigoService.resolveScope(query, user)
+    if (scope.denied || !scope.books) return { notConnected: scope.notConnected, columns: [], rows: [], totals: {} }
+
+    const { data, error } = await supabase.rpc('siigo_trial_balance_tree', {
+      p_connection: scope.books.connectionId,
+      p_statement:  query.statement,
+      p_parent:     query.parent,
+      p_from:       query.startDate?.slice(0, 7) ?? null,
+      p_to:         query.endDate?.slice(0, 7) ?? null,
+      p_tercero:    query.tercero?.trim() || null,
+      p_company_id: scope.companyId,
+    })
+    if (error) throw dbError(`No se pudo calcular el estado financiero: ${error.message}`, error)
+    const r = (data ?? {}) as Obj
+    return { notConnected: false, columns: r.columns ?? [], rows: r.rows ?? [], totals: r.totals ?? {} }
   }
 
   /** Consulta de un mes de los libros consultados: filas paginadas, totales por clase, cuadre y control de periodos */

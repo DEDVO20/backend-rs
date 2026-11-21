@@ -1,4 +1,5 @@
-import { Hono }       from 'hono'
+import { Hono, type Context } from 'hono'
+import { HTTPException } from 'hono/http-exception'
 import { zValidator } from '@hono/zod-validator'
 import { authMiddleware } from '../../middleware/auth.js'
 import { requireModule }  from '../../middleware/requireRole.js'
@@ -28,44 +29,20 @@ const app = new Hono()
 
 app.use('/*', authMiddleware, requireModule('collection'))
 
-// ── Diagnóstico temporal ───────────────────────────────────────────────────
-app.get('/debug', async (c) => {
-  const { supabase } = await import('../../lib/supabase.js')
-  const user = c.get('user')
-
-  // Simular exactamente lo que hace listDebtors
-  const { data, error, count } = await supabase
-    .from('collection_debtors')
-    .select('*, collection_debts(outstanding_amount,overdue_1_30,overdue_31_60,overdue_61_90,overdue_91_plus,not_yet_due,total_balance,currency,due_date,siigo_document)', { count: 'exact' })
-    .order('updated_at', { ascending: false })
-    .range(0, 19)
-
-  return c.json({
-    user_role: user.role,
-    user_company_id: user.companyId,
-    count,
-    error: error?.message,
-    error_details: error?.details,
-    error_hint: error?.hint,
-    sample: data?.slice(0, 3),
-  })
-})
+function readCompanyScope(c: Context, requestedCompanyId: string | null = null) {
+  const { role, companyId } = c.get('user')
+  if (STAFF_ROLES.some(staffRole => staffRole === role)) return requestedCompanyId
+  if (!companyId) throw new HTTPException(400, { message: 'Sin empresa' })
+  if (requestedCompanyId && requestedCompanyId !== companyId) {
+    throw new HTTPException(403, { message: 'Acceso denegado — empresa incorrecta' })
+  }
+  return companyId
+}
 
 // ── Stats ──────────────────────────────────────────────────────────────────
 
 app.get('/stats', async (c) => {
-  const { role, companyId: userCompanyId } = c.get('user')
-  const queryCompanyId = c.req.query('company_id')
-  const isStaff = ['admin','rs_admin','rs_staff'].includes(role)
-
-  let companyId: string | null
-  if (isStaff) {
-    companyId = queryCompanyId ?? null
-  } else {
-    companyId = queryCompanyId ?? userCompanyId
-    if (!companyId) return c.json({ error: 'Sin empresa' }, 400)
-  }
-
+  const companyId = readCompanyScope(c, c.req.query('company_id'))
   const socio = c.req.query('socio') || null
   const result = await CollectionService.getStats(companyId, socio)
   return c.json(result)
@@ -76,20 +53,8 @@ app.get('/stats', async (c) => {
 app.get('/debtors',
   zValidator('query', listDebtorsQuerySchema),
   async (c) => {
-    const { role, companyId: userCompanyId } = c.get('user')
     const query = c.req.valid('query')
-    const isStaff = ['admin','rs_admin','rs_staff'].includes(role)
-
-    let companyId: string | null
-    if (isStaff) {
-      // Staff ve todas las empresas; solo filtra si seleccionó una en el dropdown
-      companyId = query.company_id ?? null
-    } else {
-      // Cliente solo ve su propia empresa
-      companyId = query.company_id ?? userCompanyId
-      if (!companyId) return c.json({ error: 'Sin empresa' }, 400)
-    }
-
+    const companyId = readCompanyScope(c, query.company_id)
     const result = await CollectionService.listDebtors(query, companyId)
     return c.json(result)
   },
@@ -97,15 +62,14 @@ app.get('/debtors',
 
 // Socios distintos para el filtro de cartera (debe ir antes de /debtors/:id)
 app.get('/debtors/socios', async (c) => {
-  const { role, companyId: userCompanyId } = c.get('user')
-  const isStaff = ['admin', 'rs_admin', 'rs_staff'].includes(role)
-  const companyId = isStaff ? (c.req.query('company_id') ?? null) : (c.req.query('company_id') ?? userCompanyId ?? null)
+  const companyId = readCompanyScope(c, c.req.query('company_id'))
   const data = await CollectionService.listSocios(companyId)
   return c.json(data)
 })
 
 app.get('/debtors/:id', async (c) => {
-  const data = await CollectionService.getDebtor(c.req.param('id')!)
+  const data = await CollectionService.getDebtor(c.req.param('id')!, readCompanyScope(c))
+  if (!data) return c.json({ error: 'Deudor no encontrado' }, 404)
   return c.json(data)
 })
 
@@ -171,7 +135,7 @@ app.post('/actions',
 // ── Agreements ─────────────────────────────────────────────────────────────
 
 app.get('/debtors/:id/agreements', async (c) => {
-  const data = await CollectionService.listAgreements(c.req.param('id')!)
+  const data = await CollectionService.listAgreements(c.req.param('id')!, readCompanyScope(c))
   return c.json(data)
 })
 
@@ -665,15 +629,7 @@ app.post('/debtors/:id/debts',
 // ── Templates ──────────────────────────────────────────────────────────────
 
 app.get('/templates', async (c) => {
-  const { companyId, role } = c.get('user')
-  const isStaff = ['admin', 'rs_admin', 'rs_staff'].includes(role)
-
-  // Staff puede filtrar por empresa (?company_id=) para ver sus plantillas
-  // personalizadas + las globales; sin filtro ve todas (panel de administración)
-  const queryCompany = c.req.query('company_id') || null
-  const effectiveCompany = isStaff ? queryCompany : companyId
-
-  const localTemplates = await CollectionService.listTemplates(effectiveCompany)
+  const localTemplates = await CollectionService.listTemplates(readCompanyScope(c, c.req.query('company_id') || null))
 
   // Traer plantillas de Zavu en paralelo
   let zavuTemplates: any[] = []

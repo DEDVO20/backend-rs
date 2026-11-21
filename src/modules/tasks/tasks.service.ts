@@ -1,4 +1,5 @@
 import { supabase } from '../../lib/supabase.js'
+import { INACTIVE_IN_FILTER } from '../../lib/companyStatus.js'
 import { NotificationService } from '../../notifications/NotificationService.js'
 import type { z } from 'zod'
 import type {
@@ -44,14 +45,19 @@ export class TasksService {
     return { data, total: count ?? 0, page, limit }
   }
 
-  static async getById(id: string) {
-    const { data, error } = await supabase
+  static async getById(id: string, clientCompanyId?: string) {
+    let query = supabase
       .from('tasks')
       .select('*,services!tasks_service_id_fkey(name),documents(*)')
       .eq('id', id)
-      .single()
+    if (clientCompanyId !== undefined) {
+      query = query.eq('company_id', clientCompanyId).eq('owner_type', 'client')
+        .eq('documents.company_id', clientCompanyId)
+    }
+    const { data, error } = await query.maybeSingle()
 
     if (error) throw error
+    if (!data) throw Object.assign(new Error('Tarea no encontrada'), { statusCode: 404 })
     return data
   }
 
@@ -66,17 +72,20 @@ export class TasksService {
     return data
   }
 
-  static async update(id: string, input: UpdateInput) {
-    const task = await TasksService.getById(id)
+  static async update(id: string, input: UpdateInput, clientCompanyId?: string) {
+    const task = await TasksService.getById(id, clientCompanyId)
 
-    const { data, error } = await supabase
+    let query = supabase
       .from('tasks')
       .update(input)
       .eq('id', id)
-      .select()
-      .single()
+    if (clientCompanyId !== undefined) {
+      query = query.eq('company_id', clientCompanyId).eq('owner_type', 'client')
+    }
+    const { data, error } = await query.select().maybeSingle()
 
     if (error) throw error
+    if (!data) throw Object.assign(new Error('Tarea no encontrada'), { statusCode: 404 })
 
     // Notificar al owner cuando una tarea vence
     if (TASK_EMAILS_ENABLED && input.status === 'overdue' && task.company_id) {
@@ -150,10 +159,12 @@ export class TasksService {
         .from('task_templates')
         .select('id, title, frequency, due_day, create_day, owner_type, service_id, requires_document, provider_service_id')
         .eq('active', true),
+      // Las empresas inactivas no generan tareas
       supabase
         .from('company_services')
-        .select('company_id, service_id')
-        .eq('active', true),
+        .select('company_id, service_id, companies!inner(status)')
+        .eq('active', true)
+        .not('companies.status', 'in', INACTIVE_IN_FILTER),
     ])
 
     if (errT) throw new Error(`Error cargando plantillas: ${errT.message}`)
@@ -359,7 +370,7 @@ export class TasksService {
 
     const { data: tasks } = await supabase
       .from('tasks')
-      .select('id,title,due_date,company_id,companies(name,profiles(role,email))')
+      .select('id,title,due_date,company_id,companies(name,profiles!profiles_company_id_fkey(role,email))')
       .eq('status', 'pending')
       .eq('due_date', dateStr)
 
