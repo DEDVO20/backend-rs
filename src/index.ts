@@ -181,6 +181,11 @@ app.onError((err, c) => {
   if (SCHEMA_CODES.includes(String((err as any).code ?? ''))) {
     return c.json({ error: `Falta aplicar una migración en la base de datos: ${err.message}` }, 500)
   }
+  // Relación ambigua (dos llaves foráneas entre las mismas tablas): el código desplegado
+  // no coincide con el esquema; se informa para no quedar con un 500 opaco.
+  if ((err as any).code === 'PGRST201') {
+    return c.json({ error: `Consulta ambigua tras un cambio de esquema (despliega la última versión del backend): ${err.message}` }, 500)
+  }
   const message = process.env.NODE_ENV === 'production'
     ? 'Error interno del servidor'
     : err.message
